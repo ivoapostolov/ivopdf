@@ -15,7 +15,7 @@ IvoPDF превръща HTML + CSS в PDF **без външни програми
 - HTML5 парсване по алгоритъма на WHATWG (PHP ≥ 8.4).
 
 **Текст и шрифтове**
-- UTF-8 навсякъде; вградени DejaVu Sans/Serif/Mono (латиница, кирилица, гръцки, арабски, иврит…).
+- UTF-8 навсякъде; вградени **Inter** (шрифт по подразбиране, пълна кирилица) и DejaVu Sans/Serif/Mono (латиница, кирилица, гръцки, арабски, иврит…; ползват се автоматично и за знаци, които липсват в Inter).
 - **Изрязване на шрифтовете** (типична фактура е ≈ 40 KB вместо ~900 KB), TrueType и **OpenType/CFF (`.otf`)**, колекции `.ttc`, `@font-face`, автоматични **резервни шрифтове** и избор на шрифт според писмеността.
 - **OpenType оформяне**: лигатури, кернинг, `font-feature-settings`, `font-variant-*`.
 - **От дясно наляво** (Unicode bidi алгоритъм, `dir="rtl|auto"`, `<bdi>`, `<bdo>`), свързване на **арабски**, **иврит**.
@@ -109,7 +109,7 @@ print_r($pdf->getWarnings());                              // напр. изоб
 | `paperSize` | `'A4'` | A0–A6, B4, B5, Letter, Legal, Tabloid, Executive, Folio или `[ширинаPt, височинаPt]` |
 | `orientation` | `'portrait'` | `portrait` / `landscape` |
 | `margins` | по 36 pt | `['top' => .., 'right' => .., 'bottom' => .., 'left' => ..]`; CSS `@page { margin }` има предимство |
-| `defaultFont`, `defaultFontSize` | DejaVu Sans, 12 | |
+| `defaultFont`, `defaultFontSize` | Inter, 12 | общите `sans-serif`, Arial, Helvetica… водят към Inter; `serif` / `monospace` към DejaVu Serif / Sans Mono |
 | `defaultBoxSizing` | `content-box` | стандартното за CSS; шаблоните обикновено задават `* { box-sizing: border-box }` |
 | `basePath`, `allowedPaths` | `null`, `[]` | папки, от които може да се четат локални изображения, CSS и шрифтове |
 | `isRemoteEnabled` | `false` | разрешава `http(s)` ресурси (със защита от SSRF) |
@@ -185,6 +185,7 @@ print_r($pdf->validatePdfA());                                                  
 
 - Подписите са отделен CMS (`adbe.pkcs7.detached` или `ETSI.CAdES.detached`) със SHA-256 и ключове RSA или ECDSA; приемат се и `.p12` / `.pfx` файлове.
 - PDF/A-1b е истински ISO 19005-1 (PDF 1.4, `/CIDSet`, без прозрачност: полупрозрачните цветове стават плътни); 2b и 3b запазват прозрачността. `validatePdfA()` е евристична проверка и **не** замества veraPDF.
+- При всяко ниво на PDF/A изображенията се записват с `/Interpolate false`, а изрязаните шрифтове пазят ширина за всеки използван знак, така че съвпадат с `/W`. `validatePdfA()` проверява и двете неща за TrueType шрифтове; при OpenType/CFF (`.otf`) не сравнява ширините на знаците.
 - PDF/A не може да се комбинира с криптиране; PDF/X не може да се комбинира с PDF/A, криптиране или подпис.
 
 ### Печат: CMYK, spot цветове, PDF/X
@@ -239,6 +240,7 @@ for t in tests/*.php; do php "$t" || echo "FAILED: $t"; done
 
 - Не се поддържат вертикален текст (`writing-mode: vertical-*`), висяща пунктуация, SVG филтри и EMF+ записи.
 - При писане от дясно наляво таблиците, flex и grid не се огледализират.
+- Когато `min-width` е по-голямо от `max-width`, печели `min-width` (както в CSS и браузърите).
 - PDF/A и PDF/X са проверени структурно, не с veraPDF или професионален инструмент за предпечат.
 - Полетата на формулярите ползват невградените стандартни шрифтове Helvetica / ZapfDingbats, затова документи с формуляри не минават PDF/A.
 - Шрифтове от `.ttc` колекции не се поддържат в CSS `@font-face` (използвайте `registerFontFamily()`).
@@ -261,7 +263,7 @@ IvoPDF е безплатен софтуер с отворен код под ли
 
 - Можете свободно да го използвате, изучавате, променяте и споделяте, включително в търговски проекти.
 - Ако разпространявате софтуер, който включва IvoPDF, или давате достъп до него през мрежа (уеб приложения, SaaS, API), **цялото приложение трябва да бъде пуснато под AGPL** с изходен код, достъпен за потребителите му. Вграждането на IvoPDF в продукти със затворен код не е разрешено.
-- Вградените чужди данни запазват собствения си свободен лиценз: шрифтовете DejaVu ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) и TeX шаблоните за пренасяне (лицензите са в началото на файловете в `resources/hyphenation/`).
+- Вградените чужди данни запазват собствения си свободен лиценз: шрифтовете Inter (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), шрифтовете DejaVu ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) и TeX шаблоните за пренасяне (лицензите са в началото на файловете в `resources/hyphenation/`).
 
 ## Принос
 

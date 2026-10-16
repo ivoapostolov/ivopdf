@@ -148,7 +148,7 @@ class ComputedStyle
             'color' => '#111827',
             'opacity' => '1',
 
-            'font-family' => 'DejaVu Sans',
+            'font-family' => 'Inter',
             'font-size' => $fsStr,
             'font-weight' => 'normal',
             'font-style' => 'normal',

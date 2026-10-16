@@ -392,6 +392,12 @@ class TableLayout
             }
 
             $intr = $this->engine->measureIntrinsicWidth($cell, $usableWidth);
+            // A cell's min-width raises the column's minimum (and preferred) width
+            $cellMin = $this->engine->clampToMinMaxWidth($cell, 0.0, $usableWidth);
+            if ($cellMin > 0.0) {
+                $intr['min'] = max($intr['min'], $cellMin);
+                $intr['max'] = max($intr['max'], $cellMin);
+            }
             if ($intr['min'] > $minWidths[$c]) {
                 $minWidths[$c] = $intr['min'];
             }

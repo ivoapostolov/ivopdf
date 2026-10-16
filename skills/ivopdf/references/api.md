@@ -18,7 +18,7 @@
 | `paperSize` | `'A4'` | `A0`–`A6`, `B4`, `B5`, `LETTER`, `LEGAL`, `TABLOID`, `EXECUTIVE`, `FOLIO`, or `[wPt, hPt]` |
 | `orientation` | `'portrait'` | `landscape` swaps width/height |
 | `margins` | 36 pt each | `['top'=>…, 'right'=>…, 'bottom'=>…, 'left'=>…]` in pt; CSS `@page { margin }` wins |
-| `defaultFont` / `defaultFontSize` | `DejaVu Sans` / 12 | |
+| `defaultFont` / `defaultFontSize` | `Inter` / 12 | |
 | `defaultBoxSizing` | `content-box` | |
 | `dpi` | 96 | px → pt conversion |
 | `basePath` | `null` | folder for relative local resources |
@@ -58,8 +58,8 @@ PHP method names are case-insensitive: `Output()` and `output()` are the same me
 
 ## 3. Fonts
 
-- Bundled: DejaVu Sans / Serif / Sans Mono, each with regular, bold, italic, bold italic.
-- Aliases: `sans-serif`, Arial, Helvetica, Roboto, Inter, Open Sans… → DejaVu Sans; `serif`, Times, Georgia… → DejaVu Serif; `monospace`, Courier, Consolas… → DejaVu Sans Mono.
+- Bundled: Inter (default) and DejaVu Sans / Serif / Sans Mono, each with regular, bold, italic, bold italic.
+- Aliases: `sans-serif`, Arial, Helvetica, Roboto, Open Sans… → Inter; `serif`, Times, Georgia… → DejaVu Serif; `monospace`, Courier, Consolas… → DejaVu Sans Mono.
 - Custom: `$pdf->registerFontFamily('Inter', ['regular' => '/fonts/Inter-Regular.ttf', 'bold' => '/fonts/Inter-Bold.ttf']);` then `font-family: 'Inter'`.
 - CSS: `@font-face { font-family: 'Brand'; src: url(fonts/Brand.ttf); font-weight: bold; }` — the file must be inside `basePath`/`allowedPaths` (or a data URI / remote URL with `isRemoteEnabled`).
 - Use TrueType (`.ttf`). Invalid font files are rejected and reported in `getWarnings()`.

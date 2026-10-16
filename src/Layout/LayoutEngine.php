@@ -276,7 +276,7 @@ class LayoutEngine
                 $wCss = strtolower(trim($child->style->get('width', 'auto')));
                 if ($wCss === 'auto' || $wCss === '') {
                     $intr = $this->measureIntrinsicWidth($child, $contentWidth);
-                    $child->forcedBorderBoxWidth = min($contentWidth, $intr['max']);
+                    $child->forcedBorderBoxWidth = $this->clampToMinMaxWidth($child, min($contentWidth, $intr['max']), $contentWidth);
                 } else {
                     $child->forcedBorderBoxWidth = $this->computeBorderBoxWidth($child, $contentWidth);
                 }
@@ -414,7 +414,7 @@ class LayoutEngine
                     $child->forcedBorderBoxWidth = max(0.0, $refWidth - $lPt - $rPt - $child->marginLeft - $child->marginRight);
                 } else {
                     $intr = $this->measureIntrinsicWidth($child, $refWidth);
-                    $child->forcedBorderBoxWidth = min($refWidth, $intr['max']);
+                    $child->forcedBorderBoxWidth = $this->clampToMinMaxWidth($child, min($refWidth, $intr['max']), $refWidth);
                 }
             } else {
                 $child->forcedBorderBoxWidth = null;
@@ -659,6 +659,23 @@ class LayoutEngine
             return 0.0;
         }
         return max(0.0, $this->resolveLength($style->get("border-{$side}-width", '0'), 0.0, $fontSizePt));
+    }
+
+    /**
+     * Applies the box's max-width and then min-width (min wins, as in CSS) to a border-box width that was
+     * computed from content (shrink-to-fit: inline-block, float, absolute, flex/grid items, table cells).
+     */
+    public function clampToMinMaxWidth(LayoutBox $box, float $width, float $containingWidth): float
+    {
+        $maxWCss = strtolower(trim($box->style->get('max-width', 'none')));
+        if ($maxWCss !== 'none' && $maxWCss !== '' && !str_contains($maxWCss, 'content')) {
+            $width = min($width, $this->resolveBoxHorizontalDimension($box, $maxWCss, $containingWidth));
+        }
+        $minWCss = strtolower(trim($box->style->get('min-width', '0')));
+        if ($minWCss !== '0' && $minWCss !== 'auto' && $minWCss !== '' && !str_contains($minWCss, 'content')) {
+            $width = max($width, $this->resolveBoxHorizontalDimension($box, $minWCss, $containingWidth));
+        }
+        return max(0.0, $width);
     }
 
     private function computeBorderBoxWidth(LayoutBox $box, float $containingWidth): float

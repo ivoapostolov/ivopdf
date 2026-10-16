@@ -807,7 +807,8 @@ class PdfDocument
             $imgData['height'],
             $imgData['colorSpace'],
             $imgData['bitsPerComponent'],
-            ($imgData['interpolate'] ?? true) ? 'true' : 'false',
+            // PDF/A (ISO 19005-1 6.2.4 / 19005-2 6.2.8) forbids /Interpolate true at every conformance level
+            (($imgData['interpolate'] ?? true) && $this->options->pdfa === '') ? 'true' : 'false',
             $imgData['filter'],
             $decodeParmsStr,
             $smaskRef,

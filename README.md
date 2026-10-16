@@ -15,7 +15,7 @@ Requirements: PHP ≥ 8.1 with `ext-dom`, `ext-mbstring`, `ext-zlib`. Optional: 
 - HTML5 parsing per the WHATWG algorithm (PHP ≥ 8.4).
 
 **Text and fonts**
-- UTF-8 everywhere; bundled DejaVu Sans/Serif/Mono (Latin, Cyrillic, Greek, Arabic, Hebrew…).
+- UTF-8 everywhere; bundled **Inter** (default sans-serif, full Cyrillic) and DejaVu Sans/Serif/Mono (Latin, Cyrillic, Greek, Arabic, Hebrew…, also used automatically for characters Inter lacks).
 - **Font subsetting** (a typical invoice is ≈ 40 KB instead of ~900 KB), TrueType and **OpenType/CFF (`.otf`)**, `.ttc` collections, `@font-face`, automatic **fallback fonts** and per-script font selection.
 - **OpenType shaping**: ligatures, kerning, `font-feature-settings`, `font-variant-*`.
 - **Right-to-left** (Unicode bidi algorithm, `dir="rtl|auto"`, `<bdi>`, `<bdo>`), **Arabic** joining, **Hebrew**.
@@ -109,7 +109,7 @@ Not supported: the imperative drawing API (`Cell`, `Ln`, `Rect`, `Image`, `Write
 | `paperSize` | `'A4'` | A0–A6, B4, B5, Letter, Legal, Tabloid, Executive, Folio or `[widthPt, heightPt]` |
 | `orientation` | `'portrait'` | `portrait` / `landscape` |
 | `margins` | 36 pt each | `['top' => .., 'right' => .., 'bottom' => .., 'left' => ..]`; CSS `@page { margin }` overrides |
-| `defaultFont`, `defaultFontSize` | DejaVu Sans, 12 | |
+| `defaultFont`, `defaultFontSize` | Inter, 12 | generic `sans-serif`, Arial, Helvetica… map to Inter; `serif` / `monospace` to DejaVu Serif / Sans Mono |
 | `defaultBoxSizing` | `content-box` | CSS default; templates usually set `* { box-sizing: border-box }` |
 | `basePath`, `allowedPaths` | `null`, `[]` | folders from which local images / CSS / fonts may be read |
 | `isRemoteEnabled` | `false` | allow `http(s)` resources (SSRF-protected) |
@@ -185,6 +185,7 @@ print_r($pdf->validatePdfA());                                                  
 
 - Signatures are detached CMS (`adbe.pkcs7.detached` or `ETSI.CAdES.detached`) with SHA-256, RSA or ECDSA keys; `.p12` / `.pfx` bundles are accepted.
 - PDF/A-1b is real ISO 19005-1 output (PDF 1.4, `/CIDSet`, no transparency: semi-transparent colors become opaque); 2b and 3b keep transparency. `validatePdfA()` is a heuristic pre-check, **not** a replacement for veraPDF.
+- At every PDF/A level images are written with `/Interpolate false`, and embedded font subsets keep a width entry for every used glyph, so the program always matches `/W`. `validatePdfA()` checks both for TrueType fonts; for OpenType/CFF (`.otf`) fonts it does not compare glyph widths.
 - PDF/A cannot be combined with encryption; PDF/X cannot be combined with PDF/A, encryption or a signature.
 
 ### Print production: CMYK, spot colors, PDF/X
@@ -239,6 +240,7 @@ Some checks use Python with PyMuPDF (`pip install pymupdf`), the `openssl` CLI o
 
 - Vertical writing (`writing-mode: vertical-*`), hanging punctuation, SVG filters and EMF+ records are not supported.
 - RTL does not mirror table, flex and grid layouts.
+- When `min-width` is larger than `max-width`, `min-width` wins (as in CSS and browsers).
 - PDF/A and PDF/X output is checked structurally, not with veraPDF or a commercial preflight tool.
 - HTML form fields use the non-embedded standard fonts Helvetica / ZapfDingbats, so documents with forms do not pass PDF/A.
 - `.ttc` faces are not supported in CSS `@font-face` (use `registerFontFamily()`).
@@ -261,7 +263,7 @@ IvoPDF is free and open-source software licensed under the **GNU Affero General 
 
 - You may use, study, modify and share it freely, including in commercial projects.
 - If you distribute software that includes IvoPDF, or let users interact with it over a network (web apps, SaaS, APIs), the **whole application must be released under the AGPL** with its source code available to those users. Embedding IvoPDF into closed-source products is not permitted.
-- Bundled third-party data keeps its own permissive license: DejaVu fonts ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) and the TeX hyphenation patterns (license headers in `resources/hyphenation/`).
+- Bundled third-party data keeps its own permissive license: Inter fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), DejaVu fonts ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) and the TeX hyphenation patterns (license headers in `resources/hyphenation/`).
 
 ## Contributing
 

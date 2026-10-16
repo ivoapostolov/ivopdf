@@ -216,7 +216,7 @@ class GridLayout
                     $box->forcedBorderBoxWidth = max(0.0, $cellWidth - $box->marginLeft - $box->marginRight);
                 } else {
                     $intrinsic = $this->engine->measureIntrinsicWidth($box, $cellWidth);
-                    $box->forcedBorderBoxWidth = min($cellWidth, $intrinsic['max']);
+                    $box->forcedBorderBoxWidth = $this->engine->clampToMinMaxWidth($box, min($cellWidth, $intrinsic['max']), $cellWidth);
                 }
             }
 

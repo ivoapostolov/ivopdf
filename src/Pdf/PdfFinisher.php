@@ -54,6 +54,26 @@ final class PdfFinisher
      * @param array<string, string> $acroEntries extra raw /AcroForm entries (key without slash => raw PDF value)
      * @return array{encryption: ?PdfEncryption, encryptObjId: ?int, signature: ?PdfSignature, sigObjId: ?int, documentId: string, version: string}
      */
+    /**
+     * Rewrites `/Interpolate true` to false in the dictionary part of every object (images, SMasks, imported XObjects).
+     *
+     * @param array<int, string> $objects
+     */
+    private static function disableInterpolation(array &$objects): void
+    {
+        foreach ($objects as $id => $body) {
+            $streamPos = strpos($body, "stream\n");
+            $dict = $streamPos === false ? $body : substr($body, 0, $streamPos);
+            if (!str_contains($dict, '/Interpolate')) {
+                continue;
+            }
+            $fixed = (string) preg_replace('~/Interpolate\s+true~', '/Interpolate false', $dict);
+            if ($fixed !== $dict) {
+                $objects[$id] = $fixed . ($streamPos === false ? '' : substr($body, $streamPos));
+            }
+        }
+    }
+
     public function finish(
         array &$objects,
         int &$counter,
@@ -111,6 +131,11 @@ final class PdfFinisher
         }
         if ($catalogExtra !== '') {
             $objects[$catalogId] = self::appendEntries($objects[$catalogId], trim($catalogExtra));
+        }
+
+        // Every PDF/A level: image dictionaries must not request interpolation (19005-2 6.2.8-3)
+        if ($pdfa !== null) {
+            self::disableInterpolation($objects);
         }
 
         // PDF/A-1b: flatten transparency, add /CIDSet, header 1.4 (see PdfA1Profile)

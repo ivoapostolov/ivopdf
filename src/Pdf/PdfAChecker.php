@@ -367,13 +367,11 @@ final class PdfAChecker
             if ($s->has('OPI')) {
                 $this->add('Image /OPI is forbidden');
             }
-            if ($this->part === 1) {
-                if ($s->has('SMask')) {
-                    $this->add('Image with /SMask (transparency) is not allowed in PDF/A-1');
-                }
-                if ($this->reader->resolve($s->get('Interpolate')) === true) {
-                    $this->add('Image /Interpolate true is not allowed in PDF/A-1');
-                }
+            if ($this->part === 1 && $s->has('SMask')) {
+                $this->add('Image with /SMask (transparency) is not allowed in PDF/A-1');
+            }
+            if ($this->reader->resolve($s->get('Interpolate')) === true) {
+                $this->add('Image /Interpolate true is not allowed in PDF/A (19005-1 6.2.4, 19005-2 6.2.8)');
             }
             $cs = $this->reader->resolve($s->get('ColorSpace'));
             if ($cs instanceof PdfName && $cs->name === 'DeviceCMYK') {
@@ -455,6 +453,7 @@ final class PdfAChecker
         if ($cid->name('Subtype') === 'CIDFontType2' && !$cid->has('CIDToGIDMap')) {
             $this->add("Font {$base}: CIDFontType2 without /CIDToGIDMap");
         }
+        $this->checkGlyphWidths($cid, $fd, $base);
         $isSubset = preg_match('~^[A-Z]{6}\+~', $base) === 1;
         if ($this->part === 1 && $isSubset) {
             $set = $this->reader->resolve($fd->get('CIDSet'));
@@ -471,6 +470,108 @@ final class PdfAChecker
                 }
             }
         }
+    }
+
+    /**
+     * 19005-1 6.3.6 / 19005-2 6.2.11.5: the advance width of every glyph used through /W must match the embedded
+     * TrueType program (hmtx). CFF programs (FontFile3) are not checked.
+     */
+    private function checkGlyphWidths(PdfDict $cid, PdfDict $fd, string $base): void
+    {
+        $file = $this->reader->resolve($fd->get('FontFile2'));
+        if (!$file instanceof PdfStream || $cid->name('Subtype') !== 'CIDFontType2') {
+            return;
+        }
+        $advances = self::trueTypeAdvances($this->reader->decodeStream($file));
+        if ($advances === null) {
+            $this->add("Font {$base}: embedded TrueType program could not be read (hmtx/hhea/head)");
+            return;
+        }
+        $map = $this->reader->resolve($cid->get('CIDToGIDMap'));
+        $gidMap = $map instanceof PdfStream ? $this->reader->decodeStream($map) : null;
+        $lastAdvance = end($advances) ?: 0;
+        foreach ($this->widthEntries($cid) as $c => $w) {
+            if ($gidMap !== null) {
+                $gid = isset($gidMap[$c * 2 + 1]) ? (ord($gidMap[$c * 2]) << 8) | ord($gidMap[$c * 2 + 1]) : 0;
+            } else {
+                $gid = $c;
+            }
+            $actual = $advances[$gid] ?? $lastAdvance;
+            if (abs($actual - $w) > 1.0) {
+                $this->add(sprintf('Font %s: glyph %d width %d in the embedded program differs from /W (%d)', $base, $gid, (int) round($actual), (int) round($w)));
+                return;
+            }
+        }
+    }
+
+    /**
+     * Advance widths (in 1/1000 em) per glyph id read from an sfnt's head/hhea/hmtx tables.
+     *
+     * @return array<int, float>|null
+     */
+    private static function trueTypeAdvances(string $font): ?array
+    {
+        if (strlen($font) < 12) {
+            return null;
+        }
+        $numTables = unpack('n', substr($font, 4, 2))[1];
+        $tables = [];
+        for ($i = 0; $i < $numTables; $i++) {
+            $rec = substr($font, 12 + $i * 16, 16);
+            if (strlen($rec) < 16) {
+                return null;
+            }
+            $u = unpack('a4tag/Nsum/Noff/Nlen', $rec);
+            $tables[$u['tag']] = [$u['off'], $u['len']];
+        }
+        if (!isset($tables['head'], $tables['hhea'], $tables['hmtx'])) {
+            return null;
+        }
+        $upm = unpack('n', substr($font, $tables['head'][0] + 18, 2))[1] ?? 0;
+        $numH = unpack('n', substr($font, $tables['hhea'][0] + 34, 2))[1] ?? 0;
+        if ($upm <= 0 || $numH <= 0) {
+            return null;
+        }
+        $hmtx = substr($font, $tables['hmtx'][0], $tables['hmtx'][1]);
+        if (strlen($hmtx) < $numH * 4) {
+            return null;
+        }
+        $out = [];
+        for ($g = 0; $g < $numH; $g++) {
+            $out[$g] = unpack('n', substr($hmtx, $g * 4, 2))[1] * 1000.0 / $upm;
+        }
+        return $out;
+    }
+
+    /** @return array<int, float> CID => width from the /W array */
+    private function widthEntries(PdfDict $cid): array
+    {
+        $w = $this->reader->resolve($cid->get('W'));
+        if (!is_array($w)) {
+            return [];
+        }
+        $out = [];
+        $n = count($w);
+        for ($i = 0; $i < $n; $i++) {
+            $first = $this->reader->resolve($w[$i]);
+            $second = $this->reader->resolve($w[$i + 1] ?? null);
+            if (!is_int($first)) {
+                continue;
+            }
+            if (is_array($second)) {
+                foreach (array_values($second) as $k => $width) {
+                    $out[$first + $k] = (float) $this->reader->resolve($width);
+                }
+                $i += 1;
+            } elseif (is_int($second)) {
+                $width = (float) $this->reader->resolve($w[$i + 2] ?? 0);
+                for ($c = $first; $c <= min($second, $first + 70000); $c++) {
+                    $out[$c] = $width;
+                }
+                $i += 2;
+            }
+        }
+        return $out;
     }
 
     /** @return list<int> CIDs that have an explicit entry in the /W array */

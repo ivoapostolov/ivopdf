@@ -39,7 +39,8 @@ function check(string $label, bool $ok, string $detail = ''): void
 
 function renderCols(string $html, array $options = []): IvoPdf
 {
-    $pdf = new IvoPdf(array_merge(['compress' => false], $options));
+    // Line-count expectations are calibrated to DejaVu Sans metrics
+    $pdf = new IvoPdf(array_merge(['defaultFont' => 'DejaVu Sans', 'compress' => false], $options));
     $pdf->loadHtml($html)->output();
     return $pdf;
 }

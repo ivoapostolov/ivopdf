@@ -802,7 +802,7 @@ check('utf8ToCodepoints("Ж") = U+0416', $fm->utf8ToCodepoints('Ж') === [0x0416
 check('isBoldWeight(700)=true, (400)=false', $fm->isBoldWeight('700') === true && $fm->isBoldWeight('400') === false);
 
 $fontFiles = glob(__DIR__ . '/../resources/fonts/*.ttf');
-check('12 bundled DejaVu TTF files found (Sans/Serif/Mono x 4 variants)', count($fontFiles) === 12, 'found ' . count($fontFiles));
+check('16 bundled TTF files found (Inter + DejaVu Sans/Serif/Mono x 4 variants)', count($fontFiles) === 16, 'found ' . count($fontFiles));
 
 $custom = new IvoPdf();
 $custom->registerFontFamily('IvoSerif', [

@@ -106,7 +106,9 @@ final class TtfSubsetter
         }
 
         $newNumGlyphs = max(array_keys($keep)) + 1;
-        $newNumHMetrics = min($numHMetrics, $newNumGlyphs);
+        // Every glyph gets its own long metric: fonts with numberOfHMetrics < numGlyphs (monospaced fonts often have
+        // only a few) share the LAST advance for all later glyphs, and that entry may belong to a dropped glyph.
+        $newNumHMetrics = $newNumGlyphs;
 
         // glyf + loca (long format)
         $newGlyf = '';
@@ -129,12 +131,18 @@ final class TtfSubsetter
 
         // hmtx: long metrics, then left side bearings (zeroed for dropped glyphs, compresses well)
         $newHmtx = '';
+        $lastAdvance = substr($hmtx, ($numHMetrics - 1) * 4, 2);
         for ($gid = 0; $gid < $newNumHMetrics; $gid++) {
-            $newHmtx .= isset($keep[$gid]) ? substr($hmtx, $gid * 4, 4) : "\0\0\0\0";
-        }
-        for ($gid = $newNumHMetrics; $gid < $newNumGlyphs; $gid++) {
-            $pos = $numHMetrics * 4 + ($gid - $numHMetrics) * 2;
-            $newHmtx .= (isset($keep[$gid]) && $pos + 2 <= strlen($hmtx)) ? substr($hmtx, $pos, 2) : "\0\0";
+            if (!isset($keep[$gid])) {
+                $newHmtx .= "\0\0\0\0";
+            } elseif ($gid < $numHMetrics) {
+                $newHmtx .= substr($hmtx, $gid * 4, 4);
+            } else {
+                // advance = last long metric, lsb from the trailing leftSideBearing array
+                $pos = $numHMetrics * 4 + ($gid - $numHMetrics) * 2;
+                $lsb = $pos + 2 <= strlen($hmtx) ? substr($hmtx, $pos, 2) : "\0\0";
+                $newHmtx .= $lastAdvance . $lsb;
+            }
         }
 
         $newHead = substr($head, 0, 8) . "\0\0\0\0" . substr($head, 12, 38) . pack('n', 1) . substr($head, 52);

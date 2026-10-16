@@ -223,7 +223,7 @@ $pdf = render('<h1 id="top">Title</h1><p><a href="#s2">to section 2</a> <a href=
 <div style="width:50pt;height:20pt;background:#0f0;transform:rotate(10deg) translateX(10pt) skewX(5deg)"></div>
 <h2 id="s2" style="page-break-before:always">Section 2</h2><h3>Sub</h3>');
 $bytes = $pdf->output();
-check('font is subset (tag prefix ABCDEF+)', preg_match('/\/BaseFont \/[A-Z]{6}\+DejaVuSans/', $bytes) === 1);
+check('font is subset (tag prefix ABCDEF+)', preg_match('/\/BaseFont \/[A-Z]{6}\+Inter/', $bytes) === 1);
 check('subset document is small (< 60 KB uncompressed streams aside)', strlen((new IvoPdf())->loadHtml('<p>Hello свят</p>')->output()) < 60000);
 check('bookmarks / outlines present', str_contains($bytes, '/Type /Outlines') && str_contains($bytes, '/PageMode /UseOutlines'));
 check('internal link uses /Dest', preg_match('/\/Subtype \/Link [^>]*\/Dest \[\d+ 0 R \/XYZ/', $bytes) === 1);

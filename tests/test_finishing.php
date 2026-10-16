@@ -71,7 +71,7 @@ function py(string $code, array $args = []): mixed
 
 function make(array $options, string $html, ?callable $setup = null): IvoPdf
 {
-    $pdf = new IvoPdf(array_merge(['compress' => true], $options));
+    $pdf = new IvoPdf(array_merge(['defaultFont' => 'DejaVu Sans', 'compress' => true], $options));
     if ($setup !== null) {
         $setup($pdf);
     }

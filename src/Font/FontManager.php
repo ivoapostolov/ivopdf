@@ -63,6 +63,14 @@ class FontManager
 
     private function registerBundledFonts(): void
     {
+        // Inter (SIL OFL 1.1) is the default sans-serif face; DejaVu covers the scripts Inter lacks via the fallback chain
+        $this->registerFamily('inter', [
+            'regular' => $this->fontDir . '/Inter-Regular.ttf',
+            'bold' => $this->fontDir . '/Inter-Bold.ttf',
+            'italic' => $this->fontDir . '/Inter-Italic.ttf',
+            'bold_italic' => $this->fontDir . '/Inter-BoldItalic.ttf',
+        ]);
+
         $this->registerFamily('dejavu sans', [
             'regular' => $this->fontDir . '/DejaVuSans.ttf',
             'bold' => $this->fontDir . '/DejaVuSans-Bold.ttf',
@@ -87,13 +95,14 @@ class FontManager
         // Common web & CSS generic font aliases mapped to bundled Unicode/Cyrillic TTFs
         $sansAliases = [
             'sans-serif', 'sans', 'system-ui', '-apple-system', 'blinkmacsystemfont',
-            'segoe ui', 'roboto', 'inter', 'helvetica', 'helvetica neue', 'arial',
+            'segoe ui', 'roboto', 'helvetica', 'helvetica neue', 'arial',
             'verdana', 'tahoma', 'trebuchet ms', 'open sans', 'lato', 'montserrat',
-            'nunito', 'poppins', 'ubuntu', 'noto sans', 'dejavusans',
+            'nunito', 'poppins', 'ubuntu', 'noto sans', 'inter display', 'inter var',
         ];
         foreach ($sansAliases as $alias) {
-            $this->aliases[$alias] = 'dejavu sans';
+            $this->aliases[$alias] = 'inter';
         }
+        $this->aliases['dejavusans'] = 'dejavu sans';
 
         $serifAliases = [
             'serif', 'times', 'times new roman', 'georgia', 'garamond',
@@ -263,7 +272,7 @@ class FontManager
     public function resolveFont(string $fontFamilyCss, string|int $fontWeight = 'normal', string $fontStyle = 'normal'): TtfParser
     {
         $candidates = explode(',', $fontFamilyCss);
-        $resolvedKey = 'dejavu sans';
+        $resolvedKey = 'inter';
 
         foreach ($candidates as $candidate) {
             $clean = strtolower(trim($candidate, " \t\n\r\0\x0B'\""));
@@ -280,7 +289,7 @@ class FontManager
             }
         }
 
-        $variants = $this->families[$resolvedKey] ?? $this->families['dejavu sans'];
+        $variants = $this->families[$resolvedKey] ?? $this->families['inter'];
         if (($variants['regular'] ?? '') === '') {
             $variants = $this->families['dejavu sans'];
         }

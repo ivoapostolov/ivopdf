@@ -42,7 +42,8 @@ function check(string $label, bool $ok, string $detail = ''): void
 
 function render(string $html, array $options = [], ?callable $setup = null): IvoPdf
 {
-    $pdf = new IvoPdf(array_merge(['compress' => false], $options));
+    // These checks rely on DejaVu Sans' ligatures, kerning and metrics
+    $pdf = new IvoPdf(array_merge(['defaultFont' => 'DejaVu Sans', 'compress' => false], $options));
     if ($setup !== null) {
         $setup($pdf);
     }

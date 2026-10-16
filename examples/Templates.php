@@ -628,7 +628,7 @@ class Templates
     }
     * { box-sizing: border-box; }
     @page { margin: 28pt 32pt 42pt 32pt; size: A4 portrait; }
-    body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5pt; color: #0f172a; }
+    body { font-family: 'Inter', sans-serif; font-size: 9.5pt; color: #0f172a; }
 
     .header-banner {
         display: flex;
@@ -953,7 +953,7 @@ HTML
 <style>
     * { box-sizing: border-box; }
     @page { margin: 26pt 30pt 38pt 30pt; size: A4 portrait; }
-    body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5pt; color: #0f172a; }
+    body { font-family: 'Inter', sans-serif; font-size: 9.5pt; color: #0f172a; }
 
     .top-bar {
         display: flex;
@@ -1169,7 +1169,7 @@ HTML
         display: inline-block;
         background: #1e3a8a;
         color: #ffffff;
-        font-family: 'DejaVu Sans', sans-serif;
+        font-family: 'Inter', sans-serif;
         font-size: 8.5pt;
         letter-spacing: 2pt;
         text-transform: uppercase;
@@ -1194,7 +1194,7 @@ HTML
         grid-template-columns: repeat(4, 1fr);
         gap: 10pt;
         margin: 16pt 0 22pt 0;
-        font-family: 'DejaVu Sans', sans-serif;
+        font-family: 'Inter', sans-serif;
     }
     .skill-pill {
         background: #ffffff;
@@ -1210,7 +1210,7 @@ HTML
         justify-content: space-between;
         align-items: center;
         margin-top: 14pt;
-        font-family: 'DejaVu Sans', sans-serif;
+        font-family: 'Inter', sans-serif;
     }
 </style>
 </head>
@@ -1275,7 +1275,7 @@ HTML
 <style>
     * { box-sizing: border-box; }
     @page { margin: 28pt 32pt 42pt 32pt; size: A4 portrait; }
-    body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5pt; color: #0f172a; }
+    body { font-family: 'Inter', sans-serif; font-size: 9.5pt; color: #0f172a; }
     .catalog-wrap {
         display: flex;
         flex-wrap: wrap;
@@ -1407,7 +1407,7 @@ HTML
 <title>{{t:doc_title}}</title>
 <style>
     @page { margin: 30pt 34pt 40pt 34pt; size: A4 portrait; }
-    body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5pt; color: #1e293b; line-height: 1.45; counter-reset: section; }
+    body { font-family: 'Inter', sans-serif; font-size: 9.5pt; color: #1e293b; line-height: 1.45; counter-reset: section; }
     h1 { font-size: 20pt; color: #0f172a; margin: 0 0 4pt 0; }
     h2 { font-size: 13pt; color: #1e3a8a; margin: 14pt 0 6pt 0; padding-bottom: 3pt; border-bottom: 1.5pt solid #bfdbfe; counter-increment: section; }
     h2::before { content: counter(section) ". "; color: #0284c7; }

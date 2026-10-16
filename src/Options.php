@@ -9,7 +9,7 @@ namespace IvoPdf;
  */
 class Options
 {
-    public string $defaultFont = 'DejaVu Sans';
+    public string $defaultFont = 'Inter';
     public float $defaultFontSize = 12.0; // in pt
     /** @var string|array{0: float, 1: float} */
     public string|array $paperSize = 'A4';

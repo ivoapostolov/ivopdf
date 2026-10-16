@@ -908,7 +908,11 @@ class InlineLayout
             $wCss = strtolower(trim($node->style->get('width', 'auto')));
             if ($wCss === 'auto' || $wCss === '' || in_array($wCss, ['fit-content', 'max-content', 'min-content'], true)) {
                 $intrinsic = $this->engine->measureIntrinsicWidth($node, $availableWidth);
-                $node->forcedBorderBoxWidth = min(max(0.0, $availableWidth - $node->marginLeft - $node->marginRight), $wCss === 'min-content' ? $intrinsic['min'] : $intrinsic['max']);
+                $node->forcedBorderBoxWidth = $this->engine->clampToMinMaxWidth(
+                    $node,
+                    min(max(0.0, $availableWidth - $node->marginLeft - $node->marginRight), $wCss === 'min-content' ? $intrinsic['min'] : $intrinsic['max']),
+                    $availableWidth
+                );
             }
             $this->engine->layoutElement($node, 0.0, 0.0, $availableWidth);
 

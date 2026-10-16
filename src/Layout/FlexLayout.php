@@ -377,7 +377,7 @@ class FlexLayout
                     $item->forcedBorderBoxWidth = max(0.0, $contentWidth - $item->marginLeft - $item->marginRight);
                 } else {
                     $intrinsic = $this->engine->measureIntrinsicWidth($item, $contentWidth);
-                    $item->forcedBorderBoxWidth = min($contentWidth, $intrinsic['max']);
+                    $item->forcedBorderBoxWidth = $this->engine->clampToMinMaxWidth($item, min($contentWidth, $intrinsic['max']), $contentWidth);
                 }
             }
 
