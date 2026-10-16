@@ -1,0 +1,12 @@
+{
+    "name": "ivopdf/ivopdf",
+    "description": "Development stand-in for ivopdf/ivopdf: loads the library from this repository so the integrations can be tested without copying it into their vendor folders.",
+    "type": "library",
+    "license": "AGPL-3.0-or-later",
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "files": ["bootstrap.php"]
+    }
+}

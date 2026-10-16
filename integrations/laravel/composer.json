@@ -26,7 +26,7 @@
     "repositories": [
         {
             "type": "path",
-            "url": "../..",
+            "url": "../dev-core",
             "options": {"symlink": false, "versions": {"ivopdf/ivopdf": "1.0.0"}}
         }
     ],
