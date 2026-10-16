@@ -41,6 +41,8 @@ class Options
     public int $maxPages = 5000;
     /** Parse HTML with the WHATWG HTML5 algorithm (PHP >= 8.4, \Dom\HTMLDocument); false = libxml's HTML4 parser */
     public bool $html5Parser = true;
+    /** Charset of the HTML input: 'auto' (BOM, then valid UTF-8, then <meta charset>, else Windows-1252) or a charset name such as 'windows-1251'. */
+    public string $inputEncoding = 'auto';
     /** mPDF shrink_tables_to_fit: tables wider than the page are scaled down by at most this factor (0 = off, 1.4 = mPDF default) */
     public float $shrinkTablesToFit = 1.4;
 

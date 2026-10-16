@@ -121,6 +121,28 @@ class FontManager
         foreach ($monoAliases as $alias) {
             $this->aliases[$alias] = 'dejavu sans mono';
         }
+
+        // Liberation (SIL OFL 1.1) is metric-compatible with Arial / Times New Roman / Courier New, so templates
+        // written for those fonts keep their line breaks and page counts
+        foreach (['sans' => 'Sans', 'serif' => 'Serif', 'mono' => 'Mono'] as $key => $file) {
+            $this->registerFamily('liberation ' . $key, [
+                'regular' => $this->fontDir . "/Liberation{$file}-Regular.ttf",
+                'bold' => $this->fontDir . "/Liberation{$file}-Bold.ttf",
+                'italic' => $this->fontDir . "/Liberation{$file}-Italic.ttf",
+                'bold_italic' => $this->fontDir . "/Liberation{$file}-BoldItalic.ttf",
+            ]);
+        }
+        $metricAliases = [
+            'arial' => 'liberation sans', 'helvetica' => 'liberation sans', 'helvetica neue' => 'liberation sans',
+            'arimo' => 'liberation sans', 'liberationsans' => 'liberation sans',
+            'times' => 'liberation serif', 'times new roman' => 'liberation serif', 'tinos' => 'liberation serif',
+            'liberationserif' => 'liberation serif',
+            'courier' => 'liberation mono', 'courier new' => 'liberation mono', 'cousine' => 'liberation mono',
+            'liberationmono' => 'liberation mono',
+        ];
+        foreach ($metricAliases as $alias => $family) {
+            $this->aliases[$alias] = $family;
+        }
     }
 
     /**

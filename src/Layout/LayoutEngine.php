@@ -97,6 +97,8 @@ class LayoutEngine
     public function layoutElement(LayoutBox $box, float $x, float $y, float $containingWidth): void
     {
         $box->lines = [];
+        $box->collapsedMarginTop = 0.0;
+        $box->collapsedMarginBottom = 0.0;
         $this->resolveBoxMetrics($box, $containingWidth);
 
         $box->x = $x;
@@ -201,6 +203,12 @@ class LayoutEngine
         $prevMarginBottom = 0.0;
         $maxFloatBottom = $contentY;
 
+        // Parent / first-child and parent / last-child margin collapsing (CSS 2.1 8.3.1)
+        $canCollapse = $this->createsNoBlockContext($container);
+        $topOpen = $canCollapse && $container->borderTop <= 0.0 && $container->paddingTop <= 0.0;
+        $bottomOpen = $canCollapse && $container->borderBottom <= 0.0 && $container->paddingBottom <= 0.0
+            && $container->forcedBorderBoxHeight === null && $this->hasAutoHeight($container);
+
         /** @var list<array{left: float, right: float, top: float, bottom: float}> $leftFloats */
         $leftFloats = [];
         /** @var list<array{left: float, right: float, top: float, bottom: float}> $rightFloats */
@@ -230,16 +238,21 @@ class LayoutEngine
         /** @var list<LayoutBox> $inlineBuffer */
         $inlineBuffer = [];
 
-        $flushInlineBuffer = function () use (&$inlineBuffer, $container, &$cursorY, &$prevMarginBottom, $getBandAtY): void {
+        $flushInlineBuffer = function () use (&$inlineBuffer, $container, &$cursorY, &$prevMarginBottom, $getBandAtY, &$topOpen, &$leftFloats, &$rightFloats): void {
             if (empty($inlineBuffer)) {
                 return;
             }
+            $topOpen = false;
             if ($prevMarginBottom > 0.0) {
                 $cursorY += $prevMarginBottom;
                 $prevMarginBottom = 0.0;
             }
             [$bandLeft, $bandRight] = $getBandAtY($cursorY, 14.0);
             $bandWidth = max(10.0, $bandRight - $bandLeft);
+            if ($leftFloats !== [] || $rightFloats !== []) {
+                // Lines below the end of a float widen again (per-line wrapping around floats)
+                $this->inlineLayout->bandProvider = static fn(float $y, float $h): array => $getBandAtY($y, $h);
+            }
             $cursorY = $this->inlineLayout->layoutInlineSequence($container, $inlineBuffer, $bandLeft, $cursorY, $bandWidth);
             $inlineBuffer = [];
         };
@@ -252,6 +265,9 @@ class LayoutEngine
             $floatCss = strtolower(trim($child->style->get('float', 'none')));
             $clearCss = strtolower(trim($child->style->get('clear', 'none')));
 
+            if ($clearCss !== 'none' && $clearCss !== '') {
+                $topOpen = false;
+            }
             if ($clearCss === 'left' || $clearCss === 'both') {
                 $flushInlineBuffer();
                 foreach ($leftFloats as $lf) {
@@ -271,6 +287,7 @@ class LayoutEngine
 
             if ($floatCss === 'left' || $floatCss === 'right') {
                 $flushInlineBuffer();
+                $topOpen = false;
                 $this->resolveBoxMetrics($child, $contentWidth);
 
                 $wCss = strtolower(trim($child->style->get('width', 'auto')));
@@ -373,14 +390,120 @@ class LayoutEngine
             $childX = $bandLeft + $child->marginLeft;
             $this->layoutElement($child, $childX, $childY, $bandWidth);
 
-            $cursorY = $childY + $child->height;
-            $prevMarginBottom = $child->marginBottom;
+            // Margins that escaped from the child's own first / last children join the child's margins
+            $childTopEff = self::collapseMargins($child->marginTop, $child->collapsedMarginTop);
+            $childBottomEff = self::collapseMargins($child->marginBottom, $child->collapsedMarginBottom);
+
+            if ($this->isEmptyCollapsibleBlock($child)) {
+                // An empty block's top and bottom margins collapse together and with its neighbours
+                $prevMarginBottom = self::collapseMargins($prevMarginBottom, $childTopEff, $childBottomEff);
+                $child->translate(0.0, ($topOpen ? $cursorY : $cursorY + $prevMarginBottom) - $child->y);
+                continue;
+            }
+
+            $topMargin = self::collapseMargins($prevMarginBottom, $childTopEff);
+            if ($topOpen) {
+                // The container has nothing above this child: the margin escapes through the container's top edge
+                $container->collapsedMarginTop = $topMargin;
+                $topMargin = 0.0;
+                $topOpen = false;
+            }
+            $targetY = $cursorY + $topMargin;
+            if (abs($targetY - $child->y) > 0.0001) {
+                $child->translate(0.0, $targetY - $child->y);
+            }
+
+            $cursorY = $targetY + $child->height;
+            $prevMarginBottom = $childBottomEff;
         }
 
         $flushInlineBuffer();
+        if ($topOpen) {
+            // Only empty blocks inside: their collapsed margin passes through the container
+            $container->collapsedMarginTop = $prevMarginBottom;
+            $prevMarginBottom = 0.0;
+        } elseif ($bottomOpen && $maxFloatBottom <= $cursorY + 0.01) {
+            $container->collapsedMarginBottom = $prevMarginBottom;
+            $prevMarginBottom = 0.0;
+        }
         $cursorY += $prevMarginBottom;
 
         return max(0.0, max($cursorY, $maxFloatBottom) - $contentY);
+    }
+
+    /** Adjoining vertical margins collapse to the largest positive plus the most negative one. */
+    private static function collapseMargins(float ...$margins): float
+    {
+        $pos = 0.0;
+        $neg = 0.0;
+        foreach ($margins as $m) {
+            $pos = max($pos, $m);
+            $neg = min($neg, $m);
+        }
+        return $pos + $neg;
+    }
+
+    private function hasAutoHeight(LayoutBox $box): bool
+    {
+        $h = strtolower(trim($box->style->get('height', 'auto')));
+        $minH = strtolower(trim($box->style->get('min-height', '0')));
+        return ($h === 'auto' || $h === '')
+            && ($minH === '' || $minH === 'auto' || $minH === 'none' || (is_numeric(rtrim($minH, 'ptxem%')) && (float) $minH === 0.0));
+    }
+
+    /**
+     * True when $box takes part in its parent's margin collapsing with its children, i.e. it is an in-flow
+     * normal-flow block that does not establish a new block formatting context.
+     */
+    private function createsNoBlockContext(LayoutBox $box): bool
+    {
+        $parent = $box->parent;
+        if ($parent === null || $box->isPositionedOutOfFlow() || $box->isTextNode() || $box->columnFlow !== null) {
+            return false;
+        }
+        $display = $box->getDisplay();
+        if ($display !== 'block' && $display !== 'list-item') {
+            return false;
+        }
+        $pd = $parent->getDisplay();
+        if ($pd !== 'block' && $pd !== 'list-item') {
+            return false; // flex / grid / table / inline-block parents make this box a BFC root or a cell
+        }
+        if ($parent->columnFlow !== null || $this->columnLayout->isMulticol($parent) || $this->columnLayout->isMulticol($box)) {
+            return false;
+        }
+        $style = $box->style;
+        if (strtolower(trim($style->get('float', 'none'))) !== 'none') {
+            return false;
+        }
+        foreach (['overflow', 'overflow-x', 'overflow-y'] as $prop) {
+            $v = strtolower(trim($style->get($prop, 'visible')));
+            if ($v !== 'visible' && $v !== '') {
+                return false;
+            }
+        }
+        $pos = strtolower(trim($style->get('position', 'static')));
+        if ($pos !== 'static' && $pos !== 'relative' && $pos !== '') {
+            return false;
+        }
+        return $box->formControl === null && !in_array($box->tagName, ['img', 'svg', 'hr', 'br', 'table'], true);
+    }
+
+    /** A block without content, height, padding or border: its own top and bottom margins collapse through it. */
+    private function isEmptyCollapsibleBlock(LayoutBox $box): bool
+    {
+        if ($box->height > 0.01 || $box->getVerticalSpacing() > 0.0 || $box->lines !== [] || !$this->createsNoBlockContext($box)) {
+            return false;
+        }
+        if (!$this->hasAutoHeight($box) || $box->forcedBorderBoxHeight !== null) {
+            return false;
+        }
+        foreach ($box->children as $c) {
+            if (!$c->isPositionedOutOfFlow() && !$c->isTextNode() && $c->height > 0.01) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -765,7 +888,10 @@ class LayoutEngine
     /**
      * Measures the intrinsic `min-content` and `max-content` border-box width of a LayoutBox.
      *
-     * @return array{min: float, max: float}
+     * Plain inline boxes that contain a forced break (`<br>`) also report `lead` / `trail`: the widths of their
+     * first and last line pieces, which join the parent's current line run instead of the whole content.
+     *
+     * @return array{min: float, max: float, lead?: float, trail?: float}
      */
     public function measureIntrinsicWidth(LayoutBox $box, float $referenceWidth, bool $ignoreExplicitWidth = false): array
     {
@@ -776,6 +902,10 @@ class LayoutEngine
         if (!$ignoreExplicitWidth && $wCss !== 'auto' && $wCss !== '' && !str_ends_with($wCss, '%') && !str_contains($wCss, 'content')) {
             $fixedW = $this->resolveBoxHorizontalDimension($box, $wCss, $referenceWidth);
             return ['min' => $fixedW, 'max' => $fixedW];
+        }
+
+        if ($box->tagName === 'br') {
+            return ['min' => 0.0, 'max' => 0.0, 'lead' => 0.0, 'trail' => 0.0];
         }
 
         if ($box->tagName === 'img') {
@@ -835,6 +965,7 @@ class LayoutEngine
         $minContent = 0.0;
         $maxContent = 0.0;
         $inlineRunMax = 0.0;
+        $lead = null; // width of the first line piece, once a forced break was seen
 
         foreach ($box->children as $child) {
             if ($child->isPositionedOutOfFlow()) {
@@ -847,6 +978,16 @@ class LayoutEngine
             if ($isFlexRow) {
                 $minContent += $childMin;
                 $maxContent += $childMax;
+            } elseif ($child->isInlineLevel() && isset($childIntr['lead'], $childIntr['trail'])) {
+                // Forced break inside: its first piece ends the current line, its last piece starts the next one
+                if ($childMin > $minContent) {
+                    $minContent = $childMin;
+                }
+                $inlineRunMax += $childIntr['lead'] + $child->marginLeft;
+                $lead ??= $inlineRunMax;
+                $maxContent = max($maxContent, $inlineRunMax, $childMax);
+                $inlineRunMax = $childIntr['trail'] + $child->marginRight;
+                $maxContent = max($maxContent, $inlineRunMax);
             } elseif ($child->isInlineLevel()) {
                 if ($childMin > $minContent) {
                     $minContent = $childMin;
@@ -878,10 +1019,15 @@ class LayoutEngine
             return ['min' => $adj['min'] + $hSpace, 'max' => $adj['max'] + $hSpace];
         }
 
-        return [
+        $result = [
             'min' => $minContent + $hSpace,
             'max' => max($minContent, $maxContent) + $hSpace,
         ];
+        if ($lead !== null && $display === 'inline' && !$isFlexRow) {
+            $result['lead'] = $lead + $hSpace / 2;
+            $result['trail'] = $inlineRunMax + $hSpace / 2;
+        }
+        return $result;
     }
 
     public function resolveFontSize(ComputedStyle $style, float $parentFontSizePt): float

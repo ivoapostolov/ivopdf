@@ -58,15 +58,25 @@ trait MpdfApi
     public function render(): self
     {
         $this->mpdfMem = ['ix' => [], 'blank' => []];
+        $this->footnoteMem = [];
         $savedWm = [$this->options->watermarkText, $this->options->watermarkOpacity];
         try {
-            for ($pass = 0; $pass < 4; $pass++) {
+            for ($pass = 0; $pass < 5; $pass++) {
                 $this->renderCore();
+                $again = false;
                 $next = $this->mpdfNextMem;
-                if ($next === null || $next == $this->mpdfMem) {
+                if ($next !== null && $next != $this->mpdfMem) {
+                    $this->mpdfMem = $next;
+                    $again = true;
+                }
+                // CSS footnotes: the pages of the calls decide how much room every page reserves
+                if ($this->footnoteNext !== null && $this->footnoteNext != $this->footnoteMem) {
+                    $this->footnoteMem = $this->footnoteNext;
+                    $again = true;
+                }
+                if (!$again || ($pass >= 3 && $this->footnoteNext === null)) {
                     break;
                 }
-                $this->mpdfMem = $next;
             }
         } finally {
             [$this->options->watermarkText, $this->options->watermarkOpacity] = $savedWm;
@@ -87,7 +97,14 @@ trait MpdfApi
         $state = new MpdfState();
         $state->headers = $this->mpdfDefHeaders;
         $state->footers = $this->mpdfDefFooters;
+        $state->defaultFont = $this->options->defaultFont;
+        $state->measure = fn(string $t, string $family, string $weight, string $style, float $pt): float => $this->fontManager->measureText($t, $family, $weight, $style, $pt);
         $this->mpdfNextMem = null;
+        $docCss = '';
+        if (preg_match_all('~<style\b[^>]*>(.*?)</style>~is', $html, $styleBlocks)) {
+            $docCss = implode(' ', $styleBlocks[1]);
+        }
+        $state->docCss = trim($docCss . ' ' . $this->mpdfHeadCss);
         $out = MpdfTags::transform($html, $state, $this->mpdfMem);
         $this->mpdfState = $state;
 
@@ -172,7 +189,7 @@ trait MpdfApi
             if ($name === '') {
                 $html = '';
             } elseif (isset($defs[$name])) {
-                $html = $defs[$name];
+                $html = $st->withDocCss($defs[$name]);
             } else {
                 $this->options->addWarning("mPDF: unknown html{$kind} '{$name}'");
             }
@@ -198,7 +215,7 @@ trait MpdfApi
         $out = [$fallback];
         if ($this->mpdfState !== null) {
             foreach ($kind === 'header' ? $this->mpdfState->headers : $this->mpdfState->footers as $html) {
-                $out[] = strtr($html, ['{nb}' => '{PAGE_COUNT}']);
+                $out[] = strtr($this->mpdfState->withDocCss($html), ['{nb}' => '{PAGE_COUNT}']);
             }
         }
         return $out;

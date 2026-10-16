@@ -300,15 +300,39 @@ class Paginator
     private function processTablePagination(LayoutBox $table): void
     {
         $thead = null;
+        $tfoot = null;
         /** @var list<LayoutBox> $rows */
         $rows = [];
+        /** @var list<LayoutBox> $footRows */
+        $footRows = [];
+
+        // TableLayout places <tfoot> visually last wherever it is written: paginate in that same order
+        $footGroups = [];
+        $otherChildren = [];
+        foreach ($table->children as $child) {
+            if ($child->tagName === 'tfoot' || $child->getDisplay() === 'table-footer-group') {
+                $footGroups[] = $child;
+            } else {
+                $otherChildren[] = $child;
+            }
+        }
+        if ($footGroups !== []) {
+            $table->children = array_merge($otherChildren, $footGroups);
+        }
 
         foreach ($table->children as $child) {
             $tag = $child->tagName;
             $disp = $child->getDisplay();
             if ($tag === 'thead' || $disp === 'table-header-group') {
                 $thead = $child;
-            } elseif ($tag === 'tbody' || $disp === 'table-row-group' || $tag === 'tfoot' || $disp === 'table-footer-group') {
+            } elseif ($tag === 'tfoot' || $disp === 'table-footer-group') {
+                $tfoot ??= $child;
+                foreach ($child->children as $r) {
+                    if ($r->tagName === 'tr' || $r->getDisplay() === 'table-row') {
+                        $footRows[] = $r;
+                    }
+                }
+            } elseif ($tag === 'tbody' || $disp === 'table-row-group') {
                 foreach ($child->children as $r) {
                     if ($r->tagName === 'tr' || $r->getDisplay() === 'table-row') {
                         $rows[] = $r;
@@ -317,6 +341,14 @@ class Paginator
             } elseif ($tag === 'tr' || $disp === 'table-row') {
                 $rows[] = $child;
             }
+        }
+        // Browsers print the footer group at the bottom of every page the table spans: reserve room for it
+        $canRepeatTfoot = $tfoot !== null && count($footGroups) === 1 && $rows !== [] && $tfoot->height > 0.5
+            && $tfoot->height < ($this->printableHeight * 0.3)
+            && $tfoot->height + ($thead?->height ?? 0.0) < ($this->printableHeight * 0.5);
+        $footReserve = $canRepeatTfoot ? $tfoot->height : 0.0;
+        if (!$canRepeatTfoot) {
+            array_push($rows, ...$footRows);
         }
 
         $tableStartPage = $this->getPageIndexForY($table->y);
@@ -349,7 +381,7 @@ class Paginator
             $rowPage = $this->getPageIndexForY($row->y);
             [$pageTop, $pageBottom] = $this->getPageBounds($rowPage);
 
-            if ($row->height <= $this->printableHeight * 0.90 && ($row->y + $row->height > $pageBottom + 0.5) && ($row->y > $pageTop + 1.0)) {
+            if ($row->height <= $this->printableHeight * 0.90 && ($row->y + $row->height > $pageBottom - $footReserve + 0.5) && ($row->y > $pageTop + 1.0)) {
                 $nextPage = $rowPage + 1;
                 [$nextPageTop] = $this->getPageBounds($nextPage);
 
@@ -369,6 +401,28 @@ class Paginator
 
         foreach ($clonedHeaders as $ch) {
             $table->addChild($ch);
+        }
+
+        // Repeat <tfoot> right below the last row of every page except the one that holds the real footer
+        if ($canRepeatTfoot && $tfoot !== null) {
+            $this->sync($tfoot);
+            $footTopOffset = max(0.0, $tfoot->y - $this->findMinTop($tfoot));
+            $realPage = $this->getPageIndexForY($tfoot->y + 0.5);
+            /** @var array<int, float> $pageBottoms */
+            $pageBottoms = [];
+            foreach ($rows as $row) {
+                $this->sync($row);
+                $pg = $this->getPageIndexForY($row->y + 0.5);
+                $pageBottoms[$pg] = max($pageBottoms[$pg] ?? 0.0, $row->y + $row->height);
+            }
+            foreach ($pageBottoms as $pg => $bottom) {
+                if ($pg >= $realPage) {
+                    continue;
+                }
+                $clone = $this->deepCloneBox($tfoot);
+                $clone->translate(0.0, $bottom + $footTopOffset - $clone->y);
+                $table->addChild($clone);
+            }
         }
 
         // Handle explicit page-break-after on the table itself
@@ -498,7 +552,8 @@ class Paginator
                     $foundCurr = true;
                     continue;
                 }
-                if ($foundCurr && !$sibling->isPositionedOutOfFlow() && $sibling->y + $sibling->pendingDy >= $thresholdY) {
+                if ($foundCurr && !$sibling->isPositionedOutOfFlow() && $sibling->y + $sibling->pendingDy >= $thresholdY
+                    && !($sibling->isInlineLevel() && !empty($parent->lines))) {
                     $sibling->pendingDy += $delta; // applied lazily: O(1) instead of re-translating the whole remaining document
                 }
             }
@@ -537,7 +592,8 @@ class Paginator
             return;
         }
         foreach ($box->children as $child) {
-            if (!$child->isPositionedOutOfFlow() && $child->y >= $thresholdY) {
+            // Inline-level children are positioned through the (already shifted) line boxes: never shift them twice
+            if (!$child->isPositionedOutOfFlow() && $child->y + $child->pendingDy >= $thresholdY && !($child->isInlineLevel() && !empty($box->lines))) {
                 $child->translate(0.0, $delta);
             }
         }
@@ -563,8 +619,16 @@ class Paginator
                     $foundCurr = true;
                     continue;
                 }
-                if ($foundCurr && !$sibling->isPositionedOutOfFlow() && $sibling->y + $sibling->pendingDy >= $thresholdY) {
+                if ($foundCurr && !$sibling->isPositionedOutOfFlow() && $sibling->y + $sibling->pendingDy >= $thresholdY
+                    && !($sibling->isInlineLevel() && !empty($parent->lines))) {
                     $sibling->pendingDy += $delta;
+                }
+            }
+
+            // Inline content (anonymous text / inline boxes) of the parent that follows $curr moves with it
+            foreach ($parent->lines as $line) {
+                if ($line->y >= $thresholdY) {
+                    $line->translate(0.0, $delta);
                 }
             }
 

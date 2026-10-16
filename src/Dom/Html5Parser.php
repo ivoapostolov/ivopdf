@@ -66,7 +66,12 @@ final class Html5Parser
             [$node, $parent, $depth] = array_pop($stack);
 
             if ($node instanceof \Dom\Text) {
-                $parent->appendChild($dst->createTextNode($node->data));
+                // Merge with a preceding text node (left behind when a comment between them was dropped)
+                if ($parent->lastChild instanceof \DOMText) {
+                    $parent->lastChild->appendData($node->data);
+                } else {
+                    $parent->appendChild($dst->createTextNode($node->data));
+                }
                 continue;
             }
             if (!$node instanceof \Dom\Element) {
@@ -134,8 +139,34 @@ final class Html5Parser
         return implode('', $parts);
     }
 
-    /** libxml's HTML4 parser (the pre-PHP-8.4 behaviour): wraps fragments, forces UTF-8. */
-    public static function parseLegacy(string $html): DOMDocument
+    /**
+     * libxml's HTML4 parser (the pre-PHP-8.4 behaviour): wraps fragments, forces UTF-8.
+     *
+     * libxml stops parsing at 256 nested elements and silently drops the rest, so a too-deep source is flattened
+     * before parsing and the resulting tree is capped at $maxDepth, matching parse().
+     *
+     * @param (callable(string): void)|null $warn
+     */
+    public static function parseLegacy(string $html, int $maxDepth = 256, ?callable $warn = null): DOMDocument
+    {
+        $maxDepth = max(8, $maxDepth);
+        $flattened = false;
+        $dom = self::loadLegacy($html, $tooDeep);
+        if ($tooDeep) {
+            $dom = self::loadLegacy(self::capSourceDepth($html, min($maxDepth, 200)), $tooDeep);
+            $flattened = true;
+        }
+        $root = $dom->documentElement;
+        if ($root !== null && self::capTreeDepth($root, $maxDepth)) {
+            $flattened = true;
+        }
+        if ($flattened && $warn !== null) {
+            $warn("HTML nesting deeper than {$maxDepth} levels was flattened (see Options::\$maxNestingDepth).");
+        }
+        return $dom;
+    }
+
+    private static function loadLegacy(string $html, ?bool &$tooDeep): DOMDocument
     {
         $dom = new DOMDocument('1.0', 'UTF-8');
         $prevLibxml = libxml_use_internal_errors(true);
@@ -151,9 +182,137 @@ final class Html5Parser
         }
 
         @$dom->loadHTML($wrappedHtml, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD | LIBXML_COMPACT);
+        $tooDeep = false;
+        foreach (libxml_get_errors() as $error) {
+            if (stripos($error->message, 'depth') !== false) {
+                $tooDeep = true;
+                break;
+            }
+        }
         libxml_clear_errors();
         libxml_use_internal_errors($prevLibxml);
+        // Comments render nothing: drop them and glue the text nodes they separated (same result as the HTML5 path)
+        $comments = [];
+        foreach ((new \DOMXPath($dom))->query('//comment()') ?: [] as $c) {
+            $comments[] = $c;
+        }
+        foreach ($comments as $c) {
+            $c->parentNode?->removeChild($c);
+        }
+        if ($comments !== []) {
+            $dom->normalize();
+        }
         return $dom;
+    }
+
+    /**
+     * Drops start/end tags nested deeper than $limit from the source (their content is kept), so libxml never
+     * reaches its own depth limit. Only used for pathological input; implied end tags are not modelled.
+     */
+    private static function capSourceDepth(string $html, int $limit): string
+    {
+        $parts = preg_split('~(<!--.*?-->|<script\b.*?</script\s*>|<style\b.*?</style\s*>)~is', $html, -1, PREG_SPLIT_DELIM_CAPTURE);
+        if ($parts === false) {
+            return $html;
+        }
+        $void = ['area' => 1, 'base' => 1, 'basefont' => 1, 'br' => 1, 'col' => 1, 'embed' => 1, 'frame' => 1, 'hr' => 1,
+            'img' => 1, 'input' => 1, 'keygen' => 1, 'link' => 1, 'meta' => 1, 'param' => 1, 'source' => 1, 'track' => 1, 'wbr' => 1];
+        /** @var list<array{0: string, 1: bool}> $stack */
+        $stack = [];
+        $kept = 0;
+        foreach ($parts as $i => $part) {
+            if ($i % 2 === 1) {
+                continue;
+            }
+            $parts[$i] = (string) preg_replace_callback(
+                '~<(/?)([A-Za-z][A-Za-z0-9:-]*)\b(?:"[^"]*"|\'[^\']*\'|[^>"\'])*>~',
+                static function (array $m) use (&$stack, &$kept, $void, $limit): string {
+                    $name = strtolower($m[2]);
+                    if ($m[1] === '/') {
+                        for ($j = count($stack) - 1; $j >= 0; $j--) {
+                            if ($stack[$j][0] === $name) {
+                                $keep = $stack[$j][1];
+                                while (count($stack) > $j) {
+                                    if (array_pop($stack)[1]) {
+                                        $kept--;
+                                    }
+                                }
+                                return $keep ? $m[0] : '';
+                            }
+                        }
+                        return $m[0];
+                    }
+                    if (isset($void[$name]) || str_ends_with($m[0], '/>')) {
+                        return $m[0];
+                    }
+                    $keep = $kept < $limit;
+                    $stack[] = [$name, $keep];
+                    if ($keep) {
+                        $kept++;
+                    }
+                    return $keep ? $m[0] : '';
+                },
+                $part
+            );
+        }
+        return implode('', $parts);
+    }
+
+    /** Moves everything below $maxDepth up into the ancestor at that depth, in document order. True if anything moved. */
+    private static function capTreeDepth(DOMElement $root, int $maxDepth): bool
+    {
+        $changed = false;
+        /** @var list<array{0: DOMElement, 1: int}> $stack */
+        $stack = [[$root, 0]];
+        while ($stack !== []) {
+            [$el, $depth] = array_pop($stack);
+            if ($depth < $maxDepth) {
+                foreach ($el->childNodes as $child) {
+                    if ($child instanceof DOMElement) {
+                        $stack[] = [$child, $depth + 1];
+                    }
+                }
+                continue;
+            }
+            $hasDeep = false;
+            foreach ($el->childNodes as $child) {
+                if ($child instanceof DOMElement && $child->firstChild !== null) {
+                    $hasDeep = true;
+                    break;
+                }
+            }
+            if (!$hasDeep) {
+                continue;
+            }
+            $changed = true;
+            // Flatten: every descendant becomes a child of $el (elements emptied, text kept)
+            $flat = [];
+            $walk = [];
+            for ($c = $el->lastChild; $c !== null; $c = $c->previousSibling) {
+                $walk[] = $c;
+            }
+            while ($walk !== []) {
+                $n = array_pop($walk);
+                $flat[] = $n;
+                for ($c = $n->lastChild; $c !== null; $c = $c->previousSibling) {
+                    $walk[] = $c;
+                }
+            }
+            foreach ($flat as $n) {
+                $n->parentNode?->removeChild($n);
+            }
+            foreach ($flat as $n) {
+                while ($n->firstChild !== null) {
+                    $n->removeChild($n->firstChild);
+                }
+                if ($n instanceof \DOMText && $el->lastChild instanceof \DOMText) {
+                    $el->lastChild->appendData($n->data);
+                } else {
+                    $el->appendChild($n);
+                }
+            }
+        }
+        return $changed;
     }
 
     private static function makeElement(DOMDocument $doc, string $name): DOMElement

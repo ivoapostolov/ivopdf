@@ -21,3 +21,6 @@
 /skills export-ignore
 /index.php export-ignore
 /.gitattributes export-ignore
+# Also keeps nested integrations/*/vendor out of Composer path-repo copies.
+/integrations export-ignore
+/.gitignore export-ignore

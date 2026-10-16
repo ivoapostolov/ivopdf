@@ -768,12 +768,12 @@ $doc = renderDoc(
 check('break-after + break-before produce exactly 3 pages', $doc->getPageCount() === 3, 'got ' . $doc->getPageCount());
 
 $longRows = '<table style="width:100%">';
-for ($i = 1; $i <= 60; $i++) {
+for ($i = 1; $i <= 120; $i++) {
     $longRows .= "<tr><td>Row {$i} — ред {$i}</td><td>value {$i}</td></tr>";
 }
 $longRows .= '</table>';
 $doc = renderDoc('auto-pagination', "<html><body>{$longRows}</body></html>", [], 3);
-check('60-row table auto-paginates across >= 3 pages', $doc->getPageCount() >= 3, 'pages=' . $doc->getPageCount());
+check('120-row table auto-paginates across >= 3 pages', $doc->getPageCount() >= 3, 'pages=' . $doc->getPageCount());
 
 $filler = str_repeat('<p>' . str_repeat('Filler paragraph for pagination number testing ', 12) . '</p>', 40);
 $doc = renderDoc(
@@ -802,7 +802,7 @@ check('utf8ToCodepoints("Ж") = U+0416', $fm->utf8ToCodepoints('Ж') === [0x0416
 check('isBoldWeight(700)=true, (400)=false', $fm->isBoldWeight('700') === true && $fm->isBoldWeight('400') === false);
 
 $fontFiles = glob(__DIR__ . '/../resources/fonts/*.ttf');
-check('16 bundled TTF files found (Inter + DejaVu Sans/Serif/Mono x 4 variants)', count($fontFiles) === 16, 'found ' . count($fontFiles));
+check('28 bundled TTF files found (Inter, DejaVu Sans/Serif/Mono, Liberation Sans/Serif/Mono x 4 variants)', count($fontFiles) === 28, 'found ' . count($fontFiles));
 
 $custom = new IvoPdf();
 $custom->registerFontFamily('IvoSerif', [

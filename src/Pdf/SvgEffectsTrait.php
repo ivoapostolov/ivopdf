@@ -87,7 +87,7 @@ trait SvgEffectsTrait
         $empty = "0 0 0 0 re W n\n";
 
         $st = $s;
-        if (strtolower(trim((string) $cp->getAttribute('clipPathUnits'))) === 'objectboundingbox') {
+        if (strtolower(trim((string) ($cp->getAttribute('clipPathUnits') ?: $cp->getAttribute('clippathunits')))) === 'objectboundingbox') {
             $bbox = $this->elementBBox($target, $s);
             if ($bbox === null || $bbox[2] - $bbox[0] < 1e-9 || $bbox[3] - $bbox[1] < 1e-9) {
                 return $empty;
@@ -153,8 +153,8 @@ trait SvgEffectsTrait
         if ($mask === null || $this->tagOf($mask) !== 'mask' || $this->paints === null) {
             return null;
         }
-        $unitsBox = strtolower(trim($mask->getAttribute('maskUnits'))) !== 'userspaceonuse';
-        $contentBox = strtolower(trim($mask->getAttribute('maskContentUnits'))) === 'objectboundingbox';
+        $unitsBox = strtolower(trim(($mask->getAttribute('maskUnits') ?: $mask->getAttribute('maskunits')))) !== 'userspaceonuse';
+        $contentBox = strtolower(trim(($mask->getAttribute('maskContentUnits') ?: $mask->getAttribute('maskcontentunits')))) === 'objectboundingbox';
         $bbox = null;
         if ($unitsBox || $contentBox) {
             $bbox = $this->elementBBox($target, $s);

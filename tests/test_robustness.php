@@ -176,7 +176,7 @@ if (!$html5) {
 echo "\n2. Table shrink-to-fit\n";
 // ---------------------------------------------------------------------------
 $row = static fn(int $cols, string $word): string => '<tr>' . str_repeat("<td>{$word}</td>", $cols) . '</tr>';
-$wide = '<table border="1">' . str_repeat($row(8, 'Wonderful'), 3) . '</table>';
+$wide = '<style>td, th { padding: 6pt 8pt; }</style><table border="1">' . str_repeat($row(8, 'Wonderful'), 3) . '</table>';
 $tableOf = static fn(IvoPdf $p): ?LayoutBox => findBox($p->getLayoutTree(), static fn(LayoutBox $b): bool => $b->tagName === 'table');
 /** Largest overflow of any text run beyond its cell (pt) and whether any word got split. */
 $overflow = static function (LayoutBox $table): float {
@@ -372,7 +372,7 @@ for ($i = 0; $i < 48; $i++) {
 $t0 = microtime(true);
 gc_collect_cycles();
 $memBase = memory_get_usage();
-memory_reset_peak_usage();
+if (function_exists("memory_reset_peak_usage")) { memory_reset_peak_usage(); } // PHP 8.2+
 $perfPdf = renderDoc($perf, ['compress' => true]);
 $elapsed = microtime(true) - $t0;
 $pages = $perfPdf->getPageCount();

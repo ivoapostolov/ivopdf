@@ -51,7 +51,167 @@ class InlineLayout
         float $startY,
         float $availableWidth
     ): float {
+        if ($container->firstLineStyle === null || $container->lines !== [] || $this->firstLineProbe === $container) {
+            return $this->layoutInlineSequenceCore($container, $inlineNodes, $startX, $startY, $availableWidth, null);
+        }
+        return $this->layoutWithFirstLine($container, $inlineNodes, $startX, $startY, $availableWidth);
+    }
+
+    /**
+     * Set by the block layout right before layoutInlineSequence(): returns the free horizontal span [left, right]
+     * between floats for a line at (y, height), so paragraphs wrap around floats line by line.
+     *
+     * @var (\Closure(float, float): array{0: float, 1: float})|null
+     */
+    public ?\Closure $bandProvider = null;
+
+    /** Container currently being laid out in ::first-line probe passes */
+    private ?LayoutBox $firstLineProbe = null;
+
+    /**
+     * ::first-line: the first line box takes the pseudo-element's font/colour/text-transform. Because the style
+     * changes glyph widths, the paragraph is laid out on a scratch copy of the container with the first N characters
+     * restyled until the first line holds exactly the restyled text (or a stable compromise is found).
+     *
+     * @param list<LayoutBox> $inlineNodes
+     */
+    private function layoutWithFirstLine(LayoutBox $container, array $inlineNodes, float $startX, float $startY, float $availableWidth): float
+    {
+        $this->firstLineProbe = $container;
+        $band = $this->bandProvider;
+        try {
+            $trial = function (int $budget, ?int $breakAt) use ($container, $inlineNodes, $startX, $startY, $availableWidth, $band): array {
+                $probe = clone $container;
+                $probe->lines = [];
+                $this->bandProvider = $band;
+                $y = $this->layoutInlineSequenceCore($probe, $inlineNodes, $startX, $startY, $availableWidth, $budget, $breakAt);
+                $chars = 0;
+                if (isset($probe->lines[0])) {
+                    foreach ($probe->lines[0]->runs as $r) {
+                        $chars += $r->inlineBox !== null ? 1 : mb_strlen($r->text, 'UTF-8');
+                    }
+                }
+                return [$probe, $y, $chars];
+            };
+
+            // Unstyled baseline: how much text the first line holds
+            [$probe, $y, $chars] = $trial(0, null);
+            if ($chars > 0) {
+                // Find the largest K such that the first K characters, restyled, still fit on the first line
+                $good = 0;
+                $budget = $chars;
+                $visited = [];
+                for ($iter = 0; $iter < 6 && !isset($visited[$budget]); $iter++) {
+                    $visited[$budget] = true;
+                    [, , $c] = $trial($budget, null);
+                    if ($c >= $budget) {
+                        $good = max($good, $budget);
+                        if ($c === $budget) {
+                            break;
+                        }
+                    }
+                    $budget = $c; // longer than expected: try the larger prefix, shorter: shrink to what fits
+                }
+                if ($good > 0) {
+                    // Final pass: restyled prefix, forced line break right after it (later lines keep the normal style)
+                    [$probe, $y] = $trial($good, $good);
+                }
+            }
+            $container->lines = $probe->lines;
+            return $y;
+        } finally {
+            $this->bandProvider = null;
+            $this->firstLineProbe = null;
+        }
+    }
+
+    /**
+     * Applies the ::first-line style to the tokens that make up the first $budget characters.
+     *
+     * @param list<TextRun> $tokens
+     */
+    private function restyleFirstLine(array $tokens, LayoutBox $container, int $budget, ?int $breakAt = null): void
+    {
+        $fl = $container->firstLineStyle;
+        if ($fl === null || $budget <= 0) {
+            return;
+        }
+        $props = $container->firstLineProps;
+        $styles = [];
+        $offset = 0;
+        foreach ($tokens as $token) {
+            if ($offset >= $budget) {
+                if ($breakAt !== null && !$token->isWhitespace && !$token->isLineBreak) {
+                    $token->lineStart = true; // the first line ends right before this word
+                }
+                if ($breakAt === null || !$token->isWhitespace) {
+                    break;
+                }
+                continue;
+            }
+            if ($token->isLineBreak) {
+                break; // a forced break ends the first line
+            }
+            if ($token->inlineBox !== null) {
+                $offset++;
+                continue;
+            }
+            $offset += mb_strlen($token->text, 'UTF-8');
+            $key = spl_object_id($token->style);
+            if (!isset($styles[$key])) {
+                $ns = clone $token->style;
+                $baseFamily = $container->style->get('font-family', '');
+                foreach ($props as $p) {
+                    if ($p === 'font-family' && $token->style->get('font-family', '') !== $baseFamily) {
+                        continue; // keep the fallback family chosen for missing glyphs
+                    }
+                    $ns->set($p, $fl->get($p));
+                }
+                $styles[$key] = $ns;
+            }
+            $ns = $styles[$key];
+            $token->style = $ns;
+            $fontSizePt = $ns->getFontSizePt();
+            $token->fontSizePt = $fontSizePt;
+            $ttf = $this->fontManager->resolveFont($ns->get('font-family', 'DejaVu Sans'), $ns->get('font-weight', 'normal'), $ns->get('font-style', 'normal'));
+            $token->ascent = ($ttf->ascent / 1000.0) * $fontSizePt;
+            $token->descent = (abs($ttf->descent) / 1000.0) * $fontSizePt;
+            $token->height = $token->ascent + $token->descent;
+            $token->letterSpacingPt = $this->engine->resolveLength($ns->get('letter-spacing', '0'), 0.0, $fontSizePt);
+            if (!$token->isWhitespace && in_array('text-transform', $props, true)) {
+                $token->text = TextEffects::transform($token->text, $ns->get('text-transform', 'none'));
+            }
+            if ($token->isWhitespace) {
+                $wordSpacing = $this->engine->resolveLength($ns->get('word-spacing', '0'), 0.0, $fontSizePt);
+                $token->width = $this->fontManager->measureText(
+                    $token->text,
+                    $ns->get('font-family', 'DejaVu Sans'),
+                    $ns->get('font-weight', 'normal'),
+                    $ns->get('font-style', 'normal'),
+                    $fontSizePt,
+                    $token->letterSpacingPt
+                ) + $wordSpacing * strlen($token->text);
+            } else {
+                $this->shapeRun($token);
+            }
+        }
+    }
+
+    /**
+     * @param list<LayoutBox> $inlineNodes
+     */
+    private function layoutInlineSequenceCore(
+        LayoutBox $container,
+        array $inlineNodes,
+        float $startX,
+        float $startY,
+        float $availableWidth,
+        ?int $firstLineBudget,
+        ?int $firstLineBreakAt = null
+    ): float {
         $tokens = [];
+        $band = $this->bandProvider;
+        $this->bandProvider = null; // only this paragraph wraps around floats, not nested inline-blocks
         $outerBidiFlag = $this->bidiFlag;
         $outerSpans = $this->spanRecords;
         $this->bidiFlag = false;
@@ -66,6 +226,9 @@ class InlineLayout
 
         if (empty($tokens)) {
             return $startY;
+        }
+        if ($firstLineBudget !== null && $firstLineBudget > 0) {
+            $this->restyleFirstLine($tokens, $container, $firstLineBudget, $firstLineBreakAt);
         }
 
         // Bidi: resolve embedding levels on the logical paragraph before line breaking
@@ -93,9 +256,25 @@ class InlineLayout
         /** @var TextRun|null $pendingLeft whitespace dropped at a line start whose left-side decorations move to the next run */
         $pendingLeft = null;
 
-        $flushLine = function (bool $forced) use (&$rawLines, &$currentRuns, &$currentWidth): void {
+        // Text wrapping around floats: every line may have its own left edge and width (see $bandProvider)
+        $availW = $availableWidth;
+        $lineDx = 0.0;
+        $lineY = $startY;
+        $strutLh = $this->resolveLineHeight($container->style->get('line-height', '1.4'), $container->fontSizePt);
+
+        $flushLine = function (bool $forced) use (&$rawLines, &$currentRuns, &$currentWidth, &$availW, &$lineDx, &$lineY, $band, $startX, $strutLh, $container): void {
             $this->trimTrailingWhitespace($currentRuns);
-            $rawLines[] = ['runs' => $currentRuns, 'forcedBreak' => $forced];
+            $rawLines[] = ['runs' => $currentRuns, 'forcedBreak' => $forced, 'dx' => $lineDx, 'w' => $availW];
+            if ($band !== null) {
+                $h = $strutLh;
+                foreach ($currentRuns as $r) {
+                    $h = max($h, $r->inlineBox !== null ? $r->ascent + $r->descent : $this->resolveLineHeight($r->style->get('line-height', '1.4'), $r->fontSizePt));
+                }
+                $lineY += $h;
+                [$bl, $br] = $band($lineY, $strutLh);
+                $lineDx = $bl - $startX;
+                $availW = max(10.0, $br - $bl);
+            }
             $currentRuns = [];
             $currentWidth = 0.0;
         };
@@ -104,6 +283,10 @@ class InlineLayout
             if ($token->isLineBreak) {
                 $flushLine(true);
                 continue;
+            }
+
+            if ($token->lineStart && !empty($currentRuns)) {
+                $flushLine(false); // ::first-line probe: the first line ends before this token
             }
 
             $preserve = $this->preservesSpaces($token);
@@ -132,7 +315,7 @@ class InlineLayout
 
             $tokenTotalWidth = $token->width + $token->paddingLeft + $token->paddingRight;
 
-            if (!empty($currentRuns) && $availableWidth > 1.0 && ($currentWidth + $tokenTotalWidth > $availableWidth + 0.05)) {
+            if (!empty($currentRuns) && $availW > 1.0 && ($currentWidth + $tokenTotalWidth > $availW + 0.05)) {
                 if ($token->isWhitespace && !$isNoWrap && !$preserve) {
                     // The space itself overflows: break here and drop it
                     $pendingLeft = $this->mergeLeftEdge($pendingLeft, $token);
@@ -140,14 +323,14 @@ class InlineLayout
                     continue;
                 }
 
-                if ($token->breakBefore && !$isNoWrap && ($token->softBreak === null || $currentWidth + $token->softBreakWidth <= $availableWidth + 0.05)) {
+                if ($token->breakBefore && !$isNoWrap && ($token->softBreak === null || $currentWidth + $token->softBreakWidth <= $availW + 0.05)) {
                     $this->appendBreakHyphen($currentRuns, $token);
                     $flushLine(false);
                 } else {
                     // Glued to the previous run (e.g. "foo<b>bar</b>"): move the whole unbreakable word to the next line
                     $breakIdx = null;
                     for ($k = count($currentRuns) - 1; $k >= 1; $k--) {
-                        if ($currentRuns[$k]->breakBefore && $this->breakHyphenFits($currentRuns, $k, $availableWidth)) {
+                        if ($currentRuns[$k]->breakBefore && $this->breakHyphenFits($currentRuns, $k, $availW)) {
                             $breakIdx = $k;
                             break;
                         }
@@ -177,12 +360,12 @@ class InlineLayout
             }
 
             // A single word still wider than the line: break it by characters (unless nowrap)
-            if (!$isNoWrap && !$token->isWhitespace && $token->inlineBox === null && ($currentWidth + $tokenTotalWidth > $availableWidth + 0.05) && $availableWidth > 5.0 && $tokenTotalWidth > $availableWidth + 0.05) {
-                $pieces = $this->splitOversizedWordToken($token, max(5.0, $availableWidth - $currentWidth), $availableWidth);
+            if (!$isNoWrap && !$token->isWhitespace && $token->inlineBox === null && ($currentWidth + $tokenTotalWidth > $availW + 0.05) && $availW > 5.0 && $tokenTotalWidth > $availW + 0.05) {
+                $pieces = $this->splitOversizedWordToken($token, max(5.0, $availW - $currentWidth), $availW);
                 $pieceCount = count($pieces);
                 foreach ($pieces as $pi => $piece) {
                     $pieceWidth = $piece->width + $piece->paddingLeft + $piece->paddingRight;
-                    if (!empty($currentRuns) && ($currentWidth + $pieceWidth > $availableWidth + 0.05)) {
+                    if (!empty($currentRuns) && ($currentWidth + $pieceWidth > $availW + 0.05)) {
                         $flushLine(false);
                     }
                     $currentRuns[] = $piece;
@@ -247,7 +430,8 @@ class InlineLayout
             }
 
             $lineBox = new LineBox();
-            $lineBox->x = $startX;
+            $lineStartX = $startX + $lineData['dx'];
+            $lineBox->x = $lineStartX;
             $lineBox->y = $cursorY;
 
             $maxAscent = 0.0;
@@ -294,10 +478,10 @@ class InlineLayout
             $lineBox->baselineOffset = $maxAscent;
 
             $indent = ($lineIdx === 0) ? $textIndentPt : 0.0;
-            $freeSpace = max(0.0, $availableWidth - $runsTotalWidth - $indent);
+            $freeSpace = max(0.0, $lineData['w'] - $runsTotalWidth - $indent);
             $extraSpacePerGap = 0.0;
 
-            $offsetX = $startX + ($baseLevel === 1 ? 0.0 : $indent);
+            $offsetX = $lineStartX + ($baseLevel === 1 ? 0.0 : $indent);
             if ($textAlign === 'center') {
                 $offsetX += $freeSpace / 2.0;
             } elseif ($textAlign === 'right' || $textAlign === 'end') {
@@ -1132,6 +1316,11 @@ class InlineLayout
             return;
         }
 
+        $scMode = TextEffects::smallCapsMode($style);
+        if ($scMode > 0 && TextEffects::fontHasSmallCaps($this->fontManager->resolveFont($fontFamily, $fontWeight, $fontStyle), $scMode)) {
+            $scMode = 0; // the font substitutes small capitals itself (smcp / c2sc through FontFeatures)
+        }
+
         foreach ($parts as $part) {
             $isSpace = trim($part, " \t\n\r\f") === '';
             if ($isSpace) {
@@ -1158,22 +1347,55 @@ class InlineLayout
                 $pieces = \IvoPdf\Text\WordBreakMode::apply($pieces, $style);
             }
             foreach (SoftBreaker::expand($pieces, $style) as [$piece, $breakAllowed, $isSoft]) {
-                // Characters missing from the font are rendered with a fallback family (glued to the same word)
-                foreach ($this->splitByFontCoverage($piece, $style, $fontFamily, $fontWeight, $fontStyle) as $si => [$segment, $segStyle]) {
-                    $segFamily = $segStyle->get('font-family', $fontFamily);
-                    $run = new TextRun($segment, $segStyle, 0.0, $fontSizePt, $ascentPt, $descentPt, false, $href);
-                    $run->letterSpacingPt = $letterSpacingPt;
-                    $run->wide = $wide;
-                    $this->shapeRun($run);
-                    $run->afterHyphen = $breakAllowed && $si === 0;
-                    if ($isSoft && $si === 0) {
-                        $run->softBreak = SoftBreaker::hyphenChar($style);
-                        $run->softBreakWidth = $this->fontManager->measureText($run->softBreak, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
+                // font-variant: small-caps without native glyphs: lowercase letters become capitals at a reduced size
+                $subs = $scMode > 0 ? TextEffects::smallCapsSegments($piece, $scMode) : [[$piece, false]];
+                foreach ($subs as $subIdx => [$subText, $isSmall]) {
+                    $cStyle = $style;
+                    $cSize = $fontSizePt;
+                    $cAscent = $ascentPt;
+                    $cDescent = $descentPt;
+                    if ($isSmall) {
+                        $cStyle = $this->smallCapsStyle($style, $fontSizePt);
+                        $cSize = $fontSizePt * TextEffects::SMALL_CAPS_SCALE;
+                        $cAscent = $ascentPt * TextEffects::SMALL_CAPS_SCALE;
+                        $cDescent = $descentPt * TextEffects::SMALL_CAPS_SCALE;
+                        $subText = mb_strtoupper($subText, 'UTF-8');
                     }
-                    $tokens[] = $run;
+                    // Characters missing from the font are rendered with a fallback family (glued to the same word)
+                    foreach ($this->splitByFontCoverage($subText, $cStyle, $fontFamily, $fontWeight, $fontStyle) as $si => [$segment, $segStyle]) {
+                        $run = new TextRun($segment, $segStyle, 0.0, $cSize, $cAscent, $cDescent, false, $href);
+                        $run->letterSpacingPt = $letterSpacingPt;
+                        $run->wide = $wide;
+                        $this->shapeRun($run);
+                        $run->afterHyphen = $breakAllowed && $si === 0 && $subIdx === 0;
+                        if ($isSoft && $si === 0 && $subIdx === 0) {
+                            $run->softBreak = SoftBreaker::hyphenChar($style);
+                            $run->softBreakWidth = $this->fontManager->measureText($run->softBreak, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
+                        }
+                        $tokens[] = $run;
+                    }
                 }
             }
         }
+    }
+
+    /** @var array<string, array{0: ComputedStyle, 1: ComputedStyle}> synthesized small-caps style clones */
+    private array $smallCapsStyles = [];
+
+    /**
+     * Style of synthesized small capitals: the base style at 70% of the font size without further caps variants.
+     */
+    private function smallCapsStyle(ComputedStyle $style, float $fontSizePt): ComputedStyle
+    {
+        $key = spl_object_id($style);
+        if (!isset($this->smallCapsStyles[$key]) || $this->smallCapsStyles[$key][0] !== $style) {
+            $small = clone $style;
+            $small->set('font-size', round($fontSizePt * TextEffects::SMALL_CAPS_SCALE, 3) . 'pt');
+            $small->set('font-variant', 'normal');
+            $small->set('font-variant-caps', 'normal');
+            $this->smallCapsStyles[$key] = [$style, $small];
+        }
+        return $this->smallCapsStyles[$key][1];
     }
 
     /**

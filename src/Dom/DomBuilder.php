@@ -47,6 +47,7 @@ class DomBuilder
         if ($this->options->maxHtmlBytes > 0 && strlen($html) > $this->options->maxHtmlBytes) {
             throw new \LengthException(sprintf('HTML input of %d bytes exceeds Options::$maxHtmlBytes (%d).', strlen($html), $this->options->maxHtmlBytes));
         }
+        $html = InputEncoding::toUtf8($html, $this->options->inputEncoding);
         $html = $this->expandBarcodeTags($html);
 
         // Media queries are evaluated against the printable page area
@@ -57,7 +58,7 @@ class DomBuilder
         $dom = $this->options->html5Parser
             ? Html5Parser::parse($html, $this->options->maxNestingDepth, fn(string $w) => $this->options->addWarning($w))
             : null;
-        $dom ??= Html5Parser::parseLegacy($html);
+        $dom ??= Html5Parser::parseLegacy($html, $this->options->maxNestingDepth, fn(string $w) => $this->options->addWarning($w));
 
         // Extract <title>, <style>, and <link rel="stylesheet">
         $this->extractHeadMetadataAndStyles($dom);
@@ -194,7 +195,7 @@ class DomBuilder
 
         foreach ($parentNode->childNodes as $child) {
             if ($child instanceof DOMText) {
-                $text = $child->wholeText;
+                $text = $child->data; // not wholeText: adjacent text nodes (around a dropped comment) would be duplicated
                 // Preserve whitespace inside <pre>, otherwise collapse runs of whitespace
                 $whiteSpace = strtolower($parentBox->style->get('white-space', 'normal'));
                 if (!in_array($whiteSpace, ['pre', 'pre-wrap', 'pre-line'], true)) {
@@ -324,6 +325,7 @@ class DomBuilder
                 $this->addGeneratedContent($child, $childBox, 'before', $currentHref);
                 $this->buildChildren($child, $childBox, $currentHref);
                 $this->addGeneratedContent($child, $childBox, 'after', $currentHref);
+                FirstPseudo::apply($this->cssParser, $child, $childBox);
             }
 
             if ($childBox->getDisplay() === 'contents') {

@@ -27,7 +27,7 @@
         {
             "type": "path",
             "url": "../..",
-            "options": {"symlink": true, "versions": {"ivopdf/ivopdf": "1.0.0"}}
+            "options": {"symlink": false, "versions": {"ivopdf/ivopdf": "1.0.0"}}
         }
     ],
     "extra": {

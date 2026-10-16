@@ -9,15 +9,16 @@ IvoPDF превръща HTML + CSS в PDF **без външни програми
 ## Възможности
 
 **Оформление и CSS**
-- Block, inline, inline-block, плаващи елементи, позициониране absolute / fixed / relative, `z-index`, **Flexbox**, **CSS Grid** (`fr`, `repeat()`, `minmax()`, `auto-fit/fill`, span, автоматично разполагане), **колони** (`column-count`, `column-width`, `column-rule`, `column-span`, балансиране през страници).
+- Block, inline, inline-block, плаващи елементи, позициониране absolute / fixed / relative, `z-index`, **Flexbox**, **CSS Grid** (`fr`, `repeat()`, `minmax()`, `auto-fit/fill`, span, автоматично разполагане, вкл. `grid-auto-flow: column | dense`, `grid-auto-columns/rows`, `grid-template-areas`, `grid-area`, съкращенията `grid-template` / `grid` и именувани линии като `[main-start]` / `main-end`; текстът обтича плаващите елементи ред по ред), **колони** (`column-count`, `column-width`, `column-rule`, `column-span`, балансиране през страници).
 - Таблици: `thead/tbody/tfoot`, `colspan`/`rowspan`, `<caption>`, ширини от `<col>`, `table-layout: fixed`, слети рамки, заглавен ред, повтарян на всяка страница, редове, които никога не се разрязват, свиване на твърде широки таблици (като `shrink_tables_to_fit` в mPDF).
 - Пълен механизъм за селектори (`:is()`, `:where()`, `:has()`, `:nth-*()`, атрибутни оператори…), специфичност и `!important`, `var()`, `calc()`, `inherit`/`initial`/`unset`, `@media` (print, ширина, ориентация), `@supports`, `@import`, `@font-face`, `::before`/`::after` с `content`, CSS броячи, височини в проценти, `aspect-ratio`, `display: contents`.
 - HTML5 парсване по алгоритъма на WHATWG (PHP ≥ 8.4).
 
 **Текст и шрифтове**
-- UTF-8 навсякъде; вградени **Inter** (шрифт по подразбиране, пълна кирилица) и DejaVu Sans/Serif/Mono (латиница, кирилица, гръцки, арабски, иврит…; ползват се автоматично и за знаци, които липсват в Inter).
+- UTF-8 навсякъде; вградени **Inter** (шрифт по подразбиране, пълна кирилица), **Liberation** Sans/Serif/Mono (със същите ширини като Arial, Times New Roman и Courier New, така че шаблоните за тези шрифтове се пренасят по същия начин) и DejaVu Sans/Serif/Mono (латиница, кирилица, гръцки, арабски, иврит…; ползват се автоматично и за знаци, които липсват в другите шрифтове).
 - **Изрязване на шрифтовете** (типична фактура е ≈ 40 KB вместо ~900 KB), TrueType и **OpenType/CFF (`.otf`)**, колекции `.ttc`, `@font-face`, автоматични **резервни шрифтове** и избор на шрифт според писмеността.
-- **OpenType оформяне**: лигатури, кернинг, `font-feature-settings`, `font-variant-*`.
+- **OpenType оформяне**: лигатури, кернинг, `font-feature-settings`, `font-variant-*`; `font-variant: small-caps` / `all-small-caps` ползват знаците `smcp`/`c2sc` на шрифта, а при шрифтове без тях се синтезират (главни букви на 70 % размер), както правят браузърите и mPDF. GSUB/GPOS правилата се филтрират предварително за всеки знак, затова Inter е почти толкова бърз, колкото DejaVu.
+- **Типографски псевдо-елементи**: `::first-letter` (буквица чрез `float` / `initial-letter`) и `::first-line` (шрифт, цвят, `text-transform` върху първия ред, който се пренарежда при промяна на размерите).
 - **От дясно наляво** (Unicode bidi алгоритъм, `dir="rtl|auto"`, `<bdi>`, `<bdo>`), свързване на **арабски**, **иврит**.
 - Пренасяне на **китайски, японски и корейски** (kinsoku, `word-break`, `line-break`), оформяне на **индийски писмености** (деванагари, бенгалски, гуджарати, гурмукхи, тамилски…), пренасяне на **тайландски, лаоски и кхмерски** по думи.
 - **Пренасяне с тире**: `&shy;` и `hyphens: auto` за български и английски (TeX шаблони).
@@ -43,7 +44,7 @@ IvoPDF превръща HTML + CSS в PDF **без външни програми
 - Отдалеченото зареждане е изключено; локалните файлове се четат само от `basePath` / `allowedPaths` (без path traversal, без `phar://` или `file://`).
 - Защита от SSRF: блокирани частни и резервирани IPv4/IPv6 адреси, фиксиране на проверения IP, проверка на TLS, без пренасочвания, лимит на размера.
 - Лимити за размера на HTML, дълбочината на влагане, дължината на думите, броя страници и пикселите на изображенията; некритичните проблеми се връщат чрез `getWarnings()`.
-- `<script type="text/php">` от dompdf нарочно **не** се поддържа.
+- `<script type="text/php">` от dompdf нарочно **не** се поддържа (предупреждение насочва към `getCanvas()->page_text()` / `setFooterHtml()`).
 
 ## Бърз старт
 
@@ -78,7 +79,32 @@ print_r($pdf->getWarnings());                              // напр. изоб
 | `counter(page)` в CSS | `SetHTMLHeader()` / `SetHTMLFooter()` с `{PAGENO}` / `{nbpg}` | работят всички; също `setHeaderHtml()` / `setFooterHtml()` с `{PAGE_NUM}` / `{PAGE_COUNT}` |
 | — | `SetProtection()`, `SetWatermarkText()`, `SetAssociatedFiles()`, `SetDocTemplate()`… | поддържат се |
 
+Стиловете по подразбиране са като в браузъра (и в dompdf): клетките на таблици имат `padding: 1px`, така че шаблоните, писани за браузър, запазват височината на редовете. За по-просторни клетки задайте собствен `td { padding: … }`.
+
 За Laravel и Symfony вижте [Интеграции с фреймуърци](#интеграции-с-фреймуърци).
+
+### dompdf код без промени
+
+`use Dompdf\Dompdf; use Dompdf\Options;` работи както е (псевдоними `Dompdf\Dompdf`, `Dompdf\Options`, `Dompdf\Canvas`, `Dompdf\FontMetrics`; никога не заместват истинска инсталация на dompdf):
+
+```php
+$options = new Options();
+$options->set('isRemoteEnabled', true);          // работят и setIsRemoteEnabled(), setChroot(), setDefaultFont(), setDpi()...
+$dompdf = new Dompdf($options);
+$dompdf->loadHtml($html, 'UTF-8');
+$dompdf->setPaper('A4', 'portrait');
+$dompdf->render();
+
+$canvas = $dompdf->getCanvas();
+$font = $dompdf->getFontMetrics()->getFont('helvetica', 'bold');
+$canvas->page_text($canvas->get_width() - 90, $canvas->get_height() - 35, 'Страница {PAGE_NUM} от {PAGE_COUNT}', $font, 10, [0, 0, 0]);
+$canvas->page_script(function ($pageNumber, $pageCount, $canvas, $fontMetrics) {   // PHP callable, никога низ с код
+    $canvas->line(36, 50, 559, 50, [0.6, 0.6, 0.6], 0.5);
+});
+echo $dompdf->output(['compress' => 0]);        // или $dompdf->stream('x.pdf', ['Attachment' => 0])
+```
+
+`Canvas` поддържа `page_text()`, `page_script()`, `page_line()`, `text()`, `line()`, `rect()`, `filled_rectangle()`, `circle()`, `polygon()`, `image()`, `get_width()`, `get_height()`, `get_page_count()`; координатите са като в dompdf (pt от горния ляв ъгъл). Рисуване след `render()` кара `output()` да рендира отново. `FontMetrics` има `getFont()`, `getTextWidth()`, `registerFont()`. Разлики: форматът по подразбиране на dompdf е Letter (извикайте `setPaper('A4')`); `fontDir` / `fontCache` / `tempDir` / `pdfBackend` и debug опциите се приемат и се игнорират; `<script type="text/php">` и низове с PHP код към `page_script()` никога не се изпълняват, а предупреждение в `getWarnings()` насочва към `getCanvas()->page_text()` / `page_script(callable)` или `setFooterHtml()`.
 
 ### mPDF шаблони без промени
 
@@ -94,13 +120,17 @@ print_r($pdf->getWarnings());                              // напр. изоб
 | `<indexentry>`, `<indexinsert>`, `IndexEntry()`, `InsertIndex()` | азбучен показалец с номера на страници, сортиран с `Collator` (`bg_BG`, `en_US`…) или с вграден български/латински ред |
 | `<annotation>` | бележка (sticky note) в PDF |
 | `<watermarktext>`, `<watermarkimage>`, `SetWatermarkImage()` | воден знак с текст или изображение на всяка страница |
-| `<columns>` / `<columnbreak />` / `SetColumns()` | CSS колони |
+| `<columns>` / `<columnbreak />` / `SetColumns()` | CSS колони (`column-count`, `column-gap`, `vAlign` / `vertical-align="justify"` балансира колоните) |
+| `mirrorMargins` (ключ в конструктора или `$mpdf->mirrorMargins = 1`) | четните страници разменят левия и десния си margin |
+| `<dottab outdent="2em" />` | линия от точки до десния край, текстът след нея е подравнен надясно |
+| `<textcircle r="30mm" top-text bottom-text space-width char-width divider style>` | текст по окръжност, завъртян знак по знак; `font-size: auto` напасва към обиколката |
+| CSS `float: footnote` (CSS GCPM, не е таг на mPDF) | препратка към бележка (горен индекс) + бележка в зона най-долу на страницата с препратката; правила `::footnote-call` / `::footnote-marker` (декларации + `content` с `counter(footnote)`), номерацията започва отначало на всяка страница с `@page { counter-reset: footnote }` |
 | `rotate`, `autosize`, `overflow="shrink"` за таблици / изображения | завъртане чрез `transform`; свиване, за да се побере |
 | `<barcode code type size error>` | вижте „Баркодове“ по-долу |
 | `WriteHTML($html, $mode)`, `SetDefaultBodyCSS()`, `SetDirectionality()`, `SetCompression()`, `SetDisplayMode()`, `SetJS()`, `AddPage(...)`, `AddPageByArray()`, `SetBasePath()`, `SetDefaultFont()` | поддържат се |
 | ключове в конструктора | `mode`, `tempDir`, `autoScriptToLang`, `autoLangToFont`, `fontDir` + `fontdata`, `margin_header` / `margin_footer`, `showImageErrors`, `PDFA`, `PDFX`, `restrictColorSpace`, `shrink_tables_to_fit`… |
 
-Не се поддържат: рисуващият API (`Cell`, `Ln`, `Rect`, `Image`, `WriteText`, `SetFont`…), `mirrorMargins`, `<dottab>`, `<formfeed>`, `<tts>`, `<setpageheader>` / `<setpagefooter>` (използвайте `SetHeader()` / `SetFooter()`).
+Не се поддържат: рисуващият API (`Cell`, `Ln`, `Rect`, `Image`, `WriteText`, `SetFont`…), `<formfeed>`, `<tts>`, `<setpageheader>` / `<setpagefooter>` (използвайте `SetHeader()` / `SetFooter()`).
 
 ## Опции
 
@@ -109,13 +139,14 @@ print_r($pdf->getWarnings());                              // напр. изоб
 | `paperSize` | `'A4'` | A0–A6, B4, B5, Letter, Legal, Tabloid, Executive, Folio или `[ширинаPt, височинаPt]` |
 | `orientation` | `'portrait'` | `portrait` / `landscape` |
 | `margins` | по 36 pt | `['top' => .., 'right' => .., 'bottom' => .., 'left' => ..]`; CSS `@page { margin }` има предимство |
-| `defaultFont`, `defaultFontSize` | Inter, 12 | общите `sans-serif`, Arial, Helvetica… водят към Inter; `serif` / `monospace` към DejaVu Serif / Sans Mono |
+| `defaultFont`, `defaultFontSize` | Inter, 12 | общият `sans-serif` води към Inter; Arial / Helvetica, Times New Roman и Courier New към Liberation Sans / Serif / Mono; `serif` / `monospace` към DejaVu Serif / Sans Mono |
 | `defaultBoxSizing` | `content-box` | стандартното за CSS; шаблоните обикновено задават `* { box-sizing: border-box }` |
 | `basePath`, `allowedPaths` | `null`, `[]` | папки, от които може да се четат локални изображения, CSS и шрифтове |
 | `isRemoteEnabled` | `false` | разрешава `http(s)` ресурси (със защита от SSRF) |
 | `maxRemoteBytes`, `maxImagePixels` | 10 MB, 25 MP | лимити на ресурсите |
 | `maxHtmlBytes`, `maxNestingDepth`, `maxWordLength`, `maxPages` | 32 MB, 200, 2000, 5000 | защитни лимити |
 | `html5Parser` | `true` | HTML5 парсер на WHATWG (PHP ≥ 8.4); `false` ползва HTML4 парсера на libxml |
+| `inputEncoding` | `'auto'` | `auto`: BOM, после `<meta charset>`, после валиден UTF-8; стари байтове без meta се четат като Windows-1251, ако приличат на кирилица, иначе като Windows-1252. За други стари файлове без meta я задайте изрично (напр. `'ISO-8859-2'`, `'KOI8-R'`, `'Shift_JIS'`) |
 | `shrinkTablesToFit` | `1.4` | максимално свиване на твърде широки таблици (`0` = изключено) |
 | `subsetFonts` | `true` | вграждат се само използваните знаци |
 | `fallbackFonts`, `scriptFonts` | `[]` | допълнителни шрифтове за липсващи знаци; шрифт според писмеността (`['Hani' => 'Noto Sans SC', 'Deva' => 'Noto Sans Devanagari']`) |
@@ -263,7 +294,7 @@ IvoPDF е безплатен софтуер с отворен код под ли
 
 - Можете свободно да го използвате, изучавате, променяте и споделяте, включително в търговски проекти.
 - Ако разпространявате софтуер, който включва IvoPDF, или давате достъп до него през мрежа (уеб приложения, SaaS, API), **цялото приложение трябва да бъде пуснато под AGPL** с изходен код, достъпен за потребителите му. Вграждането на IvoPDF в продукти със затворен код не е разрешено.
-- Вградените чужди данни запазват собствения си свободен лиценз: шрифтовете Inter (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), шрифтовете DejaVu ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) и TeX шаблоните за пренасяне (лицензите са в началото на файловете в `resources/hyphenation/`).
+- Вградените чужди данни запазват собствения си свободен лиценз: шрифтовете Inter (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), шрифтовете Liberation (SIL Open Font License 1.1, [resources/fonts/LICENSE-Liberation.txt](resources/fonts/LICENSE-Liberation.txt)), шрифтовете DejaVu ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) и TeX шаблоните за пренасяне (лицензите са в началото на файловете в `resources/hyphenation/`).
 
 ## Принос
 

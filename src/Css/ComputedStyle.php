@@ -190,6 +190,8 @@ class ComputedStyle
             'grid-template-columns' => 'none',
             'grid-template-rows' => 'none',
             'grid-auto-rows' => 'auto',
+            'grid-auto-columns' => 'auto',
+            'grid-template-areas' => 'none',
             'grid-auto-flow' => 'row',
             'grid-column-start' => 'auto',
             'grid-column-end' => 'auto',
@@ -316,42 +318,47 @@ class ComputedStyle
                 \IvoPdf\Layout\FormControls::applyDefaults($this, $tag);
                 break;
             case 'h1':
-                $this->set('font-size', '22pt');
+                $this->set('font-size', '2em');
                 $this->set('font-weight', 'bold');
-                $this->set('margin-top', '6pt');
-                $this->set('margin-bottom', '8pt');
+                $this->set('margin-top', '0.67em');
+                $this->set('margin-bottom', '0.67em');
                 $this->set('line-height', '1.25');
                 break;
             case 'h2':
-                $this->set('font-size', '17pt');
+                $this->set('font-size', '1.5em');
                 $this->set('font-weight', 'bold');
-                $this->set('margin-top', '6pt');
-                $this->set('margin-bottom', '6pt');
+                $this->set('margin-top', '0.83em');
+                $this->set('margin-bottom', '0.83em');
                 $this->set('line-height', '1.3');
                 break;
             case 'h3':
-                $this->set('font-size', '13.5pt');
+                $this->set('font-size', '1.17em');
                 $this->set('font-weight', 'bold');
-                $this->set('margin-top', '5pt');
-                $this->set('margin-bottom', '5pt');
+                $this->set('margin-top', '1em');
+                $this->set('margin-bottom', '1em');
                 $this->set('line-height', '1.3');
                 break;
             case 'h4':
-                $this->set('font-size', '11.5pt');
+                $this->set('font-size', '1em');
                 $this->set('font-weight', 'bold');
-                $this->set('margin-top', '4pt');
-                $this->set('margin-bottom', '4pt');
+                $this->set('margin-top', '1.33em');
+                $this->set('margin-bottom', '1.33em');
                 break;
             case 'h5':
-            case 'h6':
-                $this->set('font-size', '10pt');
+                $this->set('font-size', '0.83em');
                 $this->set('font-weight', 'bold');
-                $this->set('margin-top', '3pt');
-                $this->set('margin-bottom', '3pt');
+                $this->set('margin-top', '1.67em');
+                $this->set('margin-bottom', '1.67em');
+                break;
+            case 'h6':
+                $this->set('font-size', '0.67em');
+                $this->set('font-weight', 'bold');
+                $this->set('margin-top', '2.33em');
+                $this->set('margin-bottom', '2.33em');
                 break;
             case 'p':
-                $this->set('margin-top', '0');
-                $this->set('margin-bottom', '6pt');
+                $this->set('margin-top', '1em');
+                $this->set('margin-bottom', '1em');
                 break;
             case 'ul':
             case 'ol':
@@ -421,12 +428,12 @@ class ComputedStyle
                 $this->set('font-weight', 'bold');
                 $this->set('text-align', 'start');
                 $this->set('vertical-align', 'middle');
-                $this->set('padding', '6pt 8pt');
+                $this->set('padding', '1px'); // browser and dompdf default
                 break;
             case 'td':
                 $this->set('display', 'table-cell');
                 $this->set('vertical-align', 'middle');
-                $this->set('padding', '6pt 8pt');
+                $this->set('padding', '1px'); // browser and dompdf default
                 break;
             case 'caption':
                 $this->set('display', 'table-caption');
@@ -597,6 +604,11 @@ class ComputedStyle
             return;
         }
 
+        // CSS error recovery: an invalid value drops the declaration (the earlier cascade value stays)
+        if (!CssValidator::isValid($key, $val)) {
+            return;
+        }
+
         if ($key === 'font-size') {
             $this->computedFontSizePt = $this->resolveFontSizeValue($val);
             $this->props['font-size'] = round($this->computedFontSizePt, 4) . 'pt';
@@ -753,6 +765,13 @@ class ComputedStyle
             case 'grid-row':
                 $this->expandGridLineShorthand('row', $val);
                 break;
+            case 'grid-area':
+            case 'grid-template':
+            case 'grid':
+                foreach (GridShorthand::expand($key, $val) ?? [] as $longhand => $longValue) {
+                    $this->props[$longhand] = $longValue;
+                }
+                break;
             case 'place-items':
                 $parts = $this->splitSpaceTokens($val);
                 $this->props['align-items'] = $parts[0] ?? 'stretch';
@@ -866,22 +885,60 @@ class ComputedStyle
             return $val;
         }
 
-        $maxIterations = 5;
-        while ($maxIterations-- > 0 && str_contains($val, 'var(')) {
-            $val = (string) preg_replace_callback(
-                '/var\(\s*(--[a-zA-Z0-9_-]+)\s*(?:,\s*([^)]+))?\)/',
-                function (array $m): string {
-                    $varName = strtolower(trim($m[1]));
-                    if (isset($this->variables[$varName])) {
-                        return $this->variables[$varName];
-                    }
-                    return isset($m[2]) ? trim($m[2]) : '';
-                },
-                $val
-            );
+        // Values of variables may themselves contain var(): substitute a few rounds
+        for ($round = 0; $round < 5 && str_contains($val, 'var('); $round++) {
+            $val = $this->substituteVars($val, 0);
         }
 
         return $val;
+    }
+
+    /** Replaces each var(--name[, fallback]) with balanced parentheses, so fallbacks like rgb(0, 0, 0) survive. */
+    private function substituteVars(string $val, int $depth): string
+    {
+        $out = '';
+        $pos = 0;
+        while (($start = stripos($val, 'var(', $pos)) !== false) {
+            // Skip identifiers that merely end in "var(" (e.g. a hypothetical "somevar(")
+            if ($start > 0 && preg_match('/[A-Za-z0-9_-]/', $val[$start - 1]) === 1) {
+                $out .= substr($val, $pos, $start + 4 - $pos);
+                $pos = $start + 4;
+                continue;
+            }
+            $level = 1;
+            $comma = -1;
+            $len = strlen($val);
+            $i = $start + 4;
+            for (; $i < $len && $level > 0; $i++) {
+                $ch = $val[$i];
+                if ($ch === '(') {
+                    $level++;
+                } elseif ($ch === ')') {
+                    $level--;
+                } elseif ($ch === ',' && $level === 1 && $comma < 0) {
+                    $comma = $i;
+                }
+            }
+            if ($level > 0) {
+                break; // unbalanced: leave the rest untouched
+            }
+            $end = $i - 1; // closing parenthesis
+            $nameEnd = $comma >= 0 ? $comma : $end;
+            $name = strtolower(trim(substr($val, $start + 4, $nameEnd - $start - 4)));
+            if (isset($this->variables[$name])) {
+                $replacement = $this->variables[$name];
+            } elseif ($comma >= 0) {
+                $replacement = trim(substr($val, $comma + 1, $end - $comma - 1));
+                if ($depth < 16 && str_contains($replacement, 'var(')) {
+                    $replacement = $this->substituteVars($replacement, $depth + 1);
+                }
+            } else {
+                $replacement = '';
+            }
+            $out .= substr($val, $pos, $start - $pos) . $replacement;
+            $pos = $end + 1;
+        }
+        return $out . substr($val, $pos);
     }
 
     private function expandBoxFour(string $prefix, string $val): void
@@ -1225,7 +1282,9 @@ class ComputedStyle
             $this->props["grid-{$axis}-end"] = $end;
         } else {
             $this->props["grid-{$axis}-start"] = trim($val);
-            $this->props["grid-{$axis}-end"] = 'auto';
+            // a lone identifier (grid-column: main) names both edges
+            $this->props["grid-{$axis}-end"] = preg_match('/^[A-Za-z_][\w\-]*$/', trim($val)) === 1 && strtolower(trim($val)) !== 'auto'
+                ? trim($val) : 'auto';
         }
     }
 

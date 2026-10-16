@@ -23,6 +23,8 @@ class TextRun
     public float $letterSpacingPt = 0.0;
     public bool $isWhitespace = false;
     public bool $isLineBreak = false;
+    /** Forces a (soft) line break before this run: set by InlineLayout for the end of the ::first-line */
+    public bool $lineStart = false;
     public ?string $href = null;
 
     /**

@@ -32,6 +32,10 @@ class LayoutBox
     public ?string $listMarkerImage = null;
     /** Computed ::marker style (color / font-size) when the stylesheet defines one */
     public ?ComputedStyle $markerStyle = null;
+    /** Computed ::first-line style of a block container (applied to its first line box by InlineLayout) */
+    public ?ComputedStyle $firstLineStyle = null;
+    /** @var list<string> properties declared by the ::first-line rules (only those override the run style) */
+    public array $firstLineProps = [];
 
     /** Set for <input>/<textarea>/<select>/<button>: the parsed control (replaced box, no child boxes). */
     public ?FormControl $formControl = null;
@@ -59,6 +63,10 @@ class LayoutBox
     public float $paddingRight = 0.0;
     public float $paddingBottom = 0.0;
     public float $paddingLeft = 0.0;
+
+    /** Margins of the first/last in-flow children that collapsed through this box's edges (see LayoutEngine::layoutBlockChildren) */
+    public float $collapsedMarginTop = 0.0;
+    public float $collapsedMarginBottom = 0.0;
 
     /** Paginator bookkeeping: vertical shift owed to this box's whole subtree, applied lazily (see Paginator::sync) */
     public float $pendingDy = 0.0;

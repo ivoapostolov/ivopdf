@@ -39,6 +39,12 @@ final class OpenTypeLayout
     /** @var array<int, int>|null legacy kern pairs (left << 16 | right) => value */
     private ?array $kernPairs = null;
 
+    /** @var array<string, array<int, array<int, true>|null>> per-lookup set of glyphs that can start a match */
+    private array $firstSets = [];
+
+    /** @var array<int, int> */
+    private array $glyphClassCache = [];
+
     private int $depth = 0;
 
     public function __construct(?string $gsub, ?string $gpos, ?string $gdef, ?string $kern, float $scale)
@@ -131,8 +137,12 @@ final class OpenTypeLayout
                 if ($lk === null) {
                     continue;
                 }
+                $fs = $this->firstGlyphs('GSUB', $li, $lk);
+                if ($fs !== null && !$this->anyIn($buf, $fs)) {
+                    continue; // no glyph of the run can trigger this lookup
+                }
                 for ($i = 0; $i < count($buf);) {
-                    if (($buf[$i]['m'] & $mask) === 0 || $this->skip($buf[$i]['g'], $lk)) {
+                    if (($buf[$i]['m'] & $mask) === 0 || ($fs !== null && !isset($fs[$buf[$i]['g']])) || $this->skip($buf[$i]['g'], $lk)) {
                         $i++;
                         continue;
                     }
@@ -167,8 +177,12 @@ final class OpenTypeLayout
             if ($lk === null) {
                 continue;
             }
+            $fs = $this->firstGlyphs('GPOS', $li, $lk);
+            if ($fs !== null && !$this->anyIn($buf, $fs)) {
+                continue;
+            }
             for ($i = 0; $i < count($buf);) {
-                if (($buf[$i]['m'] & $mask) === 0 || $this->skip($buf[$i]['g'], $lk)) {
+                if (($buf[$i]['m'] & $mask) === 0 || ($fs !== null && !isset($fs[$buf[$i]['g']])) || $this->skip($buf[$i]['g'], $lk)) {
                     $i++;
                     continue;
                 }
@@ -184,11 +198,14 @@ final class OpenTypeLayout
      */
     public function glyphClass(int $gid): int
     {
+        if (isset($this->glyphClassCache[$gid])) {
+            return $this->glyphClassCache[$gid];
+        }
         if (!isset($this->t['GDEF'])) {
             return 0;
         }
         $off = $this->u16($this->t['GDEF'], 4);
-        return $off === 0 ? 0 : $this->classOf('GDEF', $off, $gid);
+        return $this->glyphClassCache[$gid] = ($off === 0 ? 0 : $this->classOf('GDEF', $off, $gid));
     }
 
     public function hasGdef(): bool
@@ -317,6 +334,79 @@ final class OpenTypeLayout
         }
         $mfs = ($flag & 0x10) ? $this->u16($d, $lo + 6 + 2 * $sc) : 0;
         return $this->lookups[$table][$li] = ['type' => $type, 'flag' => $flag, 'mfs' => $mfs, 'subs' => $subs];
+    }
+
+    /**
+     * Set (gid => true) of glyphs that can start a match in any subtable of the lookup, or null when unknown.
+     * Lets the apply loops skip glyphs (and whole lookups) that cannot match without touching the subtables.
+     *
+     * @param array{type: int, flag: int, mfs: int, subs: list<array{0: int, 1: int}>} $lk
+     * @return array<int, true>|null
+     */
+    private function firstGlyphs(string $table, int $li, array $lk): ?array
+    {
+        if (array_key_exists($li, $this->firstSets[$table] ?? [])) {
+            return $this->firstSets[$table][$li];
+        }
+        $d = $this->t[$table];
+        $set = [];
+        foreach ($lk['subs'] as [$type, $off]) {
+            $covOff = null;
+            if ($table === 'GSUB' ? ($type >= 1 && $type <= 4) : ($type >= 1 && $type <= 6)) {
+                $covOff = $off + $this->u16($d, $off + 2);
+            } elseif ($table === 'GSUB' ? ($type === 5 || $type === 6) : ($type === 7 || $type === 8)) {
+                $chain = $table === 'GSUB' ? $type === 6 : $type === 8;
+                $fmt = $this->u16($d, $off);
+                if ($fmt === 1 || $fmt === 2) {
+                    $covOff = $off + $this->u16($d, $off + 2);
+                } elseif ($fmt === 3) {
+                    if ($chain) {
+                        $btc = $this->u16($d, $off + 2);
+                        $p = $off + 4 + 2 * $btc;
+                        $inc = $this->u16($d, $p);
+                        $covOff = $inc > 0 ? $off + $this->u16($d, $p + 2) : null;
+                    } else {
+                        $covOff = $this->u16($d, $off + 2) > 0 ? $off + $this->u16($d, $off + 6) : null;
+                    }
+                }
+            } elseif ($table === 'GSUB' && $type === 8) {
+                continue; // reverse chaining is not applied
+            }
+            if ($covOff === null) {
+                return $this->firstSets[$table][$li] = null;
+            }
+            $cd = $this->u16($d, $covOff);
+            $n = $this->u16($d, $covOff + 2);
+            if ($cd === 1) {
+                if ($n > 0) {
+                    foreach (unpack('n*', substr($d, $covOff + 4, 2 * $n)) ?: [] as $g) {
+                        $set[$g] = true;
+                    }
+                }
+            } else {
+                for ($k = 0; $k < $n; $k++) {
+                    $p = $covOff + 4 + 6 * $k;
+                    for ($g = $this->u16($d, $p), $e = $this->u16($d, $p + 2); $g <= $e; $g++) {
+                        $set[$g] = true;
+                    }
+                }
+            }
+        }
+        return $this->firstSets[$table][$li] = $set;
+    }
+
+    /**
+     * @param list<array<string, mixed>> $buf
+     * @param array<int, true> $set
+     */
+    private function anyIn(array $buf, array $set): bool
+    {
+        foreach ($buf as $e) {
+            if (isset($set[$e['g']])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---- skipping / coverage / classes ---------------------------------------------------------------------

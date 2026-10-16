@@ -44,6 +44,8 @@ class CssParser
     private array $compiledCache = [];
 
     private int $ruleCounter = 0;
+    /** @var array<string, true> pseudo-elements that have at least one rule (cheap pre-check for ::first-letter / ::first-line) */
+    private array $pseudoSeen = [];
     /** @var array{id: array<string, list<int>>, class: array<string, list<int>>, tag: array<string, list<int>>, any: list<int>}|null Rules bucketed by the key of their rightmost compound */
     private ?array $ruleIndex = null;
     private int $ruleIndexCount = -1;
@@ -359,8 +361,9 @@ class CssParser
 
             // Generated content: `.x::before` / `.x:after` rules are stored separately for computePseudoStyle()
             $pseudo = null;
-            if (preg_match('/::?(before|after)\s*$/i', $sel, $pm) || preg_match('/::(marker)\s*$/i', $sel, $pm)) {
+            if (preg_match('/::?(before|after|first-letter|first-line)\s*$/i', $sel, $pm) || preg_match('/::(marker)\s*$/i', $sel, $pm)) {
                 $pseudo = strtolower($pm[1]);
+                $this->pseudoSeen[$pseudo] = true;
                 $sel = trim(substr($sel, 0, -strlen($pm[0])));
                 if ($sel === '' || preg_match('/[\s>+~]$/', $sel)) {
                     $sel .= '*';
@@ -452,6 +455,11 @@ class CssParser
             if (preg_match('/^(.*?)!\s*important$/is', $val, $m)) {
                 $val = trim($m[1]);
                 $important = true;
+            }
+
+            // Invalid value: the whole declaration is ignored, so an earlier valid one of the block survives
+            if (!CssValidator::isValid($prop, $val)) {
+                continue;
             }
 
             // A later normal declaration never overrides an earlier !important one of the same block
@@ -589,6 +597,32 @@ class CssParser
     }
 
     /**
+     * Whether any rule targets the pseudo-element (before/after/first-letter/first-line/marker).
+     */
+    public function hasPseudoRules(string $pseudo): bool
+    {
+        return isset($this->pseudoSeen[$pseudo]);
+    }
+
+    /**
+     * Names of the properties declared by the rules matching an element's pseudo-element.
+     *
+     * @return list<string>
+     */
+    public function pseudoDeclaredProps(DOMElement $el, string $pseudo): array
+    {
+        $props = [];
+        foreach ($this->candidateRules($el) as $rule) {
+            if ($rule['pseudo'] === $pseudo && $this->matchesCompiled($el, $rule['compiled'], count($rule['compiled']) - 1)) {
+                foreach ($rule['declarations'] as $prop => $_) {
+                    $props[$prop] = true;
+                }
+            }
+        }
+        return array_keys($props);
+    }
+
+    /**
      * Computes the style of an element's ::before / ::after box, or null when it generates no content.
      */
     public function computePseudoStyle(DOMElement $el, ComputedStyle $elementStyle, string $pseudo, bool $requireContent = true): ?ComputedStyle
@@ -632,6 +666,23 @@ class CssParser
 
         if ($el->hasAttribute('hidden')) {
             $style->set('display', 'none');
+        }
+
+        if ($el->hasAttribute('type') && ($tag === 'ol' || $tag === 'ul' || $tag === 'li')) {
+            // <ol type="a|A|i|I|1"> / <ul type="disc|circle|square"> / <li type>: presentational hint for list-style-type
+            $t = trim($el->getAttribute('type'));
+            $mapped = match (true) {
+                $t === 'a' => 'lower-alpha',
+                $t === 'A' => 'upper-alpha',
+                $t === 'i' => 'lower-roman',
+                $t === 'I' => 'upper-roman',
+                $t === '1' => 'decimal',
+                in_array(strtolower($t), ['disc', 'circle', 'square'], true) => strtolower($t),
+                default => null,
+            };
+            if ($mapped !== null) {
+                $style->set('list-style-type', $mapped);
+            }
         }
 
         if ($el->hasAttribute('align')) {

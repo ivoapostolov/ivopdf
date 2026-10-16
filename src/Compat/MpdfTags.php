@@ -24,11 +24,11 @@ final class MpdfTags
     /** Opening tags after which a marker has to stay inline (text flow) instead of being a block. */
     private const INLINE_TAGS = ['a', 'b', 'i', 'u', 'em', 'strong', 'span', 'font', 'small', 'big', 'sub', 'sup', 'label', 'code', 'abbr', 'cite', 'q', 's', 'strike'];
 
-    private const TAG_RE = '~<(/?)(sethtmlpageheader|sethtmlpagefooter|tocpagebreak|pagebreak|bookmark|indexentry|indexinsert|annotation|watermarktext|watermarkimage|columns|columnbreak|column_break|newcolumn)\b((?:"[^"]*"|\'[^\']*\'|[^>"\'])*)>~is';
+    private const TAG_RE = '~<(/?)(sethtmlpageheader|sethtmlpagefooter|tocpagebreak|pagebreak|bookmark|indexentry|indexinsert|annotation|watermarktext|watermarkimage|columns|columnbreak|column_break|newcolumn|dottab|textcircle)\b((?:"[^"]*"|\'[^\']*\'|[^>"\'])*)>~is';
 
     public static function needed(string $html): bool
     {
-        return (bool) preg_match('~<(?:/?)(?:pagebreak|tocpagebreak|htmlpage(?:header|footer)|sethtmlpage(?:header|footer)|bookmark|indexentry|indexinsert|annotation|watermarktext|watermarkimage|columns|columnbreak|column_break|newcolumn)\b|\b(?:rotate|overflow)\s*=|@page[^{]*\{[^}]*(?:header|footer)\s*:~i', $html);
+        return (bool) preg_match('~<(?:/?)(?:pagebreak|tocpagebreak|htmlpage(?:header|footer)|sethtmlpage(?:header|footer)|bookmark|indexentry|indexinsert|annotation|watermarktext|watermarkimage|columns|columnbreak|column_break|newcolumn|dottab|textcircle)\b|\b(?:rotate|overflow)\s*=|@page[^{]*\{[^}]*(?:header|footer)\s*:~i', $html);
     }
 
     /**
@@ -191,11 +191,23 @@ final class MpdfTags
                         $count = (int) ($a['column-count'] ?? 1);
                         if ($count > 1) {
                             $gap = isset($a['column-gap']) && is_numeric($a['column-gap']) ? (float) $a['column-gap'] : 5.0;
-                            $fill = strtoupper(trim($a['valign'] ?? '')) === 'J' ? 'balance' : 'auto';
+                            $fill = in_array(strtoupper(trim($a['valign'] ?? $a['vertical-align'] ?? '')), ['J', 'JUSTIFY', 'BALANCE'], true) ? 'balance' : 'auto';
                             $columnsOpen = true;
                             $out .= '<div class="ivo-columns" style="column-count:' . $count . ';column-gap:' . $gap . 'mm;column-fill:' . $fill . '">';
                         }
                         return $out;
+
+                    case 'dottab':
+                        if ($closing) {
+                            return '';
+                        }
+                        if (!str_contains($s->pageCss, MpdfExtraTags::DOTTAB_CSS)) {
+                            $s->pageCss .= MpdfExtraTags::DOTTAB_CSS;
+                        }
+                        return MpdfExtraTags::dotTab($a);
+
+                    case 'textcircle':
+                        return $closing ? '' : MpdfExtraTags::textCircle($a, $s);
 
                     case 'columnbreak':
                     case 'column_break':

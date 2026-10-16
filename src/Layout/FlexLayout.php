@@ -128,6 +128,10 @@ class FlexLayout
                 $minW = $this->engine->resolveBoxHorizontalDimension($item, $minWidthCss, $contentWidth);
             } elseif ($basisCss === '0' || $basisCss === '0%' || $basisCss === '0px' || $basisCss === '0pt') {
                 $minW = 0.0;
+            } elseif (strtolower(trim($item->style->get('overflow-x', $item->style->get('overflow', 'visible')))) !== 'visible'
+                && strtolower(trim($item->style->get('overflow-x', $item->style->get('overflow', 'visible')))) !== '') {
+                // CSS Flexbox 4.5: the automatic minimum size of a scroll container is 0
+                $minW = 0.0;
             }
 
             $maxW = 100000.0;

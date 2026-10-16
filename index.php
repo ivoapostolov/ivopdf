@@ -8,8 +8,91 @@ require_once __DIR__ . '/examples/Templates.php';
 use IvoPdf\Examples\Templates;
 use IvoPdf\IvoPdf;
 
-$remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
-$isLocalRequest = in_array($remoteAddr, ['127.0.0.1', '::1', 'localhost'], true);
+/**
+ * Does $ip match $rule (a single IP or an IPv4/IPv6 CIDR)?
+ */
+function ivopdfIpMatches(string $ip, string $rule): bool
+{
+    $rule = trim($rule);
+    if ($rule === '') {
+        return false;
+    }
+    $packedIp = @inet_pton($ip);
+    if ($packedIp === false) {
+        return false;
+    }
+    $bits = null;
+    if (str_contains($rule, '/')) {
+        [$rule, $bitsStr] = explode('/', $rule, 2);
+        if (!ctype_digit($bitsStr)) {
+            return false;
+        }
+        $bits = (int) $bitsStr;
+    }
+    $packedRule = @inet_pton($rule);
+    if ($packedRule === false || strlen($packedRule) !== strlen($packedIp)) {
+        return false;
+    }
+    $max = strlen($packedIp) * 8;
+    $bits = $bits ?? $max;
+    if ($bits > $max) {
+        return false;
+    }
+    $fullBytes = intdiv($bits, 8);
+    if ($fullBytes > 0 && substr($packedIp, 0, $fullBytes) !== substr($packedRule, 0, $fullBytes)) {
+        return false;
+    }
+    $rest = $bits % 8;
+    if ($rest === 0) {
+        return true;
+    }
+    $mask = (0xFF << (8 - $rest)) & 0xFF;
+    return ((ord($packedIp[$fullBytes]) ^ ord($packedRule[$fullBytes])) & $mask) === 0;
+}
+
+/**
+ * Client address. X-Forwarded-For is honoured ONLY when REMOTE_ADDR is listed in
+ * IVOPDF_TRUSTED_PROXIES (comma-separated IPs/CIDRs); then the right-most
+ * address that is not itself a trusted proxy is used.
+ */
+function ivopdfClientIp(array $server, string $trustedProxies): string
+{
+    $remote = (string) ($server['REMOTE_ADDR'] ?? '');
+    if ($remote === '') {
+        return '127.0.0.1';
+    }
+    $rules = array_filter(array_map('trim', explode(',', $trustedProxies)), static fn ($r) => $r !== '');
+    $isTrusted = static function (string $ip) use ($rules): bool {
+        foreach ($rules as $rule) {
+            if (ivopdfIpMatches($ip, $rule)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if ($rules === [] || !$isTrusted($remote)) {
+        return $remote;
+    }
+    $xff = (string) ($server['HTTP_X_FORWARDED_FOR'] ?? '');
+    if ($xff === '') {
+        return $remote;
+    }
+    $hops = array_map('trim', explode(',', $xff));
+    for ($i = count($hops) - 1; $i >= 0; $i--) {
+        $hop = $hops[$i];
+        if (filter_var($hop, FILTER_VALIDATE_IP) === false) {
+            // Malformed entry: do not guess; treat it as an untrusted (non-local) client.
+            return 'invalid';
+        }
+        if (!$isTrusted($hop)) {
+            return $hop;
+        }
+    }
+    return $remote;
+}
+
+$clientIp = ivopdfClientIp($_SERVER, (string) getenv('IVOPDF_TRUSTED_PROXIES'));
+$isLocalRequest = in_array($clientIp, ['127.0.0.1', '::1'], true);
 if (!$isLocalRequest && getenv('IVOPDF_ALLOW_PUBLIC_STUDIO') !== '1') {
     http_response_code(403);
     header('Content-Type: text/plain; charset=utf-8');
@@ -142,7 +225,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' || isset($_GET['template_pd
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode([
             'ok' => false,
-            'error' => $e->getMessage(),
+            // Internal details (paths, library messages) only on localhost.
+            'error' => $isLocalRequest ? $e->getMessage() : 'PDF generation failed.',
         ], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
     }
     exit;

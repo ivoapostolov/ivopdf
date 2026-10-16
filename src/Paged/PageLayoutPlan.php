@@ -27,9 +27,28 @@ final class PageLayoutPlan
     ) {
     }
 
+    /** @var bool mPDF `mirrorMargins`: even (left-hand) pages swap their left and right margins */
+    private bool $mirror = false;
+
+    public function setMirrorMargins(bool $mirror): void
+    {
+        $this->mirror = $mirror;
+        $this->cache = [];
+    }
+
+    /** @var (\Closure(int, float, float): float)|null (pageIndex, contentWidth, pageHeight) => extra space at the bottom (footnotes) */
+    private ?\Closure $extraBottom = null;
+
+    /** Reserves extra space at the bottom of individual pages (CSS footnotes); makes the geometry per page. */
+    public function setExtraBottom(?\Closure $extra): void
+    {
+        $this->extraBottom = $extra;
+        $this->cache = [];
+    }
+
     public function isUniform(): bool
     {
-        return !$this->rules->hasPageVariants() && !$this->runningVaries;
+        return !$this->rules->hasPageVariants() && !$this->runningVaries && !$this->mirror && $this->extraBottom === null;
     }
 
     /**
@@ -37,20 +56,26 @@ final class PageLayoutPlan
      */
     public function box(int $pageIndex, ?string $name = null): array
     {
-        $key = ($pageIndex === 0 ? 'F' : '') . ($pageIndex % 2) . '|' . ($name ?? '');
+        $key = ($pageIndex === 0 ? 'F' : '') . ($this->extraBottom !== null ? 'P' . $pageIndex : '') . ($pageIndex % 2) . '|' . ($name ?? '');
         if (isset($this->cache[$key])) {
             return $this->cache[$key];
         }
         $resolved = $this->rules->resolve($pageIndex, $name);
         [$w, $h, $m] = ($this->applyProps)($resolved['props']);
+        if ($this->mirror && $pageIndex % 2 === 1) {
+            [$m['left'], $m['right']] = [$m['right'], $m['left']];
+        }
         $cw = max(50.0, $w - $m['left'] - $m['right']);
         [$eTop, $eBottom] = ($this->reserve)($pageIndex, $cw, $m, $h);
+        $extra = $this->extraBottom !== null ? max(0.0, ($this->extraBottom)($pageIndex, $cw, $h)) : 0.0;
+        $eBottom += $extra;
         return $this->cache[$key] = [
             'w' => $w,
             'h' => $h,
             'm' => $m,
             'eTop' => $eTop,
             'eBottom' => $eBottom,
+            'fn' => $extra,
             'ph' => max(50.0, $h - $eTop - $eBottom),
             'boxes' => $resolved['boxes'],
         ];

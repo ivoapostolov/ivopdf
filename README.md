@@ -9,15 +9,16 @@ Requirements: PHP ≥ 8.1 with `ext-dom`, `ext-mbstring`, `ext-zlib`. Optional: 
 ## Features
 
 **Layout and CSS**
-- Block, inline, inline-block, floats, absolute / fixed / relative positioning, `z-index`, **Flexbox**, **CSS Grid** (`fr`, `repeat()`, `minmax()`, `auto-fit/fill`, spans, auto-placement), **multi-column** (`column-count`, `column-width`, `column-rule`, `column-span`, balancing across pages).
+- Block, inline, inline-block, floats, absolute / fixed / relative positioning, `z-index`, **Flexbox**, **CSS Grid** (`fr`, `repeat()`, `minmax()`, `auto-fit/fill`, spans, auto-placement incl. `grid-auto-flow: column | dense`, `grid-auto-columns/rows`, `grid-template-areas`, `grid-area`, the `grid-template` / `grid` shorthands and named lines such as `[main-start]` / `main-end`; text wraps around floats line by line), **multi-column** (`column-count`, `column-width`, `column-rule`, `column-span`, balancing across pages).
 - Tables: `thead/tbody/tfoot`, `colspan`/`rowspan`, `<caption>`, `<col>` widths, `table-layout: fixed`, collapsed borders, header row repeated on every page, rows never sliced, wide tables shrunk to fit (mPDF `shrink_tables_to_fit`).
 - Full selector engine (`:is()`, `:where()`, `:has()`, `:nth-*()`, attribute operators…), specificity and `!important`, `var()`, `calc()`, `inherit`/`initial`/`unset`, `@media` (print, width, orientation), `@supports`, `@import`, `@font-face`, `::before`/`::after` with `content`, CSS counters, percentage heights, `aspect-ratio`, `display: contents`.
 - HTML5 parsing per the WHATWG algorithm (PHP ≥ 8.4).
 
 **Text and fonts**
-- UTF-8 everywhere; bundled **Inter** (default sans-serif, full Cyrillic) and DejaVu Sans/Serif/Mono (Latin, Cyrillic, Greek, Arabic, Hebrew…, also used automatically for characters Inter lacks).
+- UTF-8 everywhere; bundled **Inter** (default sans-serif, full Cyrillic), **Liberation** Sans/Serif/Mono (metric-compatible with Arial, Times New Roman and Courier New, so templates written for those fonts keep their line breaks) and DejaVu Sans/Serif/Mono (Latin, Cyrillic, Greek, Arabic, Hebrew…, also used automatically for characters the other fonts lack).
 - **Font subsetting** (a typical invoice is ≈ 40 KB instead of ~900 KB), TrueType and **OpenType/CFF (`.otf`)**, `.ttc` collections, `@font-face`, automatic **fallback fonts** and per-script font selection.
-- **OpenType shaping**: ligatures, kerning, `font-feature-settings`, `font-variant-*`.
+- **OpenType shaping**: ligatures, kerning, `font-feature-settings`, `font-variant-*`; `font-variant: small-caps` / `all-small-caps` use the font's `smcp`/`c2sc` glyphs and are synthesized (capitals at 70 % size) for fonts without them, as browsers and mPDF do. GSUB/GPOS lookups are pre-filtered per glyph, so Inter shapes at nearly DejaVu speed.
+- **Typographic pseudo-elements**: `::first-letter` (drop caps via `float` / `initial-letter`) and `::first-line` (font, colour, `text-transform` on the first line box, re-broken when the metrics change).
 - **Right-to-left** (Unicode bidi algorithm, `dir="rtl|auto"`, `<bdi>`, `<bdo>`), **Arabic** joining, **Hebrew**.
 - **CJK** line breaking (kinsoku, `word-break`, `line-break`), **Indic** shaping (Devanagari, Bengali, Gujarati, Gurmukhi, Tamil…), **Thai / Lao / Khmer** word breaking.
 - **Hyphenation**: `&shy;` and `hyphens: auto` for Bulgarian and English (TeX patterns).
@@ -43,7 +44,7 @@ Requirements: PHP ≥ 8.1 with `ext-dom`, `ext-mbstring`, `ext-zlib`. Optional: 
 - Remote loading off; local files only from `basePath` / `allowedPaths` (no path traversal, no `phar://` or `file://`).
 - SSRF protection: private/reserved IPv4/IPv6 blocked, DNS pinning, TLS verification, no redirects, size limits.
 - Limits for HTML size, nesting depth, word length, page count and image pixels; non-fatal problems are reported by `getWarnings()`.
-- Dompdf's `<script type="text/php">` is intentionally **not** supported.
+- Dompdf's `<script type="text/php">` is intentionally **not** supported (a warning points to `getCanvas()->page_text()` / `setFooterHtml()`).
 
 ## Quick start
 
@@ -78,7 +79,32 @@ print_r($pdf->getWarnings());                              // e.g. images that c
 | `counter(page)` in CSS | `SetHTMLHeader()` / `SetHTMLFooter()` with `{PAGENO}` / `{nbpg}` | all work; also `setHeaderHtml()` / `setFooterHtml()` with `{PAGE_NUM}` / `{PAGE_COUNT}` |
 | — | `SetProtection()`, `SetWatermarkText()`, `SetAssociatedFiles()`, `SetDocTemplate()`… | supported |
 
+Default styles follow browsers (and dompdf): table cells get `padding: 1px`, so templates written for a browser keep their row heights. Give tables their own `td { padding: … }` for roomier cells.
+
 For Laravel and Symfony see [Framework integrations](#framework-integrations).
+
+### dompdf code, unchanged
+
+`use Dompdf\Dompdf; use Dompdf\Options;` works as is (lazy aliases `Dompdf\Dompdf`, `Dompdf\Options`, `Dompdf\Canvas`, `Dompdf\FontMetrics`; they never override a real dompdf install):
+
+```php
+$options = new Options();
+$options->set('isRemoteEnabled', true);          // setIsRemoteEnabled(), setChroot(), setDefaultFont(), setDpi()... also work
+$dompdf = new Dompdf($options);
+$dompdf->loadHtml($html, 'UTF-8');
+$dompdf->setPaper('A4', 'portrait');
+$dompdf->render();
+
+$canvas = $dompdf->getCanvas();
+$font = $dompdf->getFontMetrics()->getFont('helvetica', 'bold');
+$canvas->page_text($canvas->get_width() - 90, $canvas->get_height() - 35, 'Page {PAGE_NUM} of {PAGE_COUNT}', $font, 10, [0, 0, 0]);
+$canvas->page_script(function ($pageNumber, $pageCount, $canvas, $fontMetrics) {   // a PHP callable, never a string of code
+    $canvas->line(36, 50, 559, 50, [0.6, 0.6, 0.6], 0.5);
+});
+echo $dompdf->output(['compress' => 0]);        // or $dompdf->stream('x.pdf', ['Attachment' => 0])
+```
+
+`Canvas` supports `page_text()`, `page_script()`, `page_line()`, `text()`, `line()`, `rect()`, `filled_rectangle()`, `circle()`, `polygon()`, `image()`, `get_width()`, `get_height()`, `get_page_count()`; coordinates are dompdf's (pt from the top-left corner). Drawing after `render()` makes `output()` render again. `FontMetrics` has `getFont()`, `getTextWidth()`, `registerFont()`. Differences: dompdf's default paper size is Letter (call `setPaper('A4')`); `fontDir` / `fontCache` / `tempDir` / `pdfBackend` / debug options are accepted and ignored; `<script type="text/php">` and PHP code strings given to `page_script()` are never executed, a warning in `getWarnings()` tells you to use `getCanvas()->page_text()` / `page_script(callable)` or `setFooterHtml()`.
 
 ### mPDF templates, unchanged
 
@@ -94,13 +120,17 @@ For Laravel and Symfony see [Framework integrations](#framework-integrations).
 | `<indexentry>`, `<indexinsert>`, `IndexEntry()`, `InsertIndex()` | alphabetical index with page numbers, sorted with `Collator` (`bg_BG`, `en_US`…) or a built-in Bulgarian/Latin order |
 | `<annotation>` | PDF sticky note |
 | `<watermarktext>`, `<watermarkimage>`, `SetWatermarkImage()` | text / image watermark on every page |
-| `<columns>` / `<columnbreak />` / `SetColumns()` | CSS multi-column |
+| `<columns>` / `<columnbreak />` / `SetColumns()` | CSS multi-column (`column-count`, `column-gap`, `vAlign` / `vertical-align="justify"` balances the columns) |
+| `mirrorMargins` (constructor key or `$mpdf->mirrorMargins = 1`) | even pages swap their left / right margins |
+| `<dottab outdent="2em" />` | dotted leader up to the right edge, the text after it is right-aligned |
+| `<textcircle r="30mm" top-text bottom-text space-width char-width divider style>` | text set along a circle, one rotated glyph per character; `font-size: auto` fits the circumference |
+| CSS `float: footnote` (CSS GCPM, no mPDF tag) | footnote call (superscript counter) + note in a footnote area at the bottom of the page of the call; `::footnote-call` / `::footnote-marker` rules (declarations + `content` with `counter(footnote)`), numbering restarts per page with `@page { counter-reset: footnote }` |
 | `rotate`, `autosize`, `overflow="shrink"` on tables / images | rotation via `transform`; shrink-to-fit |
 | `<barcode code type size error>` | see Barcodes below |
 | `WriteHTML($html, $mode)`, `SetDefaultBodyCSS()`, `SetDirectionality()`, `SetCompression()`, `SetDisplayMode()`, `SetJS()`, `AddPage(...)`, `AddPageByArray()`, `SetBasePath()`, `SetDefaultFont()` | supported |
 | constructor keys | `mode`, `tempDir`, `autoScriptToLang`, `autoLangToFont`, `fontDir` + `fontdata`, `margin_header` / `margin_footer`, `showImageErrors`, `PDFA`, `PDFX`, `restrictColorSpace`, `shrink_tables_to_fit`… |
 
-Not supported: the imperative drawing API (`Cell`, `Ln`, `Rect`, `Image`, `WriteText`, `SetFont`…), `mirrorMargins`, `<dottab>`, `<formfeed>`, `<tts>`, `<setpageheader>` / `<setpagefooter>` (use `SetHeader()` / `SetFooter()`).
+Not supported: the imperative drawing API (`Cell`, `Ln`, `Rect`, `Image`, `WriteText`, `SetFont`…), `<formfeed>`, `<tts>`, `<setpageheader>` / `<setpagefooter>` (use `SetHeader()` / `SetFooter()`).
 
 ## Options
 
@@ -109,13 +139,14 @@ Not supported: the imperative drawing API (`Cell`, `Ln`, `Rect`, `Image`, `Write
 | `paperSize` | `'A4'` | A0–A6, B4, B5, Letter, Legal, Tabloid, Executive, Folio or `[widthPt, heightPt]` |
 | `orientation` | `'portrait'` | `portrait` / `landscape` |
 | `margins` | 36 pt each | `['top' => .., 'right' => .., 'bottom' => .., 'left' => ..]`; CSS `@page { margin }` overrides |
-| `defaultFont`, `defaultFontSize` | Inter, 12 | generic `sans-serif`, Arial, Helvetica… map to Inter; `serif` / `monospace` to DejaVu Serif / Sans Mono |
+| `defaultFont`, `defaultFontSize` | Inter, 12 | generic `sans-serif` maps to Inter; Arial / Helvetica, Times New Roman and Courier New to Liberation Sans / Serif / Mono; `serif` / `monospace` to DejaVu Serif / Sans Mono |
 | `defaultBoxSizing` | `content-box` | CSS default; templates usually set `* { box-sizing: border-box }` |
 | `basePath`, `allowedPaths` | `null`, `[]` | folders from which local images / CSS / fonts may be read |
 | `isRemoteEnabled` | `false` | allow `http(s)` resources (SSRF-protected) |
 | `maxRemoteBytes`, `maxImagePixels` | 10 MB, 25 MP | resource limits |
 | `maxHtmlBytes`, `maxNestingDepth`, `maxWordLength`, `maxPages` | 32 MB, 200, 2000, 5000 | failure guards |
 | `html5Parser` | `true` | WHATWG HTML5 parser (PHP ≥ 8.4); `false` uses libxml's HTML4 parser |
+| `inputEncoding` | `'auto'` | `auto`: BOM, then `<meta charset>`, then valid UTF-8; legacy bytes without a meta are read as Windows-1251 when they look Cyrillic, otherwise Windows-1252. Set it explicitly (e.g. `'ISO-8859-2'`, `'KOI8-R'`, `'Shift_JIS'`) for other legacy files without a meta |
 | `shrinkTablesToFit` | `1.4` | maximum shrink factor for too-wide tables (`0` = off) |
 | `subsetFonts` | `true` | embed only used glyphs |
 | `fallbackFonts`, `scriptFonts` | `[]` | extra families for missing glyphs; font per script (`['Hani' => 'Noto Sans SC', 'Deva' => 'Noto Sans Devanagari']`) |
@@ -263,7 +294,7 @@ IvoPDF is free and open-source software licensed under the **GNU Affero General 
 
 - You may use, study, modify and share it freely, including in commercial projects.
 - If you distribute software that includes IvoPDF, or let users interact with it over a network (web apps, SaaS, APIs), the **whole application must be released under the AGPL** with its source code available to those users. Embedding IvoPDF into closed-source products is not permitted.
-- Bundled third-party data keeps its own permissive license: Inter fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), DejaVu fonts ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) and the TeX hyphenation patterns (license headers in `resources/hyphenation/`).
+- Bundled third-party data keeps its own permissive license: Inter fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), Liberation fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Liberation.txt](resources/fonts/LICENSE-Liberation.txt)), DejaVu fonts ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) and the TeX hyphenation patterns (license headers in `resources/hyphenation/`).
 
 ## Contributing
 

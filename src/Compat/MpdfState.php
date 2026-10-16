@@ -38,6 +38,14 @@ final class MpdfState
     /** @var ?array{src: string, alpha: float, size: string, pos: string} */
     public ?array $watermarkImage = null;
 
+    /** Stylesheet text of the document (<style> blocks + WriteHTML CSS mode): mPDF applies it to named headers / footers too */
+    public string $docCss = '';
+
+    /** Default font family of the document (used by <textcircle> when its style has none) */
+    public string $defaultFont = 'sans-serif';
+    /** @var (\Closure(string, string, string, string, float): float)|null (text, family, weight, style, sizePt) => width in pt */
+    public ?\Closure $measure = null;
+
     /** CSS (`@page ivo-pgN { ... }`) generated for pagebreak geometry */
     public string $pageCss = '';
 
@@ -54,6 +62,12 @@ final class MpdfState
     private array $labels = [];
     /** @var list<?string> */
     private array $hdrByPage = [];
+
+    /** Prefixes a named header / footer with the document stylesheet (so `.ftr { ... }` classes apply). */
+    public function withDocCss(string $html): string
+    {
+        return $this->docCss === '' ? $html : '<style>' . $this->docCss . '</style>' . $html;
+    }
 
     public function usesRunning(): bool
     {
@@ -105,13 +119,24 @@ final class MpdfState
         $footerSides = [];
         for ($p = 0; $p < $pageCount; $p++) {
             $reset = null;
+            $pageHdr = $hdr;
+            $pageFtr = $ftr;
             foreach ($evByPage[$p] ?? [] as $e) {
                 foreach (['O', 'E'] as $side) {
                     if (isset($e['hdr']) && is_array($e['hdr']) && array_key_exists($side, $e['hdr']) && $e['hdr'][$side] !== null) {
-                        $hdr[$side] = $e['hdr'][$side];
+                        // show-this-page with an `@page { header: html_x }` default: the default is re-applied on the next page
+                        if (!empty($e['show']) && $this->baseHeader[$side] !== null) {
+                            $pageHdr[$side] = $e['hdr'][$side];
+                        } else {
+                            $hdr[$side] = $pageHdr[$side] = $e['hdr'][$side];
+                        }
                     }
                     if (isset($e['ftr']) && is_array($e['ftr']) && array_key_exists($side, $e['ftr']) && $e['ftr'][$side] !== null) {
-                        $ftr[$side] = $e['ftr'][$side];
+                        if (!empty($e['show']) && $this->baseFooter[$side] !== null) {
+                            $pageFtr[$side] = $e['ftr'][$side];
+                        } else {
+                            $ftr[$side] = $pageFtr[$side] = $e['ftr'][$side];
+                        }
                     }
                 }
                 if (($e['reset'] ?? null) !== null) {
@@ -127,8 +152,8 @@ final class MpdfState
             if ($reset !== null) {
                 $number = $reset;
             }
-            $this->pageHeader[$p] = $hdr;
-            $footerSides[$p] = $ftr;
+            $this->pageHeader[$p] = $pageHdr;
+            $footerSides[$p] = $pageFtr;
             $this->labels[$p] = $suppress ? '' : self::formatNumber($number, $style);
             $number++;
         }

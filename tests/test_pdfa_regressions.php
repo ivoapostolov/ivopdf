@@ -172,6 +172,21 @@ $tampered = preg_replace('~(/W \[\s*\d+\s*\[)\s*602~', '${1}500', $mono, 1);
 $issues = PdfAChecker::check((string) $tampered, 2);
 check('checker flags a /W entry that differs from the embedded program', (bool) array_filter($issues, static fn(string $i): bool => str_contains($i, 'differs from /W')), implode(' | ', $issues));
 
+$fm = new \IvoPdf\Font\FontManager($fontDir);
+$mapping = ['Arial' => 'LiberationSans-Regular.ttf', 'Helvetica' => 'LiberationSans-Regular.ttf', 'Times New Roman' => 'LiberationSerif-Regular.ttf', 'Courier New' => 'LiberationMono-Regular.ttf', 'sans-serif' => 'Inter-Regular.ttf'];
+$wrong = [];
+foreach ($mapping as $family => $file) {
+    if (basename($fm->resolveFont($family)->getFilePath()) !== $file) {
+        $wrong[] = $family;
+    }
+}
+check('Arial / Helvetica / Times New Roman / Courier New map to metric-compatible Liberation fonts', $wrong === [], implode(', ', $wrong));
+if (is_file('C:/Windows/Fonts/arial.ttf')) {
+    $fm->registerFamily('Real Arial', ['regular' => 'C:/Windows/Fonts/arial.ttf']);
+    $txt = 'Invoice total: 2,880.00 EUR — Фактура № 1001';
+    check('Liberation Sans has the same advance widths as Arial', abs($fm->measureText($txt, 'Arial', 'normal', 'normal', 12) - $fm->measureText($txt, 'Real Arial', 'normal', 'normal', 12)) < 0.01);
+}
+
 $otf = null;
 foreach (glob('C:/Windows/Fonts/*.otf') ?: [] as $candidate) {
     $otf = $candidate;

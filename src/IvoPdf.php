@@ -36,6 +36,7 @@ class IvoPdf
 {
     use PdfComposeApi;
     use \IvoPdf\Compat\MpdfApi;
+    use \IvoPdf\Compat\CompatExtras;
 
     private Options $options;
     private FontManager $fontManager;
@@ -272,9 +273,10 @@ class IvoPdf
         try {
             $cssParser = new CssParser();
             $domBuilder = new DomBuilder($this->options, $cssParser);
-            $rootBox = $domBuilder->build(TocGenerator::process($this->mpdfTransform($this->html), $this->tocEnabled, $this->tocTitle, $this->tocMaxLevel));
+            $rootBox = $domBuilder->build(TocGenerator::process($this->mpdfTransform($this->compatScan($this->html)), $this->tocEnabled, $this->tocTitle, $this->tocMaxLevel));
             $this->registerCssFontFaces($cssParser->getFontFaces());
             $running = RunningElements::extract($rootBox); // position: running(name) elements leave the flow
+            $this->footnoteExtract($rootBox); // float: footnote elements become calls + notes at the page bottom
 
             if ($this->options->title === '' && $domBuilder->getDocumentTitle() !== '') {
                 $this->options->title = $domBuilder->getDocumentTitle();
@@ -334,6 +336,8 @@ class IvoPdf
                 },
                 $this->headerVariants !== [] || $this->footerVariants !== []
             );
+            $plan->setMirrorMargins(!empty($this->options->compat['mirrorMargins'])); // mPDF mirrorMargins
+            $this->footnoteAttach($plan, $layoutEngine);
             $firstName = $this->firstPageName($rootBox);
             $first = $plan->box(0, $firstName);
             $effectiveTopMargin = $first['eTop'];
@@ -364,6 +368,7 @@ class IvoPdf
             // target-counter() / leader(): the page of every target is known now
             $refResolver = new PageRefResolver($this->fontManager, static fn(float $y): int => $paginator->pageOfY($y));
             $refResolver->resolve($rootBox);
+            $this->footnoteAfterPaginate($rootBox, $paginator);
             $this->mpdfAfterPaginate($refResolver->getTargets(), $paginator, $totalPages); // mPDF header switching, page numbers, index
             $strings = $plan->hasMarginBoxes() ? StringSets::collect($rootBox, static fn(float $y): int => $paginator->pageOfY($y)) : null;
 
@@ -404,7 +409,7 @@ class IvoPdf
                 $ftr = $this->mpdfRunning('footer', $p, $this->pickRunning($this->footerHtml, $this->footerVariants, $p));
                 if ($ftr !== null && trim($ftr) !== '') {
                     $footerBox = $this->buildRunningBox($ftr, $p + 1, $totalPages, $layoutEngine, $pm['left'], 0.0, $pageContentWidth);
-                    $footerY = $this->mpdfFooterY($pageHeight, $geo['eBottom'], $footerBox->height);
+                    $footerY = $this->mpdfFooterY($pageHeight, $geo['eBottom'] - ($geo['fn'] ?? 0.0), $footerBox->height);
                     $footerBox->translate(0.0, $footerY - $footerBox->y);
                 }
 
@@ -417,6 +422,9 @@ class IvoPdf
                 }
                 foreach ($this->mpdfOverlayLayers($layoutEngine, $geo) as $mpdfLayer) {
                     $layers[] = $mpdfLayer; // mPDF image watermark
+                }
+                foreach ($this->compatOverlayLayers($layoutEngine, $geo, $p + 1, $totalPages) as $compatLayer) {
+                    $layers[] = $compatLayer; // dompdf Canvas::page_text() / page_script()
                 }
                 foreach (MarginBoxes::bands($geo['boxes'], $geo, $p + 1, $totalPages, $strings, $this->options->title, $running) as $band) {
                     $layers[] = $this->layoutHtmlBox($band['html'], $layoutEngine, $band['x'], $band['y'], $band['width'], $running);

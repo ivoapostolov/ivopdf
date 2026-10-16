@@ -8,11 +8,15 @@ namespace IvoPdf\Layout;
  * Full CSS Grid Layout Engine.
  * Supports grid-template-columns/rows, repeat(N / auto-fit / auto-fill), minmax(), fr units,
  * percentages, auto tracks, grid-column/grid-row spans, negative line indices (1 / -1),
- * gaps, and justify/align-items/self.
+ * gaps, and justify/align-items/self. Placement (named lines, grid-template-areas, grid-area, auto-flow row/column/dense,
+ * implicit tracks via grid-auto-columns/rows) lives in {@see GridPlacement}.
  */
 class GridLayout
 {
     private LayoutEngine $engine;
+
+    /** @var array<string, list<int>> named lines of the most recently parsed track list */
+    private array $lastLineNames = [];
 
     public function __construct(LayoutEngine $engine)
     {
@@ -61,14 +65,47 @@ class GridLayout
         $colGap = $this->engine->resolveLength($container->style->get('column-gap', '0'), $contentWidth, $container->fontSizePt);
         $rowGap = $this->engine->resolveLength($container->style->get('row-gap', '0'), $contentWidth, $container->fontSizePt);
 
-        // Step 1: Parse column track definitions
-        $colTemplate = $container->style->get('grid-template-columns', 'none');
-        $colTracks = $this->parseTrackList($colTemplate, $contentWidth, $colGap, $container->fontSizePt, count($gridItems));
-        $numCols = max(1, count($colTracks));
+        // Step 1: Parse explicit track definitions, named lines and grid-template-areas
+        $areasInfo = GridPlacement::parseAreas($container->style->get('grid-template-areas', 'none'));
+        $areas = $areasInfo['areas'] ?? [];
 
-        // Step 2: Place items into a 2D occupancy grid using CSS Grid Auto-Placement rules
-        /** @var array<int, array<int, bool>> $occupied [row][col] */
-        $occupied = [];
+        $colTemplate = $container->style->get('grid-template-columns', 'none');
+        $colExplicit = !in_array(strtolower(trim($colTemplate)), ['', 'none'], true);
+        $colTracks = $colExplicit ? $this->parseTrackList($colTemplate, $contentWidth, $colGap, $container->fontSizePt, count($gridItems)) : [];
+        $colNames = $colExplicit ? $this->lastLineNames : [];
+
+        $rowTemplate = $container->style->get('grid-template-rows', 'none');
+        $rowExplicit = !in_array(strtolower(trim($rowTemplate)), ['', 'none'], true);
+        $rowTracks = $rowExplicit ? $this->parseTrackList($rowTemplate, 0.0, $rowGap, $container->fontSizePt, count($gridItems)) : [];
+        $rowNames = $rowExplicit ? $this->lastLineNames : [];
+
+        $explicitCols = max(count($colTracks), $areasInfo['cols'] ?? 0);
+        $explicitRows = max(count($rowTracks), $areasInfo['rows'] ?? 0);
+        $colNames = GridPlacement::withAreaLines($colNames, $areas, true);
+        $rowNames = GridPlacement::withAreaLines($rowNames, $areas, false);
+
+        // Step 2: Resolve every item's grid lines (numbers, names, spans, areas), then auto-place the rest
+        $specs = [];
+        foreach ($gridItems as $item) {
+            [$colStart, $colSpan] = GridPlacement::resolveAxis(
+                $item->style->get('grid-column-start', 'auto'),
+                $item->style->get('grid-column-end', 'auto'),
+                $colNames,
+                $explicitCols
+            );
+            [$rowStart, $rowSpan] = GridPlacement::resolveAxis(
+                $item->style->get('grid-row-start', 'auto'),
+                $item->style->get('grid-row-end', 'auto'),
+                $rowNames,
+                $explicitRows
+            );
+            $specs[] = ['rowStart' => $rowStart, 'rowSpan' => $rowSpan, 'colStart' => $colStart, 'colSpan' => $colSpan];
+        }
+        $flowCss = strtolower(trim($container->style->get('grid-auto-flow', 'row')));
+        $placed = GridPlacement::place($specs, $explicitCols, $explicitRows, str_contains($flowCss, 'column') ? 'column' : 'row', str_contains($flowCss, 'dense'));
+        $numCols = max(1, $placed['cols']);
+        $numRows = max(1, $placed['rows']);
+
         /**
          * @var list<array{
          *   box: LayoutBox,
@@ -79,83 +116,23 @@ class GridLayout
          * }> $placements
          */
         $placements = [];
-        $cursorRow = 0;
-        $cursorCol = 0;
-        $maxRow = 0;
-
-        foreach ($gridItems as $item) {
-            [$colStart, $colSpan] = $this->resolveGridPlacement(
-                $item->style->get('grid-column-start', 'auto'),
-                $item->style->get('grid-column-end', 'auto'),
-                $numCols
-            );
-            [$rowStart, $rowSpan] = $this->resolveGridPlacement(
-                $item->style->get('grid-row-start', 'auto'),
-                $item->style->get('grid-row-end', 'auto'),
-                0
-            );
-
-            $colSpan = max(1, min($numCols, $colSpan));
-            if ($colStart !== null) {
-                $colStart = max(0, min($numCols - $colSpan, $colStart));
-            }
-            $rowSpan = max(1, $rowSpan);
-
-            if ($rowStart !== null && $colStart !== null) {
-                $r = max(0, $rowStart);
-                $c = $colStart;
-            } elseif ($colStart !== null) {
-                $c = $colStart;
-                $r = $cursorRow;
-                while (!$this->isRegionFree($occupied, $r, $c, $rowSpan, $colSpan)) {
-                    $r++;
-                }
-            } elseif ($rowStart !== null) {
-                $r = max(0, $rowStart);
-                $c = 0;
-                while ($c + $colSpan <= $numCols && !$this->isRegionFree($occupied, $r, $c, $rowSpan, $colSpan)) {
-                    $c++;
-                }
-                if ($c + $colSpan > $numCols) {
-                    $c = 0;
-                }
-            } else {
-                // Both auto: find next free slot starting at ($cursorRow, $cursorCol)
-                $r = $cursorRow;
-                $c = $cursorCol;
-                while (true) {
-                    if ($c + $colSpan > $numCols) {
-                        $r++;
-                        $c = 0;
-                    }
-                    if ($this->isRegionFree($occupied, $r, $c, $rowSpan, $colSpan)) {
-                        break;
-                    }
-                    $c++;
-                }
-                $cursorRow = $r;
-                $cursorCol = $c + $colSpan;
-                if ($cursorCol >= $numCols) {
-                    $cursorRow++;
-                    $cursorCol = 0;
-                }
-            }
-
-            $this->markRegionOccupied($occupied, $r, $c, $rowSpan, $colSpan);
-            if ($r + $rowSpan > $maxRow) {
-                $maxRow = $r + $rowSpan;
-            }
-
-            $placements[] = [
-                'box' => $item,
-                'colStart' => $c,
-                'colSpan' => $colSpan,
-                'rowStart' => $r,
-                'rowSpan' => $rowSpan,
-            ];
+        foreach ($gridItems as $k => $item) {
+            $o = $placed['items'][$k];
+            $placements[] = ['box' => $item, 'colStart' => $o['c'], 'colSpan' => $o['cs'], 'rowStart' => $o['r'], 'rowSpan' => $o['rs']];
         }
 
-        $numRows = max(1, $maxRow);
+        // Implicit columns (grid-auto-columns, cycled) complete the explicit track list
+        $autoColCss = $container->style->get('grid-auto-columns', 'auto');
+        if (count($colTracks) < $numCols) {
+            $legacy = !$colExplicit && $numCols === 1 && strtolower(trim($autoColCss)) === 'auto';
+            $implicit = $this->parseTrackList($autoColCss, $contentWidth, $colGap, $container->fontSizePt, count($gridItems));
+            $base = count($colTracks);
+            for ($c = $base; $c < $numCols; $c++) {
+                $colTracks[] = $legacy
+                    ? ['type' => 'fr', 'value' => 1.0, 'min' => 0.0, 'max' => 0.0, 'maxFr' => 1.0]
+                    : $implicit[($c - $base) % count($implicit)];
+            }
+        }
 
         // Step 3: Resolve Column Track Widths
         $colWidths = $this->resolveColumnWidths($colTracks, $placements, $contentWidth, $colGap, $container->fontSizePt);
@@ -171,15 +148,12 @@ class GridLayout
         // Step 4: First layout pass for each grid item inside its spanned column width
         $rowHeights = array_fill(0, $numRows, 0.0);
 
-        // Parse explicit row templates if any
-        $rowTemplate = $container->style->get('grid-template-rows', 'none');
-        $rowTracks = ($rowTemplate !== 'none' && $rowTemplate !== '')
-            ? $this->parseTrackList($rowTemplate, 0.0, $rowGap, $container->fontSizePt, $numRows)
-            : [];
-        $autoRowCss = $container->style->get('grid-auto-rows', 'auto');
+        // Implicit rows follow grid-auto-rows (a list is cycled)
+        $autoRows = $this->parseTrackList($container->style->get('grid-auto-rows', 'auto'), 0.0, $rowGap, $container->fontSizePt, count($gridItems));
+        $explicitRowTracks = count($rowTracks);
 
         for ($r = 0; $r < $numRows; $r++) {
-            $trackSpec = $rowTracks[$r] ?? $this->parseSingleTrack($autoRowCss, 0.0, $container->fontSizePt);
+            $trackSpec = $rowTracks[$r] ?? $autoRows[($r - $explicitRowTracks) % count($autoRows)];
             if ($trackSpec['type'] === 'fixed') {
                 $rowHeights[$r] = $trackSpec['value'];
             } elseif ($trackSpec['type'] === 'minmax' && $trackSpec['min'] > 0) {
@@ -339,6 +313,7 @@ class GridLayout
         float $fontSizePt,
         int $itemCount
     ): array {
+        $this->lastLineNames = [];
         $tpl = trim($template);
         if ($tpl === '' || strtolower($tpl) === 'none') {
             return [['type' => 'fr', 'value' => 1.0, 'min' => 0.0, 'max' => 0.0, 'maxFr' => 1.0]];
@@ -375,6 +350,7 @@ class GridLayout
         );
 
         $tokens = $this->splitTopLevelTokens($expanded);
+        $this->lastLineNames = GridPlacement::lineNamesFromTokens($tokens);
         if (empty($tokens)) {
             return [['type' => 'fr', 'value' => 1.0, 'min' => 0.0, 'max' => 0.0, 'maxFr' => 1.0]];
         }
@@ -484,6 +460,10 @@ class GridLayout
                 foreach ($placements as $pl) {
                     if ($pl['colStart'] === $c && $pl['colSpan'] === 1) {
                         $intr = $this->engine->measureIntrinsicWidth($pl['box'], $usableWidth);
+                        $ovf = strtolower(trim($pl['box']->style->get('overflow-x', $pl['box']->style->get('overflow', 'visible'))));
+                        if ($ovf !== 'visible' && $ovf !== '') {
+                            $intr['min'] = 0.0; // grid items that are scroll containers have an automatic minimum of 0
+                        }
                         $outerMin = $intr['min'] + $pl['box']->marginLeft + $pl['box']->marginRight;
                         $outerMax = $intr['max'] + $pl['box']->marginLeft + $pl['box']->marginRight;
                         if ($outerMin > $minIntrinsic) {
@@ -525,72 +505,6 @@ class GridLayout
         }
 
         return $widths;
-    }
-
-    /**
-     * Resolves a CSS grid-column or grid-row start/end pair into 0-based [startIndex|null, span].
-     *
-     * @return array{0: int|null, 1: int}
-     */
-    private function resolveGridPlacement(string $startCss, string $endCss, int $numTracks): array
-    {
-        $s = strtolower(trim($startCss));
-        $e = strtolower(trim($endCss));
-
-        $startIdx = null;
-        $span = 1;
-
-        if (str_starts_with($s, 'span ')) {
-            $span = max(1, min(100, (int) trim(substr($s, 5))));
-        } elseif (is_numeric($s)) {
-            $line = (int) $s;
-            if ($line < 0 && $numTracks > 0) {
-                $startIdx = max(0, $numTracks + 1 + $line - 1);
-            } elseif ($line > 0) {
-                $startIdx = min(200, $line - 1);
-            }
-        }
-
-        if (str_starts_with($e, 'span ')) {
-            $span = max(1, min(100, (int) trim(substr($e, 5))));
-        } elseif (is_numeric($e)) {
-            $endLine = min(201, (int) $e);
-            if ($endLine < 0 && $numTracks > 0) {
-                $endLine = $numTracks + 2 + $endLine;
-            }
-            if ($startIdx !== null && $endLine > ($startIdx + 1)) {
-                $span = min(100, $endLine - ($startIdx + 1));
-            }
-        }
-
-        return [$startIdx, $span];
-    }
-
-    /**
-     * @param array<int, array<int, bool>> $occupied
-     */
-    private function isRegionFree(array $occupied, int $row, int $col, int $rowSpan, int $colSpan): bool
-    {
-        for ($r = $row; $r < $row + $rowSpan; $r++) {
-            for ($c = $col; $c < $col + $colSpan; $c++) {
-                if (!empty($occupied[$r][$c])) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    /**
-     * @param array<int, array<int, bool>> $occupied
-     */
-    private function markRegionOccupied(array &$occupied, int $row, int $col, int $rowSpan, int $colSpan): void
-    {
-        for ($r = $row; $r < $row + $rowSpan; $r++) {
-            for ($c = $col; $c < $col + $colSpan; $c++) {
-                $occupied[$r][$c] = true;
-            }
-        }
     }
 
     /**
