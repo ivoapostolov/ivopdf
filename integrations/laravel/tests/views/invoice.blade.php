@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="bg"><head><meta charset="utf-8"><style>
+body { font-family: 'DejaVu Sans'; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10pt; }
+</style></head><body>
+<h1>Фактура {{ $number }}</h1>
+<div class="grid"><div>Клиент: {{ $client }}</div><div>Сума: 100 лв.</div></div>
+<img src="logo.png" width="40" height="40" alt="logo">
+</body></html>

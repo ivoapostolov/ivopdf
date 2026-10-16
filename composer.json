@@ -1,0 +1,45 @@
+{
+    "name": "ivopdf/ivopdf",
+    "description": "Modern Pure-PHP HTML & CSS to PDF Engine with Flexbox, CSS Grid, and Full UTF-8/Cyrillic Support for Shared Hosting.",
+    "type": "library",
+    "license": "AGPL-3.0-or-later",
+    "homepage": "https://github.com/ivoapostolov/ivopdf",
+    "support": {
+        "issues": "https://github.com/ivoapostolov/ivopdf/issues",
+        "source": "https://github.com/ivoapostolov/ivopdf"
+    },
+    "authors": [
+        {
+            "name": "Ivo Apostolov",
+            "homepage": "https://github.com/ivoapostolov"
+        }
+    ],
+    "keywords": [
+        "pdf",
+        "html-to-pdf",
+        "flexbox",
+        "css-grid",
+        "cyrillic",
+        "utf-8",
+        "dompdf",
+        "mpdf",
+        "shared-hosting"
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-dom": "*",
+        "ext-mbstring": "*",
+        "ext-zlib": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "IvoPdf\\": "src/"
+        },
+        "files": ["src/Compat/mpdf_aliases.php"]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "IvoPdf\\Tests\\": "tests/"
+        }
+    }
+}

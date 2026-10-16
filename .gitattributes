@@ -1,0 +1,23 @@
+* text=auto eol=lf
+
+*.php text eol=lf diff=php
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
+*.ttf binary
+*.otf binary
+*.png binary
+*.jpg binary
+*.pdf binary
+
+# Keep the Composer package small
+/tests export-ignore
+/examples/output export-ignore
+/.github export-ignore
+/skills export-ignore
+/index.php export-ignore
+/.gitattributes export-ignore

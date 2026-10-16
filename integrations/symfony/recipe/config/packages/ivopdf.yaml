@@ -1,0 +1,18 @@
+ivopdf:
+    paper: A4                       # A0-A6, B4, B5, Letter, Legal, Tabloid, Executive, Folio
+    orientation: portrait           # portrait | landscape
+    default_font: 'DejaVu Sans'     # bundled DejaVu covers Latin, Cyrillic, Greek
+    default_font_size: 12
+    # margins: { top: 36, right: 36, bottom: 36, left: 36 }   # points
+    base_path: '%kernel.project_dir%/public'
+    allowed_paths:
+        - '%kernel.project_dir%/public'
+        - '%kernel.project_dir%/templates'
+    remote_enabled: false           # allow http(s) resources (SSRF-protected)
+    pdfa: ~                         # '2b' | '3b'
+    # fonts:
+    #     Inter:
+    #         regular: '%kernel.project_dir%/assets/fonts/Inter.ttf'
+    #         bold: '%kernel.project_dir%/assets/fonts/Inter-Bold.ttf'
+    # fallback_fonts: ['Noto Sans CJK']
+    # options: { bookmarks: true }  # raw IvoPdf\Options keys, dompdf/mPDF names accepted

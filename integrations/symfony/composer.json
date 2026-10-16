@@ -1,0 +1,44 @@
+{
+    "name": "ivopdf/symfony-bundle",
+    "description": "Symfony bundle for IvoPDF: a pure-PHP HTML/CSS to PDF engine with Flexbox, CSS Grid and Cyrillic support. Easy migration from KnpSnappyBundle and dompdf.",
+    "type": "symfony-bundle",
+    "license": "AGPL-3.0-or-later",
+    "homepage": "https://github.com/ivoapostolov/ivopdf",
+    "keywords": ["symfony", "bundle", "pdf", "html-to-pdf", "ivopdf", "snappy", "dompdf"],
+    "authors": [{"name": "Ivo Apostolov", "homepage": "https://github.com/ivoapostolov"}],
+    "require": {
+        "php": ">=8.1",
+        "ivopdf/ivopdf": "^1.0",
+        "symfony/config": "^6.4|^7.0|^8.0",
+        "symfony/dependency-injection": "^6.4|^7.0|^8.0",
+        "symfony/http-foundation": "^6.4|^7.0|^8.0",
+        "symfony/http-kernel": "^6.4|^7.0|^8.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5|^11.0|^12.0",
+        "symfony/framework-bundle": "^6.4|^7.0|^8.0",
+        "symfony/twig-bundle": "^6.4|^7.0|^8.0",
+        "twig/twig": "^3.0"
+    },
+    "suggest": {
+        "twig/twig": "Needed for PdfGenerator::fromTwig()"
+    },
+    "autoload": {
+        "psr-4": {"IvoPdf\\Symfony\\": "src/"}
+    },
+    "autoload-dev": {
+        "psr-4": {"IvoPdf\\Symfony\\Tests\\": "tests/"}
+    },
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../..",
+            "options": {"symlink": true, "versions": {"ivopdf/ivopdf": "1.0.0"}}
+        }
+    ],
+    "scripts": {
+        "test": "phpunit"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

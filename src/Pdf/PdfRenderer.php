@@ -1,0 +1,1661 @@
+<?php
+
+declare(strict_types=1);
+
+namespace IvoPdf\Pdf;
+
+use IvoPdf\Css\CssColor;
+use IvoPdf\Css\CssUnit;
+use IvoPdf\Font\FontManager;
+use IvoPdf\Image\ImageLoader;
+use IvoPdf\Layout\LayoutBox;
+use IvoPdf\Layout\LineBox;
+use IvoPdf\Layout\TextRun;
+
+/**
+ * Renders laid-out LayoutBox trees onto PDF pages with full support for rounded corners,
+ * linear gradients, box-shadows, borders, opacity, transforms, images, SVGs, and Unicode/Cyrillic text.
+ */
+class PdfRenderer
+{
+    private PdfDocument $pdf;
+    private FontManager $fontManager;
+    private ImageLoader $imageLoader;
+    private SvgRenderer $svgRenderer;
+    private BorderPainter $borderPainter;
+    private EffectsPainter $effects;
+    private BorderImagePainter $borderImagePainter;
+
+    private float $pageWidth;
+    private float $pageHeight;
+    private float $topMargin;
+    private float $printableHeight;
+    /** Virtual y where the current page's content slice starts (null = uniform pages) */
+    private ?float $virtualTopOverride = null;
+    private int $currentPageIndex = 0;
+    private int $totalPages = 1;
+
+    public function __construct(
+        PdfDocument $pdf,
+        FontManager $fontManager,
+        ImageLoader $imageLoader,
+        float $pageWidth,
+        float $pageHeight,
+        float $topMargin,
+        float $printableHeight
+    ) {
+        $this->pdf = $pdf;
+        $this->fontManager = $fontManager;
+        $this->imageLoader = $imageLoader;
+        $this->svgRenderer = new SvgRenderer(
+            $fontManager,
+            static fn(float $a): string => $pdf->registerAlphaState($a),
+            $pdf->paints(),
+            static fn(string $src): ?array => $imageLoader->load($src)
+        );
+        $this->pageWidth = $pageWidth;
+        $this->pageHeight = $pageHeight;
+        $this->borderPainter = new BorderPainter($pdf, $pageHeight);
+        $this->effects = new EffectsPainter($pdf, $pageHeight);
+        $this->borderImagePainter = new BorderImagePainter($this, $imageLoader, $pageHeight);
+        $this->topMargin = $topMargin;
+        $this->printableHeight = max(50.0, $printableHeight);
+    }
+
+    private ?FormAppearance $formAppearance = null;
+    /** Subtree extents + fixed-box list cached across pages (skips boxes that cannot touch the current page) */
+    private ?RenderCull $cull = null;
+    private bool $activeForms = true;
+
+    /**
+     * Enables/disables interactive AcroForm widgets (false = form controls are drawn as static graphics only).
+     */
+    public function setActiveForms(bool $active): void
+    {
+        $this->activeForms = $active;
+        $this->formAppearance?->setActiveForms($active);
+    }
+
+    private function formAppearance(): FormAppearance
+    {
+        return $this->formAppearance ??= new FormAppearance($this->fontManager, $this->pdf, $this->activeForms);
+    }
+
+    /**
+     * Per-page geometry for documents with :first / :left / :right / named @page rules or per-page headers:
+     * page size, effective top margin, printable height and the virtual y where this page's slice starts.
+     */
+    public function setPageGeometry(float $pageWidth, float $pageHeight, float $topMargin, float $printableHeight, float $virtualTop): void
+    {
+        $this->pageWidth = $pageWidth;
+        $this->pageHeight = $pageHeight;
+        $this->topMargin = $topMargin;
+        $this->printableHeight = max(50.0, $printableHeight);
+        $this->virtualTopOverride = $virtualTop;
+    }
+
+    /**
+     * Renders a single page of the document (0-based $pageIndex).
+     */
+    public function renderPage(
+        LayoutBox $root,
+        int $pageIndex,
+        int $totalPages,
+        ?LayoutBox $headerBox = null,
+        ?LayoutBox $footerBox = null,
+        ?LayoutBox $overlayBox = null
+    ): void {
+        $this->currentPageIndex = $pageIndex;
+        $this->totalPages = $totalPages;
+
+        $virtualPageTop = $this->virtualTopOverride ?? ($this->topMargin + ($pageIndex * $this->printableHeight));
+        $virtualPageBottom = $virtualPageTop + $this->printableHeight;
+        $yShift = $virtualPageTop - $this->topMargin;
+
+        $stream = '';
+
+        // 1. Render optional running header
+        if ($headerBox !== null) {
+            $stream .= $this->renderBoxTree($headerBox, 0.0, 0.0, $this->pageHeight, true);
+        }
+
+        // 2. Render fixed elements anywhere in the document on every page
+        $fixedBoxes = [];
+        $this->cull ??= new RenderCull();
+        $fixedBoxes = $this->cull->fixedBoxes($root);
+        foreach ($fixedBoxes as $fixedBox) {
+            $stream .= $this->renderBoxTree($fixedBox, 0.0, 0.0, $this->pageHeight, true);
+        }
+
+        // 3. Render main page content clipped to the printable vertical region (unless single page full-bleed)
+        $stream .= "q\n";
+        if ($totalPages > 1) {
+            $clipBottomPdfY = $this->pageHeight - ($this->topMargin + $this->printableHeight);
+            $stream .= sprintf("0.00 %.2F %.2F %.2F re W n\n", $clipBottomPdfY, $this->pageWidth, $this->printableHeight);
+        }
+        $stream .= $this->renderBoxTree($root, $yShift, $virtualPageTop, $virtualPageBottom, false);
+        $stream .= "Q\n";
+
+        // 4. Render optional running footer
+        if ($footerBox !== null) {
+            $stream .= $this->renderBoxTree($footerBox, 0.0, 0.0, $this->pageHeight, true);
+        }
+
+        // 5. Optional overlay (watermark) on top of everything
+        if ($overlayBox !== null) {
+            $stream .= $this->renderBoxTree($overlayBox, 0.0, 0.0, $this->pageHeight, true);
+        }
+
+        $this->pdf->appendPageContent($pageIndex, $stream);
+    }
+
+    /**
+     * @param list<LayoutBox> $out
+     */
+    private function collectFixedBoxes(LayoutBox $box, array &$out): void
+    {
+        if (strtolower($box->style->get('position', 'static')) === 'fixed') {
+            $out[] = $box;
+            return;
+        }
+        foreach ($box->children as $child) {
+            $this->collectFixedBoxes($child, $out);
+        }
+    }
+
+    /**
+     * Drops children whose whole subtree lies outside the page slice (cheap, order-preserving; keeps paint-order sorting small).
+     *
+     * @param list<LayoutBox> $children
+     * @return list<LayoutBox>
+     */
+    private function childrenTouchingPage(array $children, bool $isFixedContext, float $top, float $bottom): array
+    {
+        if ($isFixedContext || count($children) < 6) {
+            return $children;
+        }
+        $cull = $this->cull ??= new RenderCull();
+        $out = [];
+        foreach ($children as $child) {
+            [$lo, $hi] = $cull->extent($child);
+            if ($hi >= $top - RenderCull::SLACK && $lo <= $bottom + RenderCull::SLACK) {
+                $out[] = $child;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * @param list<LayoutBox> $children
+     * @return list<LayoutBox>
+     */
+    private function paintOrder(array $children): array
+    {
+        $layers = [];
+        foreach ($children as $i => $child) {
+            $pos = strtolower($child->style->get('position', 'static'));
+            $zCss = trim($child->style->get('z-index', 'auto'));
+            $z = is_numeric($zCss) ? (int) $zCss : 0;
+            if ($pos === 'static') {
+                $rank = $z < 0 && is_numeric($zCss) ? -1 : 0;
+                $layer = [$rank, 0, $i];
+            } else {
+                $layer = $z < 0 ? [-1, $z, $i] : [1, $z, $i];
+            }
+            $layers[] = [$layer, $child];
+        }
+        usort($layers, static fn(array $a, array $b): int => $a[0] <=> $b[0]);
+        return array_map(static fn(array $l): LayoutBox => $l[1], $layers);
+    }
+
+    private function renderBoxTree(
+        LayoutBox $box,
+        float $yShift,
+        float $visibleVirtualTop,
+        float $visibleVirtualBottom,
+        bool $isFixedContext,
+        bool $skipChildren = false
+    ): string {
+        if ($box->isTextNode()) {
+            return '';
+        }
+        if (!$isFixedContext && strtolower($box->style->get('position', 'static')) === 'fixed') {
+            return '';
+        }
+        if (!$isFixedContext && $box->tagName !== 'body') {
+            // Whole subtree (boxes, lines, positioned descendants) outside this page's slice: nothing to paint
+            [$extLo, $extHi] = ($this->cull ??= new RenderCull())->extent($box);
+            if ($extHi < $visibleVirtualTop - RenderCull::SLACK || $extLo > $visibleVirtualBottom + RenderCull::SLACK) {
+                return '';
+            }
+        }
+        // visibility: hidden hides only the box itself; descendants may re-enable it with visibility: visible
+        $selfHidden = in_array(strtolower($box->style->get('visibility', 'visible')), ['hidden', 'collapse'], true);
+        if ($selfHidden && empty($box->children) && empty($box->lines)) {
+            return '';
+        }
+
+        $boxTop = $box->y;
+        $boxBottom = $box->y + $box->height;
+
+        // Skip boxes completely outside this page's vertical slice (unless it has out-of-flow children)
+        if (!$isFixedContext && empty($box->children)) {
+            if ($boxBottom < $visibleVirtualTop - 1.0 || $boxTop > $visibleVirtualBottom + 1.0) {
+                return '';
+            }
+        }
+
+        $localX = $box->x;
+        $localY = $box->y - $yShift;
+        $boxW = $box->width;
+        $boxH = $box->height;
+
+        // If a large wrapper container spans multiple pages, clamp its background/border rect to the current page
+        if (!$isFixedContext && $this->totalPages > 1 && $box->tagName !== 'body') {
+            $clampedTop = max($boxTop, $visibleVirtualTop);
+            $clampedBottom = min($boxBottom, $visibleVirtualBottom);
+            if ($clampedBottom > $clampedTop && ($boxTop < $visibleVirtualTop || $boxBottom > $visibleVirtualBottom)) {
+                $localY = $clampedTop - $yShift;
+                $boxH = $clampedBottom - $clampedTop;
+            }
+        }
+
+        $out = '';
+        $needsGraphicsRestore = false;
+
+        // Named destinations (id / a[name]) and heading bookmarks
+        if (!$isFixedContext && $box->domElement !== null && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5) {
+            $destY = $this->pageHeight - $localY;
+            foreach (['id', 'name'] as $attr) {
+                $anchor = trim($box->domElement->getAttribute($attr));
+                if ($anchor !== '' && ($attr === 'id' || $box->tagName === 'a')) {
+                    $this->pdf->registerDestination($anchor, $this->currentPageIndex, $destY);
+                }
+            }
+            if (preg_match('/^h([1-6])$/', $box->tagName, $hm) && !$box->domElement->hasAttribute('data-ivo-nobm')) {
+                $title = trim((string) preg_replace('/\s+/u', ' ', (string) $box->domElement->textContent));
+                if ($title !== '') {
+                    $this->pdf->addOutline((int) $hm[1], $title, $this->currentPageIndex, $destY);
+                }
+            }
+            \IvoPdf\Compat\MpdfRenderHooks::apply($this->pdf, $box->domElement, $this->currentPageIndex, $localX, $destY); // mPDF <bookmark>, <annotation>
+        }
+
+        // Handle opacity
+        $filterCss = $box->style->get('filter', 'none');
+        $opacity = (float) $box->style->get('opacity', '1');
+        if ($filterCss !== 'none') {
+            $opacity *= EffectsPainter::filterOpacity($filterCss);
+            if (str_contains(strtolower($filterCss), 'blur(')) {
+                $this->imageLoader->addWarning('CSS filter: blur() is not supported and was ignored');
+            }
+        }
+        $groupGs = null;
+        if ($opacity < 0.999) {
+            $out .= "q\n";
+            $needsGraphicsRestore = true;
+            $gsId = $this->pdf->registerAlphaState($opacity);
+            if (!empty($box->children) || !empty($box->lines)) {
+                $groupGs = $gsId; // painted into a transparency group and composited once (true group opacity)
+            } else {
+                $out .= "/{$gsId} gs\n";
+            }
+        }
+
+        // mix-blend-mode -> PDF blend mode (applies to the box's own painting operations)
+        $blendName = EffectsPainter::blendModeName($box->style->get('mix-blend-mode', 'normal'));
+        if ($blendName !== null) {
+            if (!$needsGraphicsRestore) {
+                $out .= "q
+";
+                $needsGraphicsRestore = true;
+            }
+            $out .= '/' . $this->pdf->registerBlendState($blendName) . " gs
+";
+        }
+
+        // Handle CSS transform (rotate, scale, translate)
+        $transformCss = trim($box->style->get('transform', 'none'));
+        if ($transformCss !== '' && strtolower($transformCss) !== 'none') {
+            if (!$needsGraphicsRestore) {
+                $out .= "q\n";
+                $needsGraphicsRestore = true;
+            }
+            $out .= $this->buildTransformMatrixCommand($transformCss, $localX, $localY, $boxW, $boxH, $box->style->get('transform-origin', '50% 50%'));
+        }
+
+        // clip-path: inset() / circle() / ellipse() / polygon() around the whole painting of the element
+        $clipPathCss = $box->style->get('clip-path', 'none');
+        if ($clipPathCss !== 'none' && $boxW > 0.05 && $boxH > 0.05) {
+            $clipCmd = $this->effects->clipPath($clipPathCss, $localX, $localY, $boxW, $boxH, $box->fontSizePt);
+            if ($clipCmd !== '') {
+                if (!$needsGraphicsRestore) {
+                    $out .= "q
+";
+                    $needsGraphicsRestore = true;
+                }
+                $out .= $clipCmd;
+            }
+        }
+
+        $groupStart = strlen($out);
+
+        // Draw box visuals (shadow, background, gradient, borders) if visible on this page
+        $isVisibleOnPage = !$selfHidden && ($isFixedContext || ($boxBottom >= $visibleVirtualTop - 0.5 && $boxTop <= $visibleVirtualBottom + 0.5));
+        $radii = $this->resolveBorderRadii($box, $boxW, $boxH);
+
+        if ($isVisibleOnPage && $boxW > 0.05 && $boxH > 0.05) {
+            // 1. Box shadow
+            $shadowCss = trim($box->style->get('box-shadow', 'none'));
+            if ($filterCss !== 'none' && ($ds = EffectsPainter::dropShadowAsBoxShadow($filterCss)) !== '') {
+                $shadowCss = strtolower($shadowCss) === 'none' || $shadowCss === '' ? $ds : $shadowCss . ', ' . $ds;
+            }
+            if ($shadowCss !== '' && strtolower($shadowCss) !== 'none') {
+                $out .= $this->drawBoxShadow($shadowCss, $localX, $localY, $boxW, $boxH, $radii, $box->fontSizePt);
+            }
+
+            // 2. Background color
+            $bgColor = CssColor::parse($box->style->get('background-color', 'transparent'));
+            if ($bgColor !== null) {
+                $out .= $this->drawFilledRect($localX, $localY, $boxW, $boxH, $radii, $bgColor);
+            }
+
+            // 3. Background gradient or background-image
+            $out .= $this->drawBackgroundImage($box, $localX, $localY, $boxW, $boxH, $radii);
+
+            // 4. Clickable box link if <a> is styled as block/inline-block/flex
+            if ($box->href !== null && $box->href !== '' && ($box->tagName === 'a' || !$box->isInlineLevel())) {
+                $pdfY = $this->pageHeight - ($localY + $boxH);
+                $this->pdf->addLinkAnnotation($this->currentPageIndex, $localX, $pdfY, $boxW, $boxH, $box->href);
+            }
+        }
+
+        // 4b. Column rules of multi-column containers
+        if (!empty($box->columnRects) && !$isFixedContext) {
+            $out .= $this->drawColumnRules($box, $yShift, $visibleVirtualTop, $visibleVirtualBottom);
+        }
+
+        // 5. Clipping if overflow: hidden
+        $overflow = strtolower($box->style->get('overflow', 'visible'));
+        $clipped = false;
+        if (($overflow === 'hidden' || $overflow === 'clip' || $overflow === 'auto' || $overflow === 'scroll') && $isVisibleOnPage && $boxW > 0.1 && $boxH > 0.1) {
+            $out .= "q\n";
+            $out .= $this->buildRoundedRectPath($localX, $localY, $boxW, $boxH, $radii) . "W n\n";
+            $clipped = true;
+        }
+
+        // 6. Replaced content: <img>, <svg> or a form control (static frame + interactive AcroForm widget)
+        if ($isVisibleOnPage) {
+            if ($box->formControl !== null) {
+                $register = !$isFixedContext && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5;
+                $out .= $this->formAppearance()->render($box, $yShift, $this->pageHeight, $this->currentPageIndex, $register);
+            } elseif ($box->tagName === 'img' && $box->imageSrc !== null) {
+                $objectFit = strtolower($box->style->get('object-fit', 'fill'));
+                $cx = $localX + $box->borderLeft + $box->paddingLeft;
+                $cy = $localY + $box->borderTop + $box->paddingTop;
+                $cw = $box->getContentWidth();
+                $ch = $box->getContentHeight();
+                $out .= $this->drawImageInRect($box->imageSrc, $cx, $cy, $cw, $ch, $radii, $objectFit, $box->style->get('object-position', '50% 50%'), $filterCss, strtolower($box->style->get('image-rendering', 'auto')) !== 'auto' && strtolower($box->style->get('image-rendering', 'auto')) !== 'smooth');
+            } elseif ($box->tagName === 'svg' && $box->domElement !== null) {
+                $cx = $localX + $box->borderLeft + $box->paddingLeft;
+                $cy = $localY + $box->borderTop + $box->paddingTop;
+                $cw = $box->getContentWidth();
+                $ch = $box->getContentHeight();
+                $out .= $this->svgRenderer->renderSvg(
+                    $box->domElement,
+                    $cx,
+                    $cy,
+                    $cw,
+                    $ch,
+                    $this->pageHeight,
+                    $box->style->get('color', '#111827')
+                );
+            }
+
+            // List item marker (bullet or number)
+            if (($box->listMarker !== null && $box->listMarker !== '') || $box->listMarkerImage !== null) {
+                $out .= $this->drawListMarker($box, $localX, $localY);
+            }
+        }
+
+        // 7. Render inline LineBoxes belonging to this box
+        foreach ($box->lines as $line) {
+            $lineTop = $line->y;
+            $lineBottom = $line->y + $line->height;
+            if (!$isFixedContext && ($lineBottom < $visibleVirtualTop - 0.5 || $lineTop > $visibleVirtualBottom + 0.5)) {
+                continue;
+            }
+            $out .= $this->renderLineBox($line, $yShift, $isFixedContext);
+        }
+
+        // 8. Render child boxes in CSS painting order (negative z-index, in-flow, positioned, positive z-index).
+        //    Table sections paint every row background first and the cells afterwards, so row-spanning cells stay visible.
+        $isTableSection = in_array($box->getDisplay(), ['table', 'table-row-group', 'table-header-group', 'table-footer-group'], true);
+        $deferredRows = [];
+        foreach ($skipChildren ? [] : $this->paintOrder($this->childrenTouchingPage($box->children, $isFixedContext, $visibleVirtualTop, $visibleVirtualBottom)) as $child) {
+            if ($isTableSection && $child->getDisplay() === 'table-row') {
+                $out .= $this->renderBoxTree($child, $yShift, $visibleVirtualTop, $visibleVirtualBottom, $isFixedContext, true);
+                $deferredRows[] = $child;
+                continue;
+            }
+            if ($child->isInlineLevel() && !$child->isPositionedOutOfFlow() && !empty($box->lines)) {
+                // Inline-level children were already tokenized into $box->lines by InlineLayout
+                continue;
+            }
+            if ($child->isInlineLevel() && !$child->isPositionedOutOfFlow() && $child->isTextNode()) {
+                continue;
+            }
+            $out .= $this->renderBoxTree($child, $yShift, $visibleVirtualTop, $visibleVirtualBottom, $isFixedContext);
+        }
+        foreach ($deferredRows as $row) {
+            foreach ($this->paintOrder($row->children) as $cell) {
+                $out .= $this->renderBoxTree($cell, $yShift, $visibleVirtualTop, $visibleVirtualBottom, $isFixedContext);
+            }
+        }
+
+        if ($clipped) {
+            $out .= "Q\n";
+        }
+
+        // 9. Draw Borders on top of background/children
+        if ($isVisibleOnPage && ($boxW > 0.05 || $boxH > 0.05)) {
+            $out .= $this->drawBorders($box, $localX, $localY, $boxW, $boxH, $radii);
+        }
+
+        // 10. Outline (outside the border box, never affects layout)
+        if ($isVisibleOnPage && $boxW > 0.05 && $boxH > 0.05) {
+            $out .= $this->borderPainter->paintOutline($box, $localX, $localY, $boxW, $boxH, $radii);
+        }
+
+        if ($groupGs !== null && strlen($out) > $groupStart) {
+            $inner = substr($out, $groupStart);
+            $out = substr($out, 0, $groupStart) . '/' . $groupGs . ' gs /' . $this->pdf->groups()->register($inner) . " Do\n";
+        }
+
+        if ($needsGraphicsRestore) {
+            $out .= "Q\n";
+        }
+
+        return $out;
+    }
+
+    private function renderLineBox(LineBox $line, float $yShift, bool $replacePageTokens): string
+    {
+        $out = $this->drawInlineDecorations($line, $yShift);
+
+        foreach ($line->runs as $run) {
+            if ($run->inlineBox !== null) {
+                $out .= $this->renderBoxTree(
+                    $run->inlineBox,
+                    $yShift,
+                    $run->inlineBox->y - 1.0,
+                    $run->inlineBox->y + $run->inlineBox->height + 1.0,
+                    $replacePageTokens
+                );
+                continue;
+            }
+
+            if ($run->style->get('visibility', 'visible') !== 'visible') {
+                continue;
+            }
+            $runBaselineDocY = ($run->y + $run->ascent) - $yShift;
+            $baselinePdfY = $this->pageHeight - $runBaselineDocY;
+
+            $text = $run->text;
+            if (str_contains($text, '{')) {
+                $text = strtr($text, [
+                    '{PAGE_NUM}' => (string) ($this->currentPageIndex + 1),
+                    '{PAGENO}' => (string) ($this->currentPageIndex + 1),
+                    '{PAGE_COUNT}' => (string) $this->totalPages,
+                    '{nbpg}' => (string) $this->totalPages,
+                ]);
+            }
+
+            if ($text === '' || ($run->isWhitespace && strtolower($run->style->get('text-decoration', 'none')) === 'none')) {
+                continue;
+            }
+
+            $fontFamily = $run->style->get('font-family', 'DejaVu Sans');
+            $fontWeight = $run->style->get('font-weight', 'normal');
+            $fontStyle = $run->style->get('font-style', 'normal');
+            $ttf = $this->fontManager->resolveFont($fontFamily, $fontWeight, $fontStyle);
+            $fontId = $this->fontManager->markFontUsed($ttf);
+
+            $color = CssColor::parse($run->style->get('color', '#111827')) ?? [0.067, 0.094, 0.153, 1.0];
+
+            $alphaGuard = '';
+            $alphaRestore = '';
+            if ($color[3] < 0.999) {
+                $gsId = $this->pdf->registerAlphaState($color[3]);
+                $alphaGuard = "q /{$gsId} gs ";
+                $alphaRestore = " Q";
+            }
+
+            $textStartLen = strlen($out);
+            if ($run->glyphs !== null && $text === $run->text) {
+                // Shaped run (ligatures, kerning, Arabic forms, RTL): positioned glyph ids in visual order
+                // Reordered Indic glyphs carry /ActualText so that copy/paste and search see the logical text
+                $logical = preg_match('/[\x{0900}-\x{0D7F}]/u', $text) === 1 || in_array('', array_column($run->glyphs, 4), true) ? $text : null;
+                $showOps = $this->fontManager->encodeShapedGlyphs($ttf, $run->glyphs, $run->fontSizePt, $logical);
+            } else {
+                $hexGids = $this->fontManager->encodeTextToHexGids($ttf, $text);
+                $showOps = $hexGids !== '' ? '<' . $hexGids . '> Tj' : '';
+            }
+            if ($showOps !== '') {
+                $tcCmd = abs($run->letterSpacingPt) > 0.001 ? sprintf('%.3F Tc ', $run->letterSpacingPt) : '';
+                $tcReset = abs($run->letterSpacingPt) > 0.001 ? ' 0 Tc' : '';
+
+                $out .= sprintf(
+                    "%sBT /%s %.2F Tf %s%s %.2F %.2F Td %s%s ET%s\n",
+                    $alphaGuard,
+                    $fontId,
+                    $run->fontSizePt,
+                    $tcCmd,
+                    ColorOps::fillOp($color),
+                    $run->x,
+                    $baselinePdfY,
+                    $showOps,
+                    $tcReset,
+                    $alphaRestore
+                );
+            }
+
+            $out = $this->effects->applyTextShadow($out, $textStartLen, $run->style->get('text-shadow', 'none'), $run->fontSizePt);
+
+            // Text decorations (underline, overline, line-through)
+            $deco = strtolower($run->style->get('text-decoration', 'none'));
+            $decoColor = CssColor::parse($run->style->get('text-decoration-color', 'currentcolor'));
+            if ($decoColor !== null && preg_match('/\b(underline|overline|line-through)\b/', $deco)) {
+                $color = $decoColor;
+            }
+            if (str_contains($deco, 'overline')) {
+                $lineY = $baselinePdfY + ($run->ascent * 0.98);
+                $lw = max(0.5, $run->fontSizePt * 0.06);
+                $out .= sprintf(
+                    "q %.2F w %s %.2F %.2F m %.2F %.2F l S Q\n",
+                    $lw,
+                    ColorOps::strokeOp($color),
+                    $run->x,
+                    $lineY,
+                    $run->x + $run->width,
+                    $lineY
+                );
+            }
+            if (str_contains($deco, 'underline')) {
+                $lineY = $baselinePdfY - ($run->fontSizePt * 0.12);
+                $lw = max(0.5, $run->fontSizePt * 0.06);
+                $out .= sprintf(
+                    "q %.2F w %s %.2F %.2F m %.2F %.2F l S Q\n",
+                    $lw,
+                    ColorOps::strokeOp($color),
+                    $run->x,
+                    $lineY,
+                    $run->x + $run->width,
+                    $lineY
+                );
+            }
+            if (str_contains($deco, 'line-through')) {
+                $lineY = $baselinePdfY + ($run->fontSizePt * 0.28);
+                $lw = max(0.5, $run->fontSizePt * 0.06);
+                $out .= sprintf(
+                    "q %.2F w %s %.2F %.2F m %.2F %.2F l S Q\n",
+                    $lw,
+                    ColorOps::strokeOp($color),
+                    $run->x,
+                    $lineY,
+                    $run->x + $run->width,
+                    $lineY
+                );
+            }
+
+            // Clickable Link Annotation (external URLs and internal #anchors)
+            if ($run->href !== null && $run->href !== '') {
+                $pdfRunBottom = $baselinePdfY - $run->descent;
+                $this->pdf->addLinkAnnotation($this->currentPageIndex, $run->x, $pdfRunBottom, $run->width, $run->height, $run->href);
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Paints backgrounds and borders of decorated inline elements (<span style="background:..">, <mark>, <code>, badges)
+     * as one continuous box per element per line, behind the text.
+     */
+    private function drawInlineDecorations(LineBox $line, float $yShift): string
+    {
+        /** @var array<int, array{box: LayoutBox, left: float, right: float, baseline: float}> $groups */
+        $groups = [];
+        foreach ($line->runs as $run) {
+            if (empty($run->decorations)) {
+                continue;
+            }
+            $baseline = ($run->y + $run->ascent) - $yShift;
+            foreach ($run->decorations as $deco) {
+                $oid = spl_object_id($deco);
+                $left = $run->x - ($run->decoLeft[$oid] ?? 0.0);
+                $right = $run->x + $run->width + ($run->decoRight[$oid] ?? 0.0);
+                if (!isset($groups[$oid])) {
+                    $groups[$oid] = ['box' => $deco, 'left' => $left, 'right' => $right, 'baseline' => $baseline];
+                } else {
+                    $groups[$oid]['left'] = min($groups[$oid]['left'], $left);
+                    $groups[$oid]['right'] = max($groups[$oid]['right'], $right);
+                    if ($run->inlineBox === null) {
+                        $groups[$oid]['baseline'] = $baseline;
+                    }
+                }
+            }
+        }
+
+        $out = '';
+        foreach ($groups as $g) {
+            $el = $g['box'];
+            $fs = $el->fontSizePt;
+            $ttf = $this->fontManager->resolveFont(
+                $el->style->get('font-family', 'DejaVu Sans'),
+                $el->style->get('font-weight', 'normal'),
+                $el->style->get('font-style', 'normal')
+            );
+            $asc = ($ttf->ascent / 1000.0) * $fs;
+            $desc = (abs($ttf->descent) / 1000.0) * $fs;
+            $top = $g['baseline'] - $asc - $el->paddingTop - $el->borderTop;
+            $bottom = $g['baseline'] + $desc + $el->paddingBottom + $el->borderBottom;
+            $w = $g['right'] - $g['left'];
+            $h = $bottom - $top;
+            if ($w <= 0.05 || $h <= 0.05) {
+                continue;
+            }
+            $radii = $this->resolveBorderRadii($el, $w, $h);
+            $bg = CssColor::parse($el->style->get('background-color', 'transparent'));
+            if ($bg !== null) {
+                $out .= $this->drawFilledRect($g['left'], $top, $w, $h, $radii, $bg);
+            }
+            $out .= $this->drawBackgroundImage($el, $g['left'], $top, $w, $h, $radii);
+            $out .= $this->drawBorders($el, $g['left'], $top, $w, $h, $radii);
+        }
+        return $out;
+    }
+
+    /**
+     * Paints the first background-image layer: linear/radial gradient or url() image honoring
+     * background-size, background-position and background-repeat.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function drawBackgroundImage(LayoutBox $box, float $x, float $y, float $w, float $h, array $radii): string
+    {
+        $bgImage = trim($box->style->get('background-image', 'none'));
+        if ($bgImage === '' || strtolower($bgImage) === 'none' || $w <= 0.05 || $h <= 0.05) {
+            return '';
+        }
+        $layer = $this->splitTopLevelCommas($bgImage)[0] ?? $bgImage;
+        $lower = strtolower($layer);
+
+        if (str_contains($lower, 'radial-gradient(')) {
+            $radial = CssColor::parseRadialGradient($layer);
+            return $radial !== null ? $this->drawRadialGradient($x, $y, $w, $h, $radii, $radial) : '';
+        }
+        if (str_contains($lower, 'linear-gradient(')) {
+            $gradient = CssColor::parseLinearGradient($layer);
+            return $gradient !== null ? $this->drawLinearGradient($x, $y, $w, $h, $radii, $gradient) : '';
+        }
+        if (!preg_match('/url\((.+)\)/is', $layer, $um)) {
+            return '';
+        }
+
+        $src = trim($um[1], " \t\n\r\0\x0B'\"");
+        $svgBg = SvgBackground::load($this->imageLoader, $src);
+        $img = $svgBg !== null ? $svgBg['img'] : $this->imageLoader->load($src);
+        if ($img === null) {
+            return '';
+        }
+
+        $natW = max(0.01, $img['width'] * CssUnit::getPxToPt());
+        $natH = max(0.01, $img['height'] * CssUnit::getPxToPt());
+        $ratio = $natW / $natH;
+
+        $sizeCss = strtolower(trim($box->style->get('background-size', 'auto')));
+        if ($sizeCss === 'cover' || $sizeCss === 'contain') {
+            $scale = $sizeCss === 'cover' ? max($w / $natW, $h / $natH) : min($w / $natW, $h / $natH);
+            $tileW = $natW * $scale;
+            $tileH = $natH * $scale;
+        } else {
+            $sizeTokens = preg_split('/\s+/', $sizeCss, -1, PREG_SPLIT_NO_EMPTY) ?: ['auto'];
+            $sw = ($sizeTokens[0] ?? 'auto') === 'auto' ? null : CssUnit::toPt($sizeTokens[0], $w, $box->fontSizePt);
+            $sh = (($sizeTokens[1] ?? 'auto') === 'auto') ? null : CssUnit::toPt($sizeTokens[1], $h, $box->fontSizePt);
+            if ($sw === null && $sh === null) {
+                $tileW = $natW;
+                $tileH = $natH;
+            } elseif ($sh === null) {
+                $tileW = (float) $sw;
+                $tileH = $tileW / $ratio;
+            } elseif ($sw === null) {
+                $tileH = $sh;
+                $tileW = $tileH * $ratio;
+            } else {
+                $tileW = $sw;
+                $tileH = $sh;
+            }
+        }
+        if ($tileW <= 0.05 || $tileH <= 0.05) {
+            return '';
+        }
+
+        [$offX, $offY] = $this->resolvePosition($box->style->get('background-position', '0% 0%'), $w - $tileW, $h - $tileH);
+
+        $repeatTokens = preg_split('/\s+/', strtolower(trim($box->style->get('background-repeat', 'repeat'))), -1, PREG_SPLIT_NO_EMPTY) ?: ['repeat'];
+        if (count($repeatTokens) === 1) {
+            [$repX, $repY] = match ($repeatTokens[0]) {
+                'no-repeat' => [false, false],
+                'repeat-x' => [true, false],
+                'repeat-y' => [false, true],
+                default => [true, true],
+            };
+        } else {
+            $repX = $repeatTokens[0] !== 'no-repeat';
+            $repY = $repeatTokens[1] !== 'no-repeat';
+        }
+
+        $xs = [$x + $offX];
+        $ys = [$y + $offY];
+        if ($repX) {
+            $startX = $x + $offX - ceil($offX / $tileW) * $tileW;
+            $xs = [];
+            for ($tx = $startX; $tx < $x + $w - 0.01 && count($xs) < 400; $tx += $tileW) {
+                $xs[] = $tx;
+            }
+        }
+        if ($repY) {
+            $startY = $y + $offY - ceil($offY / $tileH) * $tileH;
+            $ys = [];
+            for ($ty = $startY; $ty < $y + $h - 0.01 && count($ys) < 400; $ty += $tileH) {
+                $ys[] = $ty;
+            }
+        }
+
+        $out = "q\n" . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W n\n";
+        $tiles = 0;
+        foreach ($ys as $ty) {
+            foreach ($xs as $tx) {
+                if (++$tiles > 4000) {
+                    break 2;
+                }
+                if ($svgBg !== null) {
+                    // SVG backgrounds stay vector: rendered into each tile
+                    $out .= $this->svgRenderer->renderSvg($svgBg['dom'], $tx, $ty, $tileW, $tileH, $this->pageHeight, $box->style->get('color', '#111827'));
+                    continue;
+                }
+                $out .= sprintf("q %.3F 0 0 %.3F %.3F %.3F cm /%s Do Q\n", $tileW, $tileH, $tx, $this->pageHeight - ($ty + $tileH), $img['id']);
+            }
+        }
+        return $out . "Q\n";
+    }
+
+    /**
+     * Paints a CSS gradient string (linear / radial) into a rectangle; '' when the value is not a gradient.
+     */
+    public function paintGradientCss(string $css, float $x, float $y, float $w, float $h): string
+    {
+        $none = [0.0, 0.0, 0.0, 0.0];
+        $lower = strtolower($css);
+        if (str_contains($lower, 'radial-gradient(')) {
+            $g = CssColor::parseRadialGradient($css);
+            return $g !== null ? $this->drawRadialGradient($x, $y, $w, $h, $none, $g) : '';
+        }
+        if (str_contains($lower, 'linear-gradient(')) {
+            $g = CssColor::parseLinearGradient($css);
+            return $g !== null ? $this->drawLinearGradient($x, $y, $w, $h, $none, $g) : '';
+        }
+        return '';
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     * @param array{shape: string, size: string, position: string, radii: array{0: ?string, 1: ?string}, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>} $gradient
+     */
+    private function drawRadialGradient(float $x, float $y, float $w, float $h, array $radii, array $gradient): string
+    {
+        [$cxOff, $cyOff] = $this->resolvePosition($gradient['position'], $w, $h);
+        $dxMin = min($cxOff, $w - $cxOff);
+        $dxMax = max($cxOff, $w - $cxOff);
+        $dyMin = min($cyOff, $h - $cyOff);
+        $dyMax = max($cyOff, $h - $cyOff);
+        $isCircle = $gradient['shape'] === 'circle';
+
+        if ($gradient['radii'][0] !== null) {
+            $rx = CssUnit::toPt($gradient['radii'][0], $w);
+            $ry = $gradient['radii'][1] !== null ? CssUnit::toPt($gradient['radii'][1], $h) : $rx;
+        } else {
+            [$rx, $ry] = match ($gradient['size']) {
+                'closest-side' => $isCircle ? [min($dxMin, $dyMin), min($dxMin, $dyMin)] : [$dxMin, $dyMin],
+                'farthest-side' => $isCircle ? [max($dxMax, $dyMax), max($dxMax, $dyMax)] : [$dxMax, $dyMax],
+                'closest-corner' => $isCircle
+                    ? [hypot($dxMin, $dyMin), hypot($dxMin, $dyMin)]
+                    : [$dxMin * M_SQRT2, $dyMin * M_SQRT2],
+                default => $isCircle
+                    ? [hypot($dxMax, $dyMax), hypot($dxMax, $dyMax)]
+                    : [$dxMax * M_SQRT2, $dyMax * M_SQRT2],
+            };
+        }
+        $rx = max(0.1, $rx);
+        $ry = max(0.1, $ry);
+
+        $shId = $this->pdf->registerRadialShading([0.0, 0.0, 0.0, 0.0, 0.0, $rx], $gradient['stops']);
+        $cxPdf = $x + $cxOff;
+        $cyPdf = $this->pageHeight - ($y + $cyOff);
+
+        $out = "q\n" . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W n\n";
+        $out .= sprintf("1 0 0 %.5F %.3F %.3F cm\n", $ry / $rx, $cxPdf, $cyPdf);
+        $out .= "/{$shId} sh\nQ\n";
+        return $out;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function splitTopLevelCommas(string $str): array
+    {
+        $result = [];
+        $current = '';
+        $depth = 0;
+        $len = strlen($str);
+        for ($i = 0; $i < $len; $i++) {
+            $ch = $str[$i];
+            if ($ch === '(') {
+                $depth++;
+            } elseif ($ch === ')') {
+                $depth = max(0, $depth - 1);
+            } elseif ($ch === ',' && $depth === 0) {
+                $result[] = trim($current);
+                $current = '';
+                continue;
+            }
+            $current .= $ch;
+        }
+        if (trim($current) !== '') {
+            $result[] = trim($current);
+        }
+        return $result;
+    }
+
+    private function drawListMarker(LayoutBox $liBox, float $localX, float $localY): string
+    {
+        if ($liBox->listMarkerImage !== null) {
+            $imgMarker = $this->drawListImageMarker($liBox, $localX, $localY);
+            if ($imgMarker !== '') {
+                return $imgMarker;
+            }
+        }
+        $marker = $liBox->listMarker ?? '•';
+        $fontFamily = $liBox->style->get('font-family', 'DejaVu Sans');
+        $fontWeight = $liBox->style->get('font-weight', 'normal');
+        $ttf = $this->fontManager->resolveFont($fontFamily, $fontWeight, 'normal');
+        $fontId = $this->fontManager->markFontUsed($ttf);
+
+        $markerStyle = $liBox->markerStyle;
+        $fs = $markerStyle !== null ? $markerStyle->getFontSizePt() : $liBox->fontSizePt;
+        $color = CssColor::parse(($markerStyle ?? $liBox->style)->get('color', '#111827')) ?? [0.067, 0.094, 0.153, 1.0];
+
+        $markerW = $this->fontManager->measureText($marker, $fontFamily, $fontWeight, 'normal', $fs);
+        $markerX = $localX - $markerW - 5.0;
+        if (strtolower(trim($liBox->style->get('direction', 'ltr'))) === 'rtl') {
+            // RTL list items keep the marker on the right side
+            $markerX = $localX + $liBox->width + 5.0;
+        }
+
+        if (!empty($liBox->lines)) {
+            $firstLine = $liBox->lines[0];
+            $baselineDocY = ($firstLine->y - $liBox->y + $localY) + $firstLine->baselineOffset;
+        } else {
+            $baselineDocY = $localY + $liBox->paddingTop + ($fs * 0.85);
+        }
+
+        $baselinePdfY = $this->pageHeight - $baselineDocY;
+        $hexGids = $this->fontManager->encodeTextToHexGids($ttf, $marker);
+
+        return sprintf(
+            "BT /%s %.2F Tf %s %.2F %.2F Td <%s> Tj ET\n",
+            $fontId,
+            $fs,
+            ColorOps::fillOp($color),
+            $markerX,
+            $baselinePdfY,
+            $hexGids
+        );
+    }
+
+    /**
+     * Draws a list-style-image marker left of the list item's first line (outside position).
+     */
+    private function drawListImageMarker(LayoutBox $liBox, float $localX, float $localY): string
+    {
+        $img = $this->imageLoader->load((string) $liBox->listMarkerImage);
+        if ($img === null) {
+            return '';
+        }
+        $fs = $liBox->fontSizePt;
+        $natW = $img['width'] * CssUnit::getPxToPt();
+        $natH = $img['height'] * CssUnit::getPxToPt();
+        $scale = min(1.0, ($fs * 1.2) / max(0.01, $natH));
+        $w = $natW * $scale;
+        $h = $natH * $scale;
+        if (!empty($liBox->lines)) {
+            $line = $liBox->lines[0];
+            $midDocY = ($line->y - $liBox->y + $localY) + $line->baselineOffset - $fs * 0.3;
+        } else {
+            $midDocY = $localY + $liBox->paddingTop + $fs * 0.55;
+        }
+        $x = $localX - $w - 5.0;
+        if (strtolower(trim($liBox->style->get('direction', 'ltr'))) === 'rtl') {
+            $x = $localX + $liBox->width + 5.0;
+        }
+        return $this->placeImage($img['id'], $x, $midDocY - $h / 2.0, $w, $h, $x, $midDocY - $h / 2.0, $w, $h, [0.0, 0.0, 0.0, 0.0], false);
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii [tl, tr, br, bl]
+     * @param array{0: float, 1: float, 2: float, 3: float} $color [r, g, b, a]
+     */
+    private function drawFilledRect(float $x, float $y, float $w, float $h, array $radii, array $color): string
+    {
+        $out = "q\n";
+        if ($color[3] < 0.999) {
+            $gsId = $this->pdf->registerAlphaState($color[3]);
+            $out .= "/{$gsId} gs\n";
+        }
+        $out .= ColorOps::fillOp($color) . "\n";
+        $out .= $this->buildRoundedRectPath($x, $y, $w, $h, $radii);
+        $out .= "f\nQ\n";
+        return $out;
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     * @param array{angle: float, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>} $gradient
+     */
+    private function drawLinearGradient(float $x, float $y, float $w, float $h, array $radii, array $gradient): string
+    {
+        $pdfBottom = $this->pageHeight - ($y + $h);
+        $pdfTop = $this->pageHeight - $y;
+        $cx = $x + $w / 2.0;
+        $cy = ($pdfBottom + $pdfTop) / 2.0;
+
+        // Convert CSS angle (0deg = to top, 90deg = to right, 180deg = to bottom) into math radians in PDF space
+        $rad = deg2rad(90.0 - $gradient['angle']);
+        $dx = cos($rad);
+        $dy = sin($rad);
+
+        $halfLen = (abs($w * $dx) + abs($h * $dy)) / 2.0;
+        $x0 = $cx - $dx * $halfLen;
+        $y0 = $cy - $dy * $halfLen;
+        $x1 = $cx + $dx * $halfLen;
+        $y1 = $cy + $dy * $halfLen;
+
+        $shId = $this->pdf->registerAxialShading([$x0, $y0, $x1, $y1], $gradient['stops']);
+
+        $out = "q\n";
+        $out .= $this->buildRoundedRectPath($x, $y, $w, $h, $radii);
+        $out .= "W n\n";
+        $out .= "/{$shId} sh\n";
+        $out .= "Q\n";
+        return $out;
+    }
+
+    /**
+     * Renders a soft CSS box-shadow behind a box.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function drawBoxShadow(
+        string $shadowCss,
+        float $x,
+        float $y,
+        float $w,
+        float $h,
+        array $radii,
+        float $fontSizePt
+    ): string {
+        $layers = $this->splitTopLevelCommas($shadowCss);
+        $out = '';
+        // The first shadow is painted on top, so paint in reverse order
+        foreach (array_reverse($layers) as $layer) {
+            $out .= $this->drawSingleBoxShadow($layer, $x, $y, $w, $h, $radii, $fontSizePt);
+        }
+        if ($out === '') {
+            return '';
+        }
+        // Outer shadows are only visible outside the border box (even-odd clip: page minus box)
+        return "q
+" . sprintf("0 0 %.2F %.2F re
+", $this->pageWidth, $this->pageHeight)
+            . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W* n
+" . $out . "Q
+";
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function drawSingleBoxShadow(
+        string $shadowCss,
+        float $x,
+        float $y,
+        float $w,
+        float $h,
+        array $radii,
+        float $fontSizePt
+    ): string {
+        if (str_contains(strtolower($shadowCss), 'inset')) {
+            return '';
+        }
+
+        // Extract color (rgba/rgb/hex) from shadow string
+        $shadowColor = [0.0, 0.0, 0.0, 0.10];
+        $cleaned = $shadowCss;
+        if (preg_match('/(rgba?\([^)]+\)|hsla?\([^)]+\)|#[0-9a-fA-F]{3,8})/i', $shadowCss, $cm)) {
+            $parsedColor = CssColor::parse($cm[1]);
+            if ($parsedColor !== null) {
+                $shadowColor = $parsedColor;
+            }
+            $cleaned = str_replace($cm[1], '', $shadowCss);
+        }
+
+        $lengths = preg_split('/\s+/', trim($cleaned), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        if (count($lengths) < 2) {
+            return '';
+        }
+
+        $offsetX = CssUnit::toPt($lengths[0], 0.0, $fontSizePt);
+        $offsetY = CssUnit::toPt($lengths[1], 0.0, $fontSizePt);
+        $blur = isset($lengths[2]) ? max(0.0, CssUnit::toPt($lengths[2], 0.0, $fontSizePt)) : 0.0;
+        $spread = isset($lengths[3]) ? CssUnit::toPt($lengths[3], 0.0, $fontSizePt) : 0.0;
+
+        $steps = $blur > 1.0 ? min(5, max(2, (int) ceil($blur / 2.5))) : 1;
+        $baseAlpha = $shadowColor[3] / $steps;
+        if ($baseAlpha <= 0.004) {
+            return '';
+        }
+
+        $out = '';
+        for ($s = $steps; $s >= 1; $s--) {
+            $expand = $spread + ($blur * ($s / $steps) * 0.65);
+            $sx = $x + $offsetX - $expand;
+            $sy = $y + $offsetY - $expand;
+            $sw = $w + 2.0 * $expand;
+            $sh = $h + 2.0 * $expand;
+            if ($sw <= 0.1 || $sh <= 0.1) {
+                continue;
+            }
+            $sRadii = [
+                max(0.0, $radii[0] + $expand * 0.5),
+                max(0.0, $radii[1] + $expand * 0.5),
+                max(0.0, $radii[2] + $expand * 0.5),
+                max(0.0, $radii[3] + $expand * 0.5),
+            ];
+            $out .= $this->drawFilledRect($sx, $sy, $sw, $sh, $sRadii, [$shadowColor[0], $shadowColor[1], $shadowColor[2], $baseAlpha]);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Draws an image inside ($x, $y, $w, $h) with rounded corner clipping and object-fit support.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function drawImageInRect(
+        string $src,
+        float $x,
+        float $y,
+        float $w,
+        float $h,
+        array $radii,
+        string $objectFit = 'fill',
+        string $objectPosition = '50% 50%',
+        string $filterCss = 'none',
+        bool $pixelated = false
+    ): string {
+        if ($w <= 0.1 || $h <= 0.1) {
+            return '';
+        }
+
+        $imgData = $this->imageLoader->loadVariant($src, $filterCss, $pixelated);
+        if ($imgData === null) {
+            return '';
+        }
+
+        if ($objectFit === 'none' || $objectFit === 'scale-down') {
+            $natW = $imgData['width'] * CssUnit::getPxToPt();
+            $natH = $imgData['height'] * CssUnit::getPxToPt();
+            if ($objectFit === 'scale-down' && ($natW > $w || $natH > $h)) {
+                $objectFit = 'contain';
+            } else {
+                [$px, $py] = $this->resolvePosition($objectPosition, $w - $natW, $h - $natH);
+                return $this->placeImage($imgData['id'], $x, $y, $w, $h, $x + $px, $y + $py, $natW, $natH, $radii, true);
+            }
+        }
+
+        $drawX = $x;
+        $drawY = $y;
+        $drawW = $w;
+        $drawH = $h;
+
+        $imgRatio = ($imgData['height'] > 0) ? ($imgData['width'] / $imgData['height']) : 1.0;
+        $boxRatio = $w / $h;
+
+        if ($objectFit === 'contain') {
+            if ($imgRatio > $boxRatio) {
+                $drawW = $w;
+                $drawH = $w / $imgRatio;
+                $drawY = $y + ($h - $drawH) / 2.0;
+            } else {
+                $drawH = $h;
+                $drawW = $h * $imgRatio;
+                $drawX = $x + ($w - $drawW) / 2.0;
+            }
+        } elseif ($objectFit === 'cover') {
+            if ($imgRatio > $boxRatio) {
+                $drawH = $h;
+                $drawW = $h * $imgRatio;
+                $drawX = $x - ($drawW - $w) / 2.0;
+            } else {
+                $drawW = $w;
+                $drawH = $w / $imgRatio;
+                $drawY = $y - ($drawH - $h) / 2.0;
+            }
+        }
+
+        if ($objectFit === 'contain' || $objectFit === 'cover') {
+            [$px, $py] = $this->resolvePosition($objectPosition, $w - $drawW, $h - $drawH);
+            $drawX = $x + $px;
+            $drawY = $y + $py;
+        }
+
+        $hasRadius = ($radii[0] + $radii[1] + $radii[2] + $radii[3]) > 0.2;
+        return $this->placeImage($imgData['id'], $x, $y, $w, $h, $drawX, $drawY, $drawW, $drawH, $radii, $hasRadius || $objectFit === 'cover');
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function placeImage(string $imgId, float $clipX, float $clipY, float $clipW, float $clipH, float $drawX, float $drawY, float $drawW, float $drawH, array $radii, bool $clip): string
+    {
+        $pdfY = $this->pageHeight - ($drawY + $drawH);
+        $out = "q\n";
+        if ($clip) {
+            $out .= $this->buildRoundedRectPath($clipX, $clipY, $clipW, $clipH, $radii) . "W n\n";
+        }
+        $out .= sprintf("%.2F 0 0 %.2F %.2F %.2F cm /%s Do\nQ\n", $drawW, $drawH, $drawX, $pdfY, $imgId);
+        return $out;
+    }
+
+    /**
+     * Resolves a CSS <position> ("left top", "50% 20%", "right 10pt bottom") into offsets inside the free space.
+     *
+     * @return array{0: float, 1: float}
+     */
+    private function resolvePosition(string $css, float $freeW, float $freeH): array
+    {
+        $tokens = preg_split('/\s+/', strtolower(trim($css)), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $x = null;
+        $y = null;
+        $resolve = static fn(string $t, float $free): float => match ($t) {
+            'left', 'top' => 0.0,
+            'right', 'bottom' => $free,
+            'center' => $free / 2.0,
+            default => CssUnit::toPt($t, $free),
+        };
+        if (count($tokens) === 1) {
+            $t = $tokens[0];
+            if ($t === 'top' || $t === 'bottom') {
+                return [$freeW / 2.0, $resolve($t, $freeH)];
+            }
+            return [$resolve($t, $freeW), $freeH / 2.0];
+        }
+        foreach ($tokens as $t) {
+            if ($t === 'top' || $t === 'bottom') {
+                $y = $resolve($t, $freeH);
+            } elseif ($t === 'left' || $t === 'right') {
+                $x = $resolve($t, $freeW);
+            } elseif ($x === null) {
+                $x = $resolve($t, $freeW);
+            } elseif ($y === null) {
+                $y = $resolve($t, $freeH);
+            }
+        }
+        return [$x ?? $freeW / 2.0, $y ?? $freeH / 2.0];
+    }
+
+    /**
+     * Draws borders around a box (either uniform rounded border or per-side borders).
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function drawBorders(LayoutBox $box, float $x, float $y, float $w, float $h, array $radii): string
+    {
+        $bt = $box->borderTop;
+        $br = $box->borderRight;
+        $bb = $box->borderBottom;
+        $bl = $box->borderLeft;
+
+        if ($bt <= 0.01 && $br <= 0.01 && $bb <= 0.01 && $bl <= 0.01) {
+            return '';
+        }
+
+        $borderImage = $this->borderImagePainter->paint($box, $x, $y, $w, $h);
+        if ($borderImage !== null) {
+            return $borderImage;
+        }
+
+        $complex = $this->borderPainter->paintIfComplex($box, $x, $y, $w, $h, $radii);
+        if ($complex !== null) {
+            return $complex;
+        }
+
+        $hasRadius = ($radii[0] + $radii[1] + $radii[2] + $radii[3]) > 0.2;
+        $uniformWidth = abs($bt - $br) < 0.05 && abs($bt - $bb) < 0.05 && abs($bt - $bl) < 0.05 && $bt > 0.05;
+
+        if ($uniformWidth && $hasRadius) {
+            $color = CssColor::parse($box->style->get('border-top-color', '#000000'));
+            $style = strtolower($box->style->get('border-top-style', 'solid'));
+            if ($color !== null) {
+                $inset = $bt / 2.0;
+                $adjRadii = [
+                    max(0.0, $radii[0] - $inset),
+                    max(0.0, $radii[1] - $inset),
+                    max(0.0, $radii[2] - $inset),
+                    max(0.0, $radii[3] - $inset),
+                ];
+                return $this->drawStrokedRoundedRect($x + $inset, $y + $inset, $w - $bt, $h - $bt, $adjRadii, $bt, $color, $style);
+            }
+        }
+
+        $out = '';
+        $pdfTop = $this->pageHeight - $y;
+        $pdfBottom = $this->pageHeight - ($y + $h);
+
+        // Solid borders: paint exact filled trapezoid-free bands so corners never overlap (no double alpha)
+        $sides = [
+            'top' => [$bt, $x, $y, $w, $bt],
+            'bottom' => [$bb, $x, $y + $h - $bb, $w, $bb],
+            'left' => [$bl, $x, $y + $bt, $bl, max(0.0, $h - $bt - $bb)],
+            'right' => [$br, $x + $w - $br, $y + $bt, $br, max(0.0, $h - $bt - $bb)],
+        ];
+        $allSolid = true;
+        foreach ($sides as $side => $info) {
+            if ($info[0] > 0.05 && !in_array(strtolower($box->style->get("border-{$side}-style", 'solid')), ['solid', 'inset', 'outset', 'groove', 'ridge'], true)) {
+                $allSolid = false;
+            }
+        }
+        if ($allSolid && !$hasRadius) {
+            foreach ($sides as $side => [$bw, $rx, $ry, $rw, $rh]) {
+                if ($bw <= 0.05 || $rw <= 0.0 || $rh <= 0.0) {
+                    continue;
+                }
+                $c = CssColor::parse($box->style->get("border-{$side}-color", '#000000'));
+                if ($c !== null) {
+                    $out .= $this->drawFilledRect($rx, $ry, $rw, $rh, [0.0, 0.0, 0.0, 0.0], $c);
+                }
+            }
+            return $out;
+        }
+
+        // Top border
+        if ($bt > 0.05) {
+            $c = CssColor::parse($box->style->get('border-top-color', '#000000'));
+            $st = strtolower($box->style->get('border-top-style', 'solid'));
+            if ($c !== null) {
+                $ly = $pdfTop - ($bt / 2.0);
+                $out .= $this->strokeLineSegment($x, $ly, $x + $w, $ly, $bt, $c, $st);
+            }
+        }
+        // Bottom border
+        if ($bb > 0.05) {
+            $c = CssColor::parse($box->style->get('border-bottom-color', '#000000'));
+            $st = strtolower($box->style->get('border-bottom-style', 'solid'));
+            if ($c !== null) {
+                $ly = $pdfBottom + ($bb / 2.0);
+                $out .= $this->strokeLineSegment($x, $ly, $x + $w, $ly, $bb, $c, $st);
+            }
+        }
+        // Left border
+        if ($bl > 0.05) {
+            $c = CssColor::parse($box->style->get('border-left-color', '#000000'));
+            $st = strtolower($box->style->get('border-left-style', 'solid'));
+            if ($c !== null) {
+                $lx = $x + ($bl / 2.0);
+                $out .= $this->strokeLineSegment($lx, $pdfTop, $lx, $pdfBottom, $bl, $c, $st);
+            }
+        }
+        // Right border
+        if ($br > 0.05) {
+            $c = CssColor::parse($box->style->get('border-right-color', '#000000'));
+            $st = strtolower($box->style->get('border-right-style', 'solid'));
+            if ($c !== null) {
+                $lx = $x + $w - ($br / 2.0);
+                $out .= $this->strokeLineSegment($lx, $pdfTop, $lx, $pdfBottom, $br, $c, $st);
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     * @param array{0: float, 1: float, 2: float, 3: float} $color
+     */
+    private function drawStrokedRoundedRect(
+        float $x,
+        float $y,
+        float $w,
+        float $h,
+        array $radii,
+        float $lineWidth,
+        array $color,
+        string $borderStyle
+    ): string {
+        $out = "q\n";
+        if ($color[3] < 0.999) {
+            $gsId = $this->pdf->registerAlphaState($color[3]);
+            $out .= "/{$gsId} gs\n";
+        }
+        $out .= $this->buildDashPattern($borderStyle, $lineWidth);
+        $out .= sprintf("%.2F w %s\n", $lineWidth, ColorOps::strokeOp($color));
+        $out .= $this->buildRoundedRectPath($x, $y, $w, $h, $radii);
+        $out .= "S\nQ\n";
+        return $out;
+    }
+
+    /**
+     * @param array{0: float, 1: float, 2: float, 3: float} $color
+     */
+    private function strokeLineSegment(
+        float $x1,
+        float $y1,
+        float $x2,
+        float $y2,
+        float $lineWidth,
+        array $color,
+        string $borderStyle
+    ): string {
+        $out = "q\n";
+        if ($color[3] < 0.999) {
+            $gsId = $this->pdf->registerAlphaState($color[3]);
+            $out .= "/{$gsId} gs\n";
+        }
+        $out .= $this->buildDashPattern($borderStyle, $lineWidth);
+        $out .= sprintf(
+            "%.2F w %s %.2F %.2F m %.2F %.2F l S\nQ\n",
+            $lineWidth,
+            ColorOps::strokeOp($color),
+            $x1,
+            $y1,
+            $x2,
+            $y2
+        );
+        return $out;
+    }
+
+    /**
+     * Draws the `column-rule` between adjacent columns of the same page chunk.
+     */
+    private function drawColumnRules(LayoutBox $box, float $yShift, float $visTop, float $visBottom): string
+    {
+        $style = strtolower($box->style->get('column-rule-style', 'none'));
+        if ($style === 'none' || $style === 'hidden') {
+            return '';
+        }
+        $w = CssUnit::toPt($box->style->get('column-rule-width', 'medium'), 0.0, $box->fontSizePt, $box->fontSizePt);
+        $colorCss = $box->style->get('column-rule-color', 'currentcolor');
+        if (strtolower($colorCss) === 'currentcolor') {
+            $colorCss = $box->style->get('color', '#000000');
+        }
+        $color = CssColor::parse($colorCss);
+        if ($w <= 0.01 || $color === null) {
+            return '';
+        }
+        $out = '';
+        $rects = $box->columnRects;
+        for ($i = 0; $i + 1 < count($rects); $i++) {
+            $a = $rects[$i];
+            $b = $rects[$i + 1];
+            if ($a['chunk'] !== $b['chunk'] || $a['h'] < 0.5) {
+                continue;
+            }
+            if ($a['y'] + $a['h'] < $visTop - 0.5 || $a['y'] > $visBottom + 0.5) {
+                continue;
+            }
+            $x = ($a['x'] + $a['w'] + $b['x']) / 2.0;
+            $out .= $this->strokeLineSegment(
+                $x,
+                $this->pageHeight - ($a['y'] - $yShift),
+                $x,
+                $this->pageHeight - ($a['y'] + $a['h'] - $yShift),
+                $w,
+                $color,
+                $style
+            );
+        }
+        return $out;
+    }
+
+    private function buildDashPattern(string $borderStyle, float $lineWidth): string
+    {
+        if ($borderStyle === 'dotted') {
+            // Round dots: zero-length dashes with round caps
+            return sprintf("1 J [0 %.2F] 0 d\n", max(1.0, $lineWidth * 2.0));
+        }
+        if ($borderStyle === 'dashed') {
+            $dash = max(2.0, $lineWidth * 3.0);
+            $gap = max(1.5, $lineWidth * 2.0);
+            return sprintf("[%.2F %.2F] 0 d\n", $dash, $gap);
+        }
+        if ($borderStyle === 'dotted') {
+            $dot = max(1.0, $lineWidth);
+            return sprintf("[%.2F %.2F] 0 d\n", $dot, $dot * 1.5);
+        }
+        return '';
+    }
+
+    /**
+     * Builds a PDF path for a rectangle or rounded rectangle using cubic Bézier curves.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii [tl, tr, br, bl]
+     */
+    private function buildRoundedRectPath(float $x, float $y, float $w, float $h, array $radii): string
+    {
+        [$tl, $tr, $br, $bl] = $radii;
+        $pdfBottom = $this->pageHeight - ($y + $h);
+        $pdfTop = $this->pageHeight - $y;
+
+        if ($tl <= 0.1 && $tr <= 0.1 && $br <= 0.1 && $bl <= 0.1) {
+            return sprintf("%.2F %.2F %.2F %.2F re\n", $x, $pdfBottom, $w, $h);
+        }
+
+        $k = 0.5522847498;
+        $xLeft = $x;
+        $xRight = $x + $w;
+
+        $path = sprintf("%.2F %.2F m\n", $xLeft + $tl, $pdfTop);
+        // Top edge -> top-right corner
+        $path .= sprintf("%.2F %.2F l\n", $xRight - $tr, $pdfTop);
+        if ($tr > 0.1) {
+            $path .= sprintf(
+                "%.2F %.2F %.2F %.2F %.2F %.2F c\n",
+                $xRight - $tr + ($k * $tr),
+                $pdfTop,
+                $xRight,
+                $pdfTop - $tr + ($k * $tr),
+                $xRight,
+                $pdfTop - $tr
+            );
+        }
+        // Right edge -> bottom-right corner
+        $path .= sprintf("%.2F %.2F l\n", $xRight, $pdfBottom + $br);
+        if ($br > 0.1) {
+            $path .= sprintf(
+                "%.2F %.2F %.2F %.2F %.2F %.2F c\n",
+                $xRight,
+                $pdfBottom + $br - ($k * $br),
+                $xRight - $br + ($k * $br),
+                $pdfBottom,
+                $xRight - $br,
+                $pdfBottom
+            );
+        }
+        // Bottom edge -> bottom-left corner
+        $path .= sprintf("%.2F %.2F l\n", $xLeft + $bl, $pdfBottom);
+        if ($bl > 0.1) {
+            $path .= sprintf(
+                "%.2F %.2F %.2F %.2F %.2F %.2F c\n",
+                $xLeft + $bl - ($k * $bl),
+                $pdfBottom,
+                $xLeft,
+                $pdfBottom + $bl - ($k * $bl),
+                $xLeft,
+                $pdfBottom + $bl
+            );
+        }
+        // Left edge -> top-left corner
+        $path .= sprintf("%.2F %.2F l\n", $xLeft, $pdfTop - $tl);
+        if ($tl > 0.1) {
+            $path .= sprintf(
+                "%.2F %.2F %.2F %.2F %.2F %.2F c\n",
+                $xLeft,
+                $pdfTop - $tl + ($k * $tl),
+                $xLeft + $tl - ($k * $tl),
+                $pdfTop,
+                $xLeft + $tl,
+                $pdfTop
+            );
+        }
+        $path .= "h\n";
+
+        return $path;
+    }
+
+    /**
+     * @return array{0: float, 1: float, 2: float, 3: float} [tl, tr, br, bl]
+     */
+    private function resolveBorderRadii(LayoutBox $box, float $w, float $h): array
+    {
+        $maxR = min($w, $h) / 2.0;
+        if ($maxR <= 0.1) {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        $ref = min($w, $h);
+        $fs = $box->fontSizePt;
+
+        $tl = min($maxR, max(0.0, CssUnit::toPt($box->style->get('border-top-left-radius', '0'), $ref, $fs)));
+        $tr = min($maxR, max(0.0, CssUnit::toPt($box->style->get('border-top-right-radius', '0'), $ref, $fs)));
+        $br = min($maxR, max(0.0, CssUnit::toPt($box->style->get('border-bottom-right-radius', '0'), $ref, $fs)));
+        $bl = min($maxR, max(0.0, CssUnit::toPt($box->style->get('border-bottom-left-radius', '0'), $ref, $fs)));
+
+        return [$tl, $tr, $br, $bl];
+    }
+
+    /**
+     * Builds a PDF `cm` command for a CSS transform list (translate/X/Y, scale/X/Y, rotate, skew/X/Y, matrix),
+     * applied left-to-right around the transform-origin (default: box center).
+     */
+    private function buildTransformMatrixCommand(string $transformCss, float $x, float $y, float $w, float $h, string $origin = '50% 50%'): string
+    {
+        $m = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        if (!preg_match_all('/([a-zA-Z0-9]+)\(([^)]*)\)/', $transformCss, $fns, PREG_SET_ORDER)) {
+            return '';
+        }
+
+        foreach ($fns as $fn) {
+            $name = strtolower($fn[1]);
+            $args = array_values(array_filter(array_map('trim', preg_split('/[\s,]+/', trim($fn[2])) ?: []), static fn(string $a): bool => $a !== ''));
+            $f = null;
+            switch ($name) {
+                case 'translate':
+                    $f = [1.0, 0.0, 0.0, 1.0, CssUnit::toPt($args[0] ?? '0', $w), CssUnit::toPt($args[1] ?? '0', $h)];
+                    break;
+                case 'translatex':
+                    $f = [1.0, 0.0, 0.0, 1.0, CssUnit::toPt($args[0] ?? '0', $w), 0.0];
+                    break;
+                case 'translatey':
+                    $f = [1.0, 0.0, 0.0, 1.0, 0.0, CssUnit::toPt($args[0] ?? '0', $h)];
+                    break;
+                case 'scale':
+                    $sx = (float) ($args[0] ?? 1);
+                    $sy = isset($args[1]) ? (float) $args[1] : $sx;
+                    $f = [$sx, 0.0, 0.0, $sy, 0.0, 0.0];
+                    break;
+                case 'scalex':
+                    $f = [(float) ($args[0] ?? 1), 0.0, 0.0, 1.0, 0.0, 0.0];
+                    break;
+                case 'scaley':
+                    $f = [1.0, 0.0, 0.0, (float) ($args[0] ?? 1), 0.0, 0.0];
+                    break;
+                case 'rotate':
+                case 'rotatez':
+                    $a = $this->parseAngle($args[0] ?? '0');
+                    $f = [cos($a), sin($a), -sin($a), cos($a), 0.0, 0.0];
+                    break;
+                case 'skew':
+                    $f = [1.0, tan($this->parseAngle($args[1] ?? '0')), tan($this->parseAngle($args[0] ?? '0')), 1.0, 0.0, 0.0];
+                    break;
+                case 'skewx':
+                    $f = [1.0, 0.0, tan($this->parseAngle($args[0] ?? '0')), 1.0, 0.0, 0.0];
+                    break;
+                case 'skewy':
+                    $f = [1.0, tan($this->parseAngle($args[0] ?? '0')), 0.0, 1.0, 0.0, 0.0];
+                    break;
+                case 'matrix':
+                    if (count($args) >= 6) {
+                        $px = CssUnit::getPxToPt();
+                        $f = [(float) $args[0], (float) $args[1], (float) $args[2], (float) $args[3], (float) $args[4] * $px, (float) $args[5] * $px];
+                    }
+                    break;
+            }
+            if ($f !== null) {
+                $m = $this->multiplyMatrix($m, $f);
+            }
+        }
+
+        // Transform around the origin (in document space, y pointing down)
+        [$ox, $oy] = $this->resolvePosition($origin, $w, $h);
+        $ox += $x;
+        $oy += $y;
+        $m = $this->multiplyMatrix($this->multiplyMatrix([1.0, 0.0, 0.0, 1.0, $ox, $oy], $m), [1.0, 0.0, 0.0, 1.0, -$ox, -$oy]);
+
+        // Convert from top-left document space to PDF bottom-left space: F * M * F with F(x, y) = (x, H - y)
+        [$a, $b, $c, $d, $e, $f] = $m;
+        $hp = $this->pageHeight;
+        return sprintf("%.5F %.5F %.5F %.5F %.3F %.3F cm\n", $a, -$b, -$c, $d, $c * $hp + $e, $hp - $d * $hp - $f);
+    }
+
+    private function parseAngle(string $value): float
+    {
+        $v = strtolower(trim($value));
+        $num = (float) $v;
+        return match (true) {
+            str_ends_with($v, 'grad') => deg2rad($num * 0.9),
+            str_ends_with($v, 'rad') => $num,
+            str_ends_with($v, 'turn') => $num * 2.0 * M_PI,
+            default => deg2rad($num),
+        };
+    }
+
+    /**
+     * Multiplies two affine matrices [a b c d e f] (result applies $n first, then $m).
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float, 4: float, 5: float} $m
+     * @param array{0: float, 1: float, 2: float, 3: float, 4: float, 5: float} $n
+     * @return array{0: float, 1: float, 2: float, 3: float, 4: float, 5: float}
+     */
+    private function multiplyMatrix(array $m, array $n): array
+    {
+        return [
+            $m[0] * $n[0] + $m[2] * $n[1],
+            $m[1] * $n[0] + $m[3] * $n[1],
+            $m[0] * $n[2] + $m[2] * $n[3],
+            $m[1] * $n[2] + $m[3] * $n[3],
+            $m[0] * $n[4] + $m[2] * $n[5] + $m[4],
+            $m[1] * $n[4] + $m[3] * $n[5] + $m[5],
+        ];
+    }
+}
