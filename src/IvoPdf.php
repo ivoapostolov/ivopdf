@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IvoPdf;
 
+use IvoPdf\Compat\MpdfArgs;
 use IvoPdf\Compose\PdfComposeApi;
 use IvoPdf\Css\ComputedStyle;
 use IvoPdf\Css\CssParser;
@@ -57,6 +58,14 @@ class IvoPdf
     private ?LayoutBox $layoutTree = null;
     private ?string $renderedPdf = null;
     private int $pageCount = 0;
+    /** Bumped by every change other than appended HTML (mPDF PageNo() reuses its layout while only HTML was appended) */
+    private int $stateVersion = 0;
+    /**
+     * @internal mPDF PageNo(): called after the layout ('layout') and after the pagination ('paginate') of renderCore();
+     * returning false stops renderCore() there (a measuring pass, no PDF is built)
+     * @var ?\Closure(string, LayoutBox, ?Paginator, int, PageLayoutPlan): bool
+     */
+    private ?\Closure $layoutProbe = null;
 
     /**
      * @param Options|array<string, mixed> $options
@@ -120,11 +129,12 @@ class IvoPdf
     /**
      * Draws a large diagonal semi-transparent text on every page (e.g. "DRAFT", "COPY").
      */
-    public function setWatermarkText(string $text, float $opacity = 0.08): self
+    public function setWatermarkText(mixed $text, mixed $opacity = 0.08): self
     {
-        $this->options->watermarkText = $text;
-        $this->options->watermarkOpacity = max(0.01, min(1.0, $opacity));
-        $this->renderedPdf = null;
+        $opacity = MpdfArgs::num($opacity, 0.08);
+        $this->options->watermarkText = MpdfArgs::str($text);
+        $this->options->watermarkOpacity = $opacity < 0 ? 0.2 : max(0.01, min(1.0, $opacity)); // mPDF: -1 = default alpha 0.2
+        $this->invalidate();
         return $this;
     }
 
@@ -134,7 +144,7 @@ class IvoPdf
     public function addFallbackFont(string $familyName): self
     {
         $this->fontManager->addFallbackFamily($familyName);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -148,16 +158,24 @@ class IvoPdf
         $this->overrideBasePath = $basePath;
         $effectiveBase = $basePath ?? $this->options->basePath;
         $this->imageLoader = new ImageLoader($effectiveBase, $this->options->isRemoteEnabled, $this->options);
-        $this->renderedPdf = null;
+        $this->mpdfChunkStarts = [];
+        $this->invalidate();
         return $this;
+    }
+
+    /** Marks the rendered PDF (and every cached layout) as out of date. */
+    private function invalidate(): void
+    {
+        $this->renderedPdf = null;
+        $this->stateVersion++;
     }
 
     /**
      * Alias of loadHtml() for mPDF compatibility.
      */
-    public function WriteHTML(string $html, int $mode = 0, bool $init = true, bool $close = true): self
+    public function WriteHTML(mixed $html, mixed $mode = 0, mixed $init = true, mixed $close = true): self
     {
-        return $this->mpdfWriteHtml($html, $mode); // mode 1 = \Mpdf\HTMLParserMode::HEADER_CSS (stylesheet text)
+        return $this->mpdfWriteHtml(MpdfArgs::str($html), MpdfArgs::int($mode)); // mode 1 = \Mpdf\HTMLParserMode::HEADER_CSS (stylesheet text)
     }
 
     /**
@@ -194,17 +212,18 @@ class IvoPdf
     {
         $this->options->paperSize = $size;
         $this->options->orientation = $orientation;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /**
      * Sets page margins in PDF points (pt).
      */
-    public function setMargins(float $top, ?float $right = null, ?float $bottom = null, ?float $left = null): self
+    public function setMargins(mixed $top, mixed $right = null, mixed $bottom = null, mixed $left = null): self
     {
-        $this->options->setMargin($top, $right, $bottom, $left);
-        $this->renderedPdf = null;
+        $opt = static fn(mixed $v): ?float => $v === null ? null : MpdfArgs::num($v);
+        $this->options->setMargin(MpdfArgs::num($top), $opt($right), $opt($bottom), $opt($left));
+        $this->invalidate();
         return $this;
     }
 
@@ -215,7 +234,7 @@ class IvoPdf
     public function setHeaderHtml(?string $html, string $pages = 'all'): self
     {
         $this->setRunningVariant($this->headerHtml, $this->headerVariants, $html, $pages);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -226,7 +245,7 @@ class IvoPdf
     public function setFooterHtml(?string $html, string $pages = 'all'): self
     {
         $this->setRunningVariant($this->footerHtml, $this->footerVariants, $html, $pages);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -239,7 +258,7 @@ class IvoPdf
         $this->tocEnabled = $enable;
         $this->tocTitle = $title;
         $this->tocMaxLevel = max(1, min(6, $maxLevel));
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -254,7 +273,7 @@ class IvoPdf
     {
         $this->fontManager->assertFontFiles($familyName, $variants);
         $this->fontManager->registerFamily($familyName, $variants);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -265,6 +284,7 @@ class IvoPdf
     {
         CssUnit::setDpi($this->options->dpi);
         ColorOps::configure($this->options); // output color space / PDF/X (validates option combinations)
+        ColorOps::startRender();
         $this->fontManager->resetUsedFonts();
         $this->imageLoader->reset();
         $this->options->clearWarnings();
@@ -290,7 +310,7 @@ class IvoPdf
             // @font-face families must exist before styles are computed (ex / ch units use the real font metrics)
             $this->fontFacesRegistered = 0;
             $domBuilder->afterStylesheets = fn() => $this->registerCssFontFaces($cssParser->getFontFaces());
-            $rootBox = $domBuilder->build(TocGenerator::process($this->mpdfTransform($this->compatScan($this->html)), $this->tocEnabled, $this->tocTitle, $this->tocMaxLevel));
+            $rootBox = $domBuilder->build(TocGenerator::process(self::gaugeDefaults($this->mpdfTransform($this->compatScan($this->html))), $this->tocEnabled, $this->tocTitle, $this->tocMaxLevel));
             $this->registerCssFontFaces($cssParser->getFontFaces());
             $firstPageLeft = $domBuilder->getDocumentDirection() === 'rtl';
             $cssParser->getPageRules()->firstPageLeft = $firstPageLeft;
@@ -372,6 +392,9 @@ class IvoPdf
 
             // Layout main document tree inside the effective printable area
             $layoutEngine->layoutDocument($rootBox, $layoutX, $effectiveTopMargin, $printableWidth, true);
+            if ($this->layoutProbe !== null && ($this->layoutProbe)('layout', $rootBox, null, 0, $plan) === false) {
+                return $this;
+            }
 
             $this->footnotePrepare($rootBox); // footnote-policy: calls whose note must move start a page
 
@@ -394,6 +417,9 @@ class IvoPdf
             $refResolver->resolve($rootBox);
             $this->footnoteAfterPaginate($rootBox, $paginator);
             $this->mpdfAfterPaginate($refResolver->getTargets(), $paginator, $totalPages); // mPDF header switching, page numbers, index
+            if ($this->layoutProbe !== null && ($this->layoutProbe)('paginate', $rootBox, $paginator, $totalPages, $plan) === false) {
+                return $this;
+            }
             $strings = $plan->hasMarginBoxes() ? StringSets::collect($rootBox, static fn(float $y): int => $paginator->pageOfY($y)) : null;
 
             // Render pages into PdfDocument
@@ -415,8 +441,13 @@ class IvoPdf
             if ($this->composeMergeOnly()) {
                 $totalPages = 0; // no HTML content: output consists of the appended PDF pages only
             }
+            // mPDF DeletePages() / MovePages(): {PAGENO} / {nbpg} (and the other page numbers) count the output pages
+            $outputOrder = $this->mpdfPageOps !== [] ? $this->mpdfPageOrder($totalPages) : null;
+            $outputIndex = $outputOrder !== null ? array_flip($outputOrder) : [];
+            $outputCount = $outputOrder !== null ? count($outputOrder) : $totalPages;
             for ($p = 0; $p < $totalPages; $p++) {
                 RenderLimits::check();
+                $pageNo = isset($outputIndex[$p]) ? $outputIndex[$p] + 1 : $p + 1; // a deleted page is never output
                 $geo = $plan->box($p, $paginator->getPageName($p));
                 $pageWidth = $geo['w'];
                 $pageHeight = $geo['h'];
@@ -428,12 +459,12 @@ class IvoPdf
                 $hdr = $this->mpdfRunning('header', $p, $this->pickRunning($this->headerHtml, $this->headerVariants, $p));
                 if ($hdr !== null && trim($hdr) !== '') {
                     $headerStartY = $this->mpdfHeaderY($pm['top']);
-                    $headerBox = $this->buildRunningBox($hdr, $p + 1, $totalPages, $layoutEngine, $pm['left'], $headerStartY, $pageContentWidth);
+                    $headerBox = $this->buildRunningBox($hdr, $pageNo, $outputCount, $layoutEngine, $pm['left'], $headerStartY, $pageContentWidth);
                 }
                 $footerBox = null;
                 $ftr = $this->mpdfRunning('footer', $p, $this->pickRunning($this->footerHtml, $this->footerVariants, $p));
                 if ($ftr !== null && trim($ftr) !== '') {
-                    $footerBox = $this->buildRunningBox($ftr, $p + 1, $totalPages, $layoutEngine, $pm['left'], 0.0, $pageContentWidth);
+                    $footerBox = $this->buildRunningBox($ftr, $pageNo, $outputCount, $layoutEngine, $pm['left'], 0.0, $pageContentWidth);
                     $footerY = $this->mpdfFooterY($pageHeight, $geo['eBottom'] - ($geo['fn'] ?? 0.0), $footerBox->height);
                     $footerBox->translate(0.0, $footerY - $footerBox->y);
                 }
@@ -448,10 +479,10 @@ class IvoPdf
                 foreach ($this->mpdfOverlayLayers($layoutEngine, $geo) as $mpdfLayer) {
                     $layers[] = $mpdfLayer; // mPDF image watermark
                 }
-                foreach ($this->compatOverlayLayers($layoutEngine, $geo, $p + 1, $totalPages) as $compatLayer) {
+                foreach ($this->compatOverlayLayers($layoutEngine, $geo, $pageNo, $outputCount) as $compatLayer) {
                     $layers[] = $compatLayer; // dompdf Canvas::page_text() / page_script()
                 }
-                foreach (MarginBoxes::bands($geo['boxes'], $geo, $p + 1, $totalPages, $strings, $this->options->title, $running) as $band) {
+                foreach (MarginBoxes::bands($geo['boxes'], $geo, $pageNo, $outputCount, $strings, $this->options->title, $running) as $band) {
                     $layers[] = $this->layoutHtmlBox($band['html'], $layoutEngine, $band['x'], $band['y'], $band['width'], $running);
                 }
                 $overlayBox = null;
@@ -475,6 +506,9 @@ class IvoPdf
 
             $this->composeApply($pdfDoc, $totalPages); // backgrounds, appended PDF pages, attachments
             $this->renderedPdf = $pdfDoc->compile();
+            foreach (ColorOps::warnings() as $colorWarning) {
+                $this->options->addWarning($colorWarning); // PDF/A: CMYK written as RGB for the sRGB output intent
+            }
             // The decoded images are in the PDF now: only the layout tree (getLayoutTree()) stays after output()
             $this->imageLoader->reset();
         } finally {
@@ -486,6 +520,18 @@ class IvoPdf
         }
 
         return $this;
+    }
+
+    /**
+     * Browser defaults of <progress> / <meter> (Chromium: inline-block, 10em / 5em x 1em, vertical-align -0.2em), put
+     * before the document's own CSS so that it can override them; PdfRenderer draws the bar (FormGauges).
+     */
+    private static function gaugeDefaults(string $html): string
+    {
+        if (stripos($html, '<progress') === false && stripos($html, '<meter') === false) {
+            return $html;
+        }
+        return \IvoPdf\Compat\MpdfTags::injectStyle($html, 'progress,meter{display:inline-block;box-sizing:border-box;height:1em;vertical-align:-0.2em;overflow:hidden}progress{width:10em}meter{width:5em}');
     }
 
     /**
@@ -707,35 +753,74 @@ class IvoPdf
     }
 
     /**
-     * Returns the raw binary PDF content (automatically renders first).
-     * Also accepts the mPDF signature Output($name, $dest) with $dest 'S' | 'F' | 'D' | 'I'.
+     * Returns the raw binary PDF content (automatically renders first); dompdf's output([...]) too.
      *
-     * @param string|array<string, mixed> $name
+     * Also accepts mPDF's Output($name, $dest) with mPDF's semantics: $dest 'S' returns the bytes, 'F' writes the file
+     * $name, 'D' sends it as a download, 'I' inline; an empty $dest means 'F' when $name is given (and 'I' otherwise);
+     * a boolean $dest means 'D' (true) or 'F' (false). 'F' / 'D' / 'I' return null, like mPDF. A file name without a
+     * destination (`output('/path/doc.pdf')`) writes the file.
+     *
+     * @param string|array<string, mixed>|null $name
+     * @param string|bool|null $dest
+     * @throws \InvalidArgumentException for an unknown destination
+     * @throws RuntimeException when the file cannot be written
      */
-    public function output(string|array $name = '', ?string $dest = null): string
+    public function output(mixed $name = '', mixed $dest = null): ?string
+    {
+        if (is_array($name)) {
+            return $this->pdfBytes(); // dompdf output(['compress' => 0])
+        }
+        $name = MpdfArgs::str($name);
+        if ($dest === null) {
+            if ($name === '') {
+                return $this->pdfBytes(); // IvoPDF / dompdf: output() returns the bytes
+            }
+            $dest = 'F'; // mPDF Output($file)
+        }
+        return $this->mpdfOutput($name, $dest);
+    }
+
+    /**
+     * mPDF Output() destinations (see output()).
+     *
+     * @throws \InvalidArgumentException for an unknown destination
+     */
+    protected function mpdfOutput(string $name, mixed $dest): ?string
+    {
+        if (is_bool($dest)) {
+            $dest = $dest ? 'D' : 'F';
+        }
+        $dest = strtoupper(trim(MpdfArgs::str($dest)));
+        if ($dest === '') {
+            $dest = $name === '' ? 'I' : 'F';
+        }
+        switch ($dest) {
+            case 'S':
+                return $this->pdfBytes();
+            case 'F':
+                if ($name === '') {
+                    throw new RuntimeException('Output(): a file name is required for destination F');
+                }
+                $this->save($name);
+                return null;
+            case 'D':
+                $this->stream($name !== '' ? basename($name) : 'mpdf.pdf', ['Attachment' => true]);
+                return null;
+            case 'I':
+                $this->stream($name !== '' ? basename($name) : 'mpdf.pdf', ['Attachment' => false]);
+                return null;
+            default:
+                throw new \InvalidArgumentException("Incorrect output destination {$dest}");
+        }
+    }
+
+    /** The PDF bytes (renders first when needed). */
+    private function pdfBytes(): string
     {
         if ($this->renderedPdf === null) {
             $this->render();
         }
-        // dompdf: output() / output([...]) returns the bytes.
-        // mPDF: Output($name, $dest) with 'S' string, 'F' file, 'D' download, 'I' inline.
-        if ($dest === null || is_array($name)) {
-            return (string) $this->renderedPdf;
-        }
-        $file = $name !== '' ? $name : 'document.pdf';
-        switch (strtoupper($dest)) {
-            case 'S':
-                return (string) $this->renderedPdf;
-            case 'F':
-                $this->save($file);
-                return '';
-            case 'D':
-                $this->stream(basename($file), ['Attachment' => true]);
-                return '';
-            default:
-                $this->stream(basename($file), ['Attachment' => false]);
-                return '';
-        }
+        return (string) $this->renderedPdf;
     }
 
     /**
@@ -745,7 +830,7 @@ class IvoPdf
      */
     public function save(string $filePath): self
     {
-        $pdfBytes = $this->output();
+        $pdfBytes = $this->pdfBytes();
         $dir = dirname($filePath);
         // Failures are reported through the exception only: PHP's own warnings are swallowed (even by custom error handlers)
         $reason = '';
@@ -774,15 +859,16 @@ class IvoPdf
      */
     public function stream(string $filename = 'document.pdf', array $options = ['Attachment' => false]): void
     {
-        $pdfBytes = $this->output();
+        $pdfBytes = $this->pdfBytes();
         $isAttachment = !empty($options['Attachment']);
         $disposition = $isAttachment ? 'attachment' : 'inline';
         $cleanName = str_replace(['"', "\r", "\n", "\\"], '', $filename);
         $asciiFallback = preg_replace('/[^\x20-\x7E]/', '_', $cleanName) ?: 'document.pdf';
         $utf8Encoded = rawurlencode($cleanName);
 
-        if (!headers_sent()) {
-            // Discard stray buffered output (BOMs, whitespace, notices) that would corrupt the PDF
+        if (!headers_sent() && PHP_SAPI !== 'cli') {
+            // Discard stray buffered output (BOMs, whitespace, notices) that would corrupt the PDF (on the command line
+            // there is no HTTP response: the caller's own output buffers are left alone)
             while (ob_get_level() > 0) {
                 if (!@ob_end_clean()) {
                     break;
@@ -803,21 +889,23 @@ class IvoPdf
     // ------------------------------------------------------------------
 
     /** @param string $side '' (all pages), 'O' (odd) or 'E' (even) like mPDF */
-    public function SetHTMLHeader(string $html, string $side = ''): self
+    public function SetHTMLHeader(mixed $html = '', mixed $side = '', mixed $write = false): self
     {
-        return $this->setHeaderHtml($this->convertMpdfPlaceholders($html), $side === '' ? 'all' : $side);
+        $side = MpdfArgs::str($side);
+        return $this->setHeaderHtml($this->convertMpdfPlaceholders(MpdfArgs::str($html)), $side === '' ? 'all' : $side);
     }
 
     /** @param string $side '' (all pages), 'O' (odd) or 'E' (even) like mPDF */
-    public function SetHTMLFooter(string $html, string $side = ''): self
+    public function SetHTMLFooter(mixed $html = '', mixed $side = ''): self
     {
-        return $this->setFooterHtml($this->convertMpdfPlaceholders($html), $side === '' ? 'all' : $side);
+        $side = MpdfArgs::str($side);
+        return $this->setFooterHtml($this->convertMpdfPlaceholders(MpdfArgs::str($html)), $side === '' ? 'all' : $side);
     }
 
     /** mPDF requires showWatermarkText = true; IvoPDF shows the watermark as soon as it is set. */
-    public function showWatermarkText(bool $show = true): self
+    public function showWatermarkText(mixed $show = true): self
     {
-        if (!$show) {
+        if (!MpdfArgs::bool($show, true)) {
             $this->options->watermarkText = '';
         }
         return $this;
@@ -827,38 +915,38 @@ class IvoPdf
      * mPDF AddPage($orientation, $condition, $resetpagenum, $pagenumstyle, $suppress, $mgl, $mgr, $mgt, $mgb, $mgh, $mgf,
      * $ohname, $ehname, $ofname, $efname, $ohvalue, $ehvalue, $ofvalue, $efvalue, $pagesel, $newformat) — all optional.
      */
-    public function AddPage(string $orientation = '', string $condition = '', mixed ...$more): self
+    public function AddPage(mixed $orientation = '', mixed $condition = '', mixed ...$more): self
     {
-        return $this->mpdfAddPage(array_merge([$orientation, $condition], array_values($more)));
+        return $this->mpdfAddPage(array_merge([MpdfArgs::str($orientation), MpdfArgs::str($condition)], array_values($more)));
     }
 
-    public function SetTitle(string $title): self
+    public function SetTitle(mixed $title): self
     {
-        $this->options->title = $title;
+        $this->options->title = MpdfArgs::str($title);
         return $this;
     }
 
-    public function SetAuthor(string $author): self
+    public function SetAuthor(mixed $author): self
     {
-        $this->options->author = $author;
+        $this->options->author = MpdfArgs::str($author);
         return $this;
     }
 
-    public function SetSubject(string $subject): self
+    public function SetSubject(mixed $subject): self
     {
-        $this->options->subject = $subject;
+        $this->options->subject = MpdfArgs::str($subject);
         return $this;
     }
 
-    public function SetKeywords(string $keywords): self
+    public function SetKeywords(mixed $keywords): self
     {
-        $this->options->keywords = $keywords;
+        $this->options->keywords = MpdfArgs::str($keywords);
         return $this;
     }
 
-    public function SetCreator(string $creator): self
+    public function SetCreator(mixed $creator): self
     {
-        $this->options->creator = $creator;
+        $this->options->creator = MpdfArgs::str($creator);
         return $this;
     }
 
@@ -870,8 +958,12 @@ class IvoPdf
      * @param string|int $method 'aes256' (default), 'aes128', 'rc4' (RC4-128); mPDF key lengths 40/128 => rc4, 256 => aes256
      *                          ('aes128' / 'rc4' convert passwords to PDFDocEncoding and refuse e.g. Cyrillic ones)
      */
-    public function setProtection(array $permissions = ['print', 'copy'], string $userPassword = '', ?string $ownerPassword = null, string|int $method = 'aes256'): self
+    public function setProtection(mixed $permissions = ['print', 'copy'], mixed $userPassword = '', mixed $ownerPassword = null, mixed $method = 'aes256'): self
     {
+        $permissions = is_array($permissions) ? array_map(static fn(mixed $p): string => MpdfArgs::str($p), $permissions) : [];
+        $userPassword = MpdfArgs::str($userPassword);
+        $ownerPassword = $ownerPassword === null ? null : MpdfArgs::str($ownerPassword);
+        $method = is_int($method) || (is_string($method) && ctype_digit(trim($method))) ? (int) $method : (is_float($method) ? (int) $method : MpdfArgs::str($method, 'aes256'));
         if (PdfEncryption::normalizeMethod($method) !== 'aes256') { // validate early
             PdfEncryption::legacyPasswordBytes($userPassword);
             PdfEncryption::legacyPasswordBytes((string) $ownerPassword);
@@ -883,7 +975,7 @@ class IvoPdf
             'owner' => $ownerPassword,
             'method' => $method,
         ];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -894,7 +986,7 @@ class IvoPdf
     public function setPdfA(string|bool $conformance = '2b'): self
     {
         $this->options->pdfa = $conformance === true ? '2b' : ($conformance === false ? '' : $conformance);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -910,7 +1002,7 @@ class IvoPdf
         $this->options->pdfx = PdfX::normalize($level);
         $this->options->pdfxOutputCondition = $outputCondition;
         $this->options->pdfxIccProfile = $iccProfile;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -920,7 +1012,7 @@ class IvoPdf
     public function setColorSpace(string $space): self
     {
         $this->options->colorSpace = strtolower(trim($space)) === 'cmyk' ? 'cmyk' : 'rgb';
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -931,7 +1023,7 @@ class IvoPdf
     {
         $this->options->bleed = max(0.0, $mm);
         $this->options->cropMarks = $cropMarks;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -939,11 +1031,12 @@ class IvoPdf
      * Defines a named spot (Separation) color like mPDF's AddSpotColor(); the CMYK alternate is given in percent (0..100).
      * Use it in CSS as `color: spot(PANTONE 185 C, 100%)` (second argument: tint).
      */
-    public function addSpotColor(string $name, float $c, float $m, float $y, float $k): self
+    public function addSpotColor(mixed $name, mixed $c, mixed $m, mixed $y, mixed $k): self
     {
+        [$name, $c, $m, $y, $k] = [MpdfArgs::str($name), MpdfArgs::num($c), MpdfArgs::num($m), MpdfArgs::num($y), MpdfArgs::num($k)];
         SpotColors::define($name, $c, $m, $y, $k); // validates the name
         $this->options->spotColors[trim($name)] = [$c, $m, $y, $k];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -960,7 +1053,7 @@ class IvoPdf
         if ($level === null) {
             return ['PDF/A output is not enabled: call setPdfA() first'];
         }
-        return \IvoPdf\Pdf\PdfAChecker::check($this->output(), $level['part']);
+        return \IvoPdf\Pdf\PdfAChecker::check($this->pdfBytes(), $level['part']);
     }
 
     /**
@@ -983,7 +1076,7 @@ class IvoPdf
             'rect' => $visibleRect,
             'subFilter' => $subFilter,
         ];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 

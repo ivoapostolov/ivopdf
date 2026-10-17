@@ -550,6 +550,11 @@ final class Dompdf
     {
         $compress ??= $this->renderedCompress ?? true;
         $engine = new IvoPdf($this->settings($compress));
+        // dompdf's generic families are the PDF core fonts: serif = Times, monospace = Courier (metric-compatible
+        // Liberation faces), so templates written for dompdf wrap the same way
+        foreach (['serif' => 'liberation serif', 'times-roman' => 'liberation serif', 'monospace' => 'liberation mono', 'fixed' => 'liberation mono'] as $generic => $face) {
+            $engine->getFontManager()->setAlias($generic, $face);
+        }
         FontMetrics::applyRegistered($engine->getFontManager());
         [$w, $h] = $this->pageSize();
         $engine->setPaper($this->paper ?? $this->options->getDefaultPaperSize(), $this->paper === null ? $this->options->getDefaultPaperOrientation() : $this->orientation);

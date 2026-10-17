@@ -48,8 +48,8 @@ final class Canvas
 
     private float $width;
     private float $height;
-    /** dompdf's page counters (get_page_number() / get_page_count()) */
-    private int $pageCount = 0;
+    /** dompdf's page counters (get_page_number() / get_page_count()): 1 before render(), like dompdf's first page */
+    private int $pageCount = 1;
     private int $current = 1;
     /**
      * The page drawing calls land on: 'p<n>' = page n of the document, 'x<k>' = the k-th page added by new_page()
@@ -1076,13 +1076,15 @@ final class Canvas
         [$family, $weight, $style] = FontMetrics::parse($op['font']);
         [$rgb, $alpha] = self::color($op['color']);
         $alpha *= (float) ($op['opacity'] ?? 1.0);
-        // dompdf puts the baseline one font height (ascent + descent) below y. A line box as tall as the font's content
-        // area has its baseline `ascent` below its top, so the box starts at y + descent.
+        // dompdf puts the baseline one font height below y (FontMetrics::getFontBaseline(): the AFM ascent + descent of
+        // a core font, the font's own otherwise). A line box as tall as the drawing font's content area has its
+        // baseline `ascent` below its top, so the box starts at y + baseline - ascent.
         [$asc, $desc] = $this->metrics->ascentDescent($op['font'], $op['size']);
+        $top = $op['y'] + $this->metrics->getFontBaseline($op['font'], $op['size']) - $asc;
         $css = sprintf(
             'position:absolute;left:%.2Fpt;top:%.2Fpt;margin:0;padding:0;white-space:pre;line-height:%.3Fpt;font-family:\'%s\',sans-serif;font-size:%.2Fpt;font-weight:%s;font-style:%s;color:%s',
             $op['x'],
-            $op['y'] + $desc,
+            $top,
             $asc + $desc,
             str_replace(["'", '"', '\\', ';'], '', $family),
             $op['size'],

@@ -17,6 +17,11 @@ use IvoPdf\Font\FontManager;
 final class FormControls
 {
     public const DEFAULT_INPUT_WIDTH = 132.75;
+    /** Edge: <input type=range> is 129px x 16px (track, fill and thumb drawn by FormAppearance) */
+    public const RANGE_WIDTH = 96.75;
+    public const RANGE_HEIGHT = 12.0;
+    /** Edge (Chromium) widths of the date / time inputs, border box (date measured; the others scaled from its field layout) */
+    public const DATE_WIDTHS = ['date' => 87.0, 'time' => 65.0, 'datetime-local' => 120.0, 'datetime' => 120.0, 'month' => 87.0, 'week' => 87.0];
     public const CHECK_SIZE = 9.75;
     /** Width reserved on the right of a combo box for the drop-down arrow. */
     public const ARROW_WIDTH = 14.0;
@@ -62,6 +67,18 @@ final class FormControls
             $s->set('margin-right', '2.25pt');
             $s->set('margin-top', '2.25pt');
             $s->set('margin-bottom', '2.25pt');
+            return;
+        }
+
+        if ($tag === 'input' && $type === 'range') {
+            // a slider: no box of its own (Chromium: margin 2px)
+            $s->set('border', '0 none transparent');
+            $s->set('padding', '0');
+            $s->set('background-color', 'transparent');
+            $s->set('border-radius', '0');
+            $s->set('margin-left', '1.5pt');
+            $s->set('margin-right', '1.5pt');
+            $s->set('font-family', 'Liberation Sans');
             return;
         }
 
@@ -158,7 +175,10 @@ final class FormControls
             return ['w' => $w, 'h' => $lineH + $vs, 'baseline' => $box->borderTop + $box->paddingTop + $asc];
         }
 
-        $w = $c->size > 0 ? $c->size * 0.55 * $fs + $hs : self::DEFAULT_INPUT_WIDTH;
+        if ($c->inputType === 'range') {
+            return ['w' => self::RANGE_WIDTH + $hs, 'h' => self::RANGE_HEIGHT + $vs, 'baseline' => self::RANGE_HEIGHT + $vs];
+        }
+        $w = $c->size > 0 ? $c->size * 0.55 * $fs + $hs : (self::DATE_WIDTHS[$c->inputType] ?? self::DEFAULT_INPUT_WIDTH);
         $contentH = $lineH;
         return [
             'w' => $w,

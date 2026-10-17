@@ -148,7 +148,7 @@ class InlineLayout
      *
      * @param list<TextRun> $tokens
      */
-    private function restyleFirstLine(array $tokens, LayoutBox $container, int $budget, ?int $breakAt = null): void
+    private function restyleFirstLine(array &$tokens, LayoutBox $container, int $budget, ?int $breakAt = null): void
     {
         $fl = $container->firstLineStyle;
         if ($fl === null || $budget <= 0) {
@@ -157,7 +157,12 @@ class InlineLayout
         $props = $container->firstLineProps;
         $styles = [];
         $offset = 0;
-        foreach ($tokens as $token) {
+        $splits = []; // token index => runs replacing it (synthesized small capitals)
+        $synthesized = [];
+        foreach ($this->smallCapsStyles as [, $small]) {
+            $synthesized[spl_object_id($small)] = true;
+        }
+        foreach ($tokens as $ti => $token) {
             if ($offset >= $budget) {
                 if ($breakAt !== null && !$token->isWhitespace && !$token->isLineBreak) {
                     $token->lineStart = true; // the first line ends right before this word
@@ -175,6 +180,7 @@ class InlineLayout
                 continue;
             }
             $offset += mb_strlen($token->text, 'UTF-8');
+            $oldStyle = $token->style;
             $key = spl_object_id($token->style);
             if (!isset($styles[$key])) {
                 $ns = clone $token->style;
@@ -210,8 +216,70 @@ class InlineLayout
                 ) + $wordSpacing * strlen($token->text);
             } else {
                 $this->shapeRun($token);
+                if (!isset($synthesized[spl_object_id($oldStyle)]) && TextEffects::smallCapsMode($oldStyle) === 0
+                    && ($runs = $this->firstLineSmallCaps($token)) !== null) {
+                    $splits[$ti] = $runs;
+                }
             }
         }
+        if ($splits !== []) {
+            $out = [];
+            foreach ($tokens as $ti => $token) {
+                array_push($out, ...($splits[$ti] ?? [$token]));
+            }
+            $tokens = $out;
+        }
+    }
+
+    /**
+     * `::first-line { font-variant: small-caps }`: splits a restyled run into full-size and synthesized small capital
+     * runs, as collectInlineTokens() does for a normal small-caps style (null: nothing to split, or the font has smcp).
+     *
+     * @return list<TextRun>|null
+     */
+    private function firstLineSmallCaps(TextRun $token): ?array
+    {
+        $style = $token->style;
+        $mode = TextEffects::smallCapsMode($style);
+        if ($mode === 0) {
+            return null;
+        }
+        $ff = $style->get('font-family', 'DejaVu Sans');
+        $fw = $style->get('font-weight', 'normal');
+        $fs = $style->get('font-style', 'normal');
+        if (TextEffects::fontHasSmallCaps($this->fontManager->resolveFont($ff, $fw, $fs), $mode)) {
+            return null; // shapeRun() applied the font's own smcp / c2sc
+        }
+        $subs = TextEffects::smallCapsSegments($token->text, $mode);
+        if (count($subs) === 1 && !$subs[0][1]) {
+            return null;
+        }
+        $runs = [];
+        foreach ($subs as $i => [$text, $isSmall]) {
+            $run = clone $token;
+            $run->text = $text;
+            if ($i > 0) {
+                $run->afterHyphen = false;
+                $run->lineStart = false;
+            }
+            if ($i > 0) {
+                $run->softBreak = null; // a soft hyphen breaks before the first piece only
+            }
+            if ($isSmall) {
+                $run->style = $this->smallCapsStyle($style, $token->fontSizePt);
+                $scFactor = TextEffects::smallCapsFactor($token->fontSizePt);
+                $run->fontSizePt = $token->fontSizePt * $scFactor;
+                $run->ascent = $token->ascent * $scFactor;
+                $run->descent = $token->descent * $scFactor;
+                $run->text = mb_strtoupper($text, 'UTF-8');
+                if ($run->actualText === null && $run->text !== $text) {
+                    $run->actualText = $text; // extracted / searched as the original lowercase text
+                }
+            }
+            $this->shapeRun($run);
+            $runs[] = $run;
+        }
+        return $runs;
     }
 
     /**
@@ -1714,9 +1782,10 @@ class InlineLayout
                     $origText = $subText;
                     if ($isSmall) {
                         $cStyle = $this->smallCapsStyle($style, $fontSizePt);
-                        $cSize = $fontSizePt * TextEffects::SMALL_CAPS_SCALE;
-                        $cAscent = $ascentPt * TextEffects::SMALL_CAPS_SCALE;
-                        $cDescent = $descentPt * TextEffects::SMALL_CAPS_SCALE;
+                        $scFactor = TextEffects::smallCapsFactor($fontSizePt);
+                        $cSize = $fontSizePt * $scFactor;
+                        $cAscent = $ascentPt * $scFactor;
+                        $cDescent = $descentPt * $scFactor;
                         $subText = mb_strtoupper($subText, 'UTF-8');
                     }
                     // Characters missing from the font are rendered with a fallback family (glued to the same word)
@@ -1830,7 +1899,7 @@ class InlineLayout
         $key = spl_object_id($style);
         if (!isset($this->smallCapsStyles[$key]) || $this->smallCapsStyles[$key][0] !== $style) {
             $small = clone $style;
-            $small->set('font-size', round($fontSizePt * TextEffects::SMALL_CAPS_SCALE, 3) . 'pt');
+            $small->set('font-size', round($fontSizePt * TextEffects::smallCapsFactor($fontSizePt), 3) . 'pt');
             $small->set('font-variant', 'normal');
             $small->set('font-variant-caps', 'normal');
             $this->smallCapsStyles[$key] = [$style, $small];

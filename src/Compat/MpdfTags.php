@@ -483,6 +483,14 @@ final class MpdfTags
             $pos = $m[0][1] + strlen($m[0][0]);
             return substr($html, 0, $pos) . '<head>' . $style . '</head>' . substr($html, $pos);
         }
+        if (preg_match('~<body\b~i', $html, $m, PREG_OFFSET_CAPTURE)) {
+            // a document that starts with <body ...>: the style goes into a <head> before it, so the parser does not
+            // open <body> at the <style> and drop the attributes of the real <body> tag (libxml)
+            return substr($html, 0, $m[0][1]) . '<head>' . $style . '</head>' . substr($html, $m[0][1]);
+        }
+        if (preg_match('~^\s*<!doctype[^>]*>~i', $html, $m)) {
+            return $m[0] . $style . substr($html, strlen($m[0]));
+        }
         return $style . $html;
     }
 

@@ -10,7 +10,7 @@ declare(strict_types=1);
  */
 spl_autoload_register(static function (string $class): void {
     static $map = [
-        'Mpdf\Mpdf' => \IvoPdf\IvoPdf::class,
+        'Mpdf\Mpdf' => \IvoPdf\Compat\Mpdf::class, // IvoPdf with mPDF's defaults (font, Output())
         'Mpdf\HTMLParserMode' => \IvoPdf\Compat\HTMLParserMode::class,
         'Mpdf\Output\Destination' => \IvoPdf\Compat\Destination::class,
         'Dompdf\Dompdf' => \IvoPdf\Compat\Dompdf\Dompdf::class,

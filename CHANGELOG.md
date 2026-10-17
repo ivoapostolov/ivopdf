@@ -14,11 +14,12 @@ First public release: a pure-PHP HTML/CSS to PDF engine meant as a drop-in repla
 - Typography: OpenType shaping (GSUB/GPOS, kerning, ligatures, features), language-aware letterforms (`locl`, e.g. Bulgarian forms in Sofia Sans), Arabic/Hebrew bidi, Indic scripts with a registered font, hyphenation patterns, small caps, `::first-letter`/`::first-line`, synthesized bold/oblique.
 - Paged media: page breaks (`always|avoid|left|right|recto|verso`), `orphans`/`widows`, running headers/footers, CSS footnotes (`float: footnote`), bookmarks, tables of contents, internal links to any element.
 - Images: JPEG (CMYK, EXIF), PNG (alpha, palette, 16-bit, interlaced), GIF, WebP, BMP, TIFF, ICO, SVG (gradients, patterns, masks, clip paths, markers, `<use>`, links), WMF/EMF, PDF pages as images.
-- Forms (AcroForm fields), barcodes (QR, Data Matrix, PDF417, Code 128, EAN/UPC, …).
+- Forms (AcroForm fields incl. range, progress and meter drawn like browsers), barcodes (QR, Data Matrix, PDF417, Code 128, EAN/UPC, …).
+- Text extraction: real space glyphs between words also on justified lines, logical order for RTL text, `/ActualText` for synthesized small caps and missing glyphs.
 
 ### PDF output
 - Font subsetting with correct `/W` widths; bundled Inter, Liberation (Arial/Times/Courier metrics), Sofia Sans and DejaVu.
-- PDF/A-1b, 2b, 3b (validated with veraPDF), PDF/X-1a, X-3, X-4, CMYK and spot colours, bleed and crop marks.
+- PDF/A-1b, 2b, 3b (validated with veraPDF; CMYK colours converted to the sRGB intent, or a CMYK output intent via `pdfaIccProfile`), PDF/X-1a, X-3, X-4, CMYK and spot colours, bleed and crop marks.
 - Encryption (AES-256, AES-128, RC4), digital signatures, attachments, Factur-X, page templates and appended PDFs.
 
 ### Compatibility

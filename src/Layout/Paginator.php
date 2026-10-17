@@ -278,7 +278,16 @@ class Paginator
         }
 
         // Recurse into children
+        $isGrid = in_array($box->getDisplay(), ['grid', 'inline-grid'], true);
+        $rowY = null;
         foreach ($box->columnFlow === null ? $box->children : [] as $child) {
+            if ($isGrid && !$child->isPositionedOutOfFlow()) {
+                $y = $this->syncedY($child);
+                if ($rowY === null || abs($y - $rowY) > 0.5) {
+                    $this->keepGridRowTogether($box, $child);
+                    $rowY = $this->syncedY($child);
+                }
+            }
             $this->processBox($child);
         }
         $this->settleHeight($box);
@@ -324,6 +333,81 @@ class Paginator
     }
 
     /**
+     * A grid row that crosses the page bottom goes to the next page as a whole when one of its items cannot keep its
+     * first unbreakable piece (a table row, an atomic box, the first `orphans` lines) on this page, as in Blink:
+     * otherwise the other items would leave a one-line sliver (or an empty table top border) behind.
+     */
+    private function keepGridRowTogether(LayoutBox $grid, LayoutBox $first): void
+    {
+        $y = $first->y;
+        [$pageTop, $pageBottom] = $this->getPageBounds($this->getPageIndexForY($y));
+        if ($y <= $pageTop + 1.0) {
+            return;
+        }
+        $items = [];
+        $started = false;
+        foreach ($grid->children as $c) {
+            $started = $started || $c === $first;
+            if ($started && !$c->isPositionedOutOfFlow() && abs($this->syncedY($c) - $y) <= 0.5) {
+                $items[] = $c;
+            }
+        }
+        $rowBottom = $y;
+        foreach ($items as $item) {
+            $rowBottom = max($rowBottom, $item->y + $item->height);
+        }
+        if ($rowBottom <= $pageBottom + 0.5) {
+            return;
+        }
+        foreach ($items as $item) {
+            if ($this->firstPieceBottom($item) > $pageBottom + 0.5) {
+                $this->pushBoxAndFollowing($first, $pageBottom - $y);
+                return;
+            }
+        }
+    }
+
+    /** Bottom of the first piece of $box that cannot be split across pages (see keepGridRowTogether()). */
+    private function firstPieceBottom(LayoutBox $box, int $depth = 0): float
+    {
+        $edge = $box->y + $box->borderTop + $box->paddingTop;
+        if ($depth > 30 || $box->isTextNode()) {
+            return $edge;
+        }
+        $display = $box->getDisplay();
+        if ($display === 'table' || $display === 'inline-table' || $display === 'table-row-group'
+            || $display === 'table-header-group' || $display === 'table-footer-group') {
+            foreach ($box->children as $c) {
+                $d = $c->getDisplay();
+                if ($c->tagName === 'tr' || $d === 'table-row') {
+                    return $c->height <= $this->printableHeight * 0.92 ? $c->y + $c->height : $c->y;
+                }
+                if (str_starts_with($d, 'table-') && str_ends_with($d, '-group')) {
+                    return $this->firstPieceBottom($c, $depth + 1);
+                }
+            }
+            return $edge;
+        }
+        if ($this->isAtomicBox($box) || $box->formControl !== null) {
+            return $box->height <= $this->printableHeight * 0.92 ? $box->y + $box->height : $edge;
+        }
+        $child = null;
+        foreach ($box->children as $c) {
+            if (!$c->isPositionedOutOfFlow() && !$c->isInlineLevel() && !$c->isTextNode()) {
+                $child = $c;
+                break;
+            }
+        }
+        if ($box->lines !== [] && ($child === null || $box->lines[0]->y <= $child->y + 0.01)) {
+            $o = trim($box->style->get('orphans', '2'));
+            $orphans = ctype_digit($o) ? \IvoPdf\Dom\InputGuards::intAttr($o, 1, 1000, 2) : 2;
+            $line = $box->lines[min(count($box->lines), $orphans) - 1];
+            return $line->y + $line->height;
+        }
+        return $child !== null ? $this->firstPieceBottom($child, $depth + 1) : $edge;
+    }
+
+    /**
      * `orphans` / `widows` (initial value 2, as in browsers): moves a break before line $i of $box up so at least
      * `orphans` lines of the paragraph stay on the page before it and at least `widows` lines follow it; when both
      * cannot hold, the whole paragraph goes to the next page if it starts on this page below its top, otherwise the
@@ -339,8 +423,8 @@ class Paginator
         }
         $o = trim($box->style->get('orphans', '2'));
         $w = trim($box->style->get('widows', '2'));
-        $orphans = ctype_digit($o) ? max(1, min(1000, (int) $o)) : 2;
-        $widows = ctype_digit($w) ? max(1, min(1000, (int) $w)) : 2;
+        $orphans = ctype_digit($o) ? \IvoPdf\Dom\InputGuards::intAttr($o, 1, 1000, 2) : 2; // saturating: no float-string cast
+        $widows = ctype_digit($w) ? \IvoPdf\Dom\InputGuards::intAttr($w, 1, 1000, 2) : 2;
         $k = $i;
         if ($count - $k < $widows && $count - $widows > $first) {
             $tail = 0.0;

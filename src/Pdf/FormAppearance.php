@@ -43,6 +43,10 @@ final class FormAppearance
         $h = $box->height;
         $x = $box->x;
         $pdfBottom = $pageHeight - ($box->y - $yShift + $h);
+        if ($c->inputType === 'range') {
+            // a slider is drawn, as browsers print it; PDF forms have no slider field
+            return FormGauges::slider($box, $x + $box->borderLeft + $box->paddingLeft, $pdfBottom + $box->borderBottom + $box->paddingBottom, $box->getContentWidth(), $box->getContentHeight());
+        }
 
         $widget = new FormWidget($c);
         $widget->page = $pageIndex;

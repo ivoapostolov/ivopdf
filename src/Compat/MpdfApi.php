@@ -35,6 +35,8 @@ trait MpdfApi
 
     /** Whether the document came through WriteHTML() (mPDF defaults) rather than loadHtml() (browser defaults) */
     private bool $mpdfWritten = false;
+    /** CSS of mPDF's default stylesheet that IvoPDF's own defaults lack (set by the `Mpdf\Mpdf` class) */
+    protected string $mpdfDefaultCss = '';
     private string $mpdfZoom = '';
     private string $mpdfLayout = '';
     private string $mpdfJs = '';
@@ -124,7 +126,7 @@ trait MpdfApi
         $this->mpdfState = $state;
 
         // Documents written through the mPDF API get mPDF's default body margin, 0 (browsers and dompdf: 8px)
-        $css = $this->mpdfWritten ? 'body{margin:0}' : '';
+        $css = ($this->mpdfWritten ? 'body{margin:0}' : '') . $this->mpdfDefaultCss;
         $body = $this->mpdfBodyCss;
         if ($this->mpdfRtl) {
             $body['direction'] = 'rtl';
@@ -337,7 +339,7 @@ trait MpdfApi
         if ($name === 'shrink_tables_to_fit' && is_numeric($value)) {
             $this->options->shrinkTablesToFit = (float) $value; // 0 = off, 1.4 = mPDF default
         }
-        $this->renderedPdf = null;
+        $this->invalidate();
     }
 
     // ------------------------------------------------------------------
@@ -354,10 +356,12 @@ trait MpdfApi
         if ($mode === 1) {
             $css = (string) preg_replace('~</?style\b[^>]*>~i', '', $html);
             $this->mpdfHeadCss .= $css . "\n";
+            $this->invalidate();
         } else {
+            $this->mpdfChunkStarts[] = strlen($this->html); // PageNo() lays out only the chunks written since its last call
             $this->html .= $html;
+            $this->renderedPdf = null;
         }
-        $this->renderedPdf = null;
         return $this;
     }
 
@@ -414,14 +418,19 @@ trait MpdfApi
     }
 
     /** `$mpdf->SetHeader('Left|{PAGENO}|Right')` or the array form (['odd' => [...], 'even' => [...], 'line' => 1]). */
-    public function SetHeader(string|array $header = '', string $side = '', bool $write = false): self
+    public function SetHeader(mixed $header = '', mixed $side = '', mixed $write = false): self
     {
+        $header = is_array($header) ? $header : MpdfArgs::str($header);
+        $side = MpdfArgs::str($side);
+        $write = MpdfArgs::bool($write);
         return $this->mpdfSetBar($header, $side, true);
     }
 
     /** `$mpdf->SetFooter('Left|{PAGENO}|Right')`. */
-    public function SetFooter(string|array $footer = '', string $side = ''): self
+    public function SetFooter(mixed $footer = '', mixed $side = ''): self
     {
+        $footer = is_array($footer) ? $footer : MpdfArgs::str($footer);
+        $side = MpdfArgs::str($side);
         return $this->mpdfSetBar($footer, $side, false);
     }
 
@@ -498,128 +507,166 @@ trait MpdfApi
     }
 
     /** mPDF DefHTMLHeaderByName: defines a reusable named header (switch with SetHTMLHeaderByName or `<sethtmlpageheader>`). */
-    public function DefHTMLHeaderByName(string $name, string $html): self
+    public function DefHTMLHeaderByName(mixed $name, mixed $html): self
     {
+        $name = MpdfArgs::str($name);
+        $html = MpdfArgs::str($html);
         $this->mpdfDefHeaders[$name] = $this->convertMpdfPlaceholders($html);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function DefHTMLFooterByName(string $name, string $html): self
+    public function DefHTMLFooterByName(mixed $name, mixed $html): self
     {
+        $name = MpdfArgs::str($name);
+        $html = MpdfArgs::str($html);
         $this->mpdfDefFooters[$name] = $this->convertMpdfPlaceholders($html);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function SetHTMLHeaderByName(string $name, string $side = 'O', bool $write = false): self
+    public function SetHTMLHeaderByName(mixed $name, mixed $side = 'O', mixed $write = false): self
     {
+        $name = MpdfArgs::str($name);
+        $side = MpdfArgs::str($side);
+        $write = MpdfArgs::bool($write);
         return $this->setHeaderHtml($this->mpdfDefHeaders[$name] ?? '', $side === '' ? 'all' : $side);
     }
 
-    public function SetHTMLFooterByName(string $name, string $side = 'O'): self
+    public function SetHTMLFooterByName(mixed $name, mixed $side = 'O'): self
     {
+        $name = MpdfArgs::str($name);
+        $side = MpdfArgs::str($side);
         return $this->setFooterHtml($this->mpdfDefFooters[$name] ?? '', $side === '' ? 'all' : $side);
     }
 
     /** Default CSS for the body element (`SetDefaultBodyCSS('background', "#eee")`), overridden by the document's own CSS. */
-    public function SetDefaultBodyCSS(string $property, string|int|float $value): self
+    public function SetDefaultBodyCSS(mixed $property, mixed $value): self
     {
+        $property = MpdfArgs::str($property);
+        $value = is_int($value) || is_float($value) ? $value : MpdfArgs::str($value);
         $this->mpdfBodyCss[trim($property)] = (string) $value;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** Initial view: zoom 'fullpage' | 'fullwidth' | 'real' | 'default' | percent; layout 'single' | 'continuous' | 'two' | 'default'. */
-    public function SetDisplayMode(string|int|float $zoom = 'default', string $layout = 'continuous'): self
+    public function SetDisplayMode(mixed $zoom = 'default', mixed $layout = 'continuous'): self
     {
+        $zoom = is_int($zoom) || is_float($zoom) ? $zoom : MpdfArgs::str($zoom);
+        $layout = MpdfArgs::str($layout);
         $this->mpdfZoom = (string) $zoom;
         $this->mpdfLayout = $layout;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function SetDirectionality(string $dir = 'ltr'): self
+    public function SetDirectionality(mixed $dir = 'ltr'): self
     {
+        $dir = MpdfArgs::str($dir);
         $this->mpdfRtl = strtolower(trim($dir)) === 'rtl';
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function SetCompression(bool $compress = true): self
+    public function SetCompression(mixed $compress = true): self
     {
+        $compress = MpdfArgs::bool($compress);
         $this->options->compress = $compress;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** Document-level JavaScript (catalog /Names /JavaScript); ignored with PDF/A. */
-    public function SetJS(string $script): self
+    public function SetJS(mixed $script): self
     {
+        $script = MpdfArgs::str($script);
         $this->mpdfJs = $script;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function SetDefaultFont(string $font): self
+    public function SetDefaultFont(mixed $font): self
     {
+        $font = MpdfArgs::str($font);
         $this->options->defaultFont = $font;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function SetDefaultFontSize(float $size): self
+    public function SetDefaultFontSize(mixed $size): self
     {
+        $size = MpdfArgs::num($size);
         $this->options->defaultFontSize = $size;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** Base folder for relative image / stylesheet paths. */
-    public function SetBasePath(string $path): self
+    public function SetBasePath(mixed $path): self
     {
+        $path = MpdfArgs::str($path);
         $this->overrideBasePath = $path;
         $this->imageLoader = new ImageLoader($path, $this->options->isRemoteEnabled, $this->options);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** Image watermark on every page (mPDF `SetWatermarkImage($src, $alpha, $size, $position)`). */
-    public function SetWatermarkImage(string $src, float $alpha = 0.2, string|array $size = 'D', string|array $position = 'P'): self
+    public function SetWatermarkImage(mixed $src, mixed $alpha = 0.2, mixed $size = 'D', mixed $position = 'P'): self
     {
+        $src = MpdfArgs::str($src);
+        $alpha = MpdfArgs::num($alpha, 0.2);
+        $alpha = $alpha < 0 ? 0.2 : $alpha; // mPDF: -1 = the default image watermark alpha (0.2)
+        $size = is_array($size) ? $size : MpdfArgs::str($size);
+        $position = is_array($position) ? $position : MpdfArgs::str($position);
         $fmt = static fn(string|array $v): string => is_array($v) ? implode(',', $v) : $v;
         $this->mpdfWatermarkImage = ['src' => $src, 'alpha' => max(0.01, min(1.0, $alpha)), 'size' => $fmt($size), 'pos' => $fmt($position)];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** mPDF `Bookmark($title, $level)`: an outline entry at the current position (levels start at 0). */
-    public function Bookmark(string $txt, int $level = 0, float $y = -1): self
+    public function Bookmark(mixed $txt, mixed $level = 0, mixed $y = -1): self
     {
+        $txt = MpdfArgs::str($txt);
+        $level = MpdfArgs::int($level);
+        $y = MpdfArgs::num($y);
         return $this->WriteHTML('<bookmark content="' . htmlspecialchars($txt, ENT_QUOTES, 'UTF-8') . '" level="' . max(0, $level) . '" />');
     }
 
     /** mPDF `TOC_Entry($txt, $level)`: a manual table-of-contents entry. */
-    public function TOC_Entry(string $txt, int $level = 0): self
+    public function TOC_Entry(mixed $txt, mixed $level = 0): self
     {
+        $txt = MpdfArgs::str($txt);
+        $level = MpdfArgs::int($level);
         return $this->WriteHTML('<tocentry content="' . htmlspecialchars($txt, ENT_QUOTES, 'UTF-8') . '" level="' . max(0, $level) . '" />');
     }
 
     /** mPDF `IndexEntry($txt)`: an index entry at the current position. */
-    public function IndexEntry(string $txt, string $xref = ''): self
+    public function IndexEntry(mixed $txt, mixed $xref = ''): self
     {
+        $txt = MpdfArgs::str($txt);
+        $xref = MpdfArgs::str($xref);
         return $this->WriteHTML('<indexentry content="' . htmlspecialchars($txt, ENT_QUOTES, 'UTF-8') . '" />');
     }
 
     /** mPDF `InsertIndex($usedivletters, $links, $collation)`: places the index here. */
-    public function InsertIndex(bool $usedivletters = true, bool $links = true, string $collation = '', string $collationGroup = ''): self
+    public function InsertIndex(mixed $usedivletters = true, mixed $links = true, mixed $collation = '', mixed $collationGroup = ''): self
     {
+        $usedivletters = MpdfArgs::bool($usedivletters);
+        $links = MpdfArgs::bool($links);
+        $collation = MpdfArgs::str($collation);
+        $collationGroup = MpdfArgs::str($collationGroup);
         return $this->WriteHTML('<indexinsert usedivletters="' . ($usedivletters ? 'on' : 'off') . '" links="' . ($links ? 'on' : 'off') . '" collation="' . htmlspecialchars($collation, ENT_QUOTES, 'UTF-8') . '" />');
     }
 
     /** mPDF `SetColumns($n, $vAlign, $gap)`: starts (or with 1 ends) a multi-column section. */
-    public function SetColumns(int $cols, string $vAlign = '', float $gap = 5): self
+    public function SetColumns(mixed $cols, mixed $vAlign = '', mixed $gap = 5): self
     {
+        $cols = MpdfArgs::int($cols);
+        $vAlign = MpdfArgs::str($vAlign);
+        $gap = MpdfArgs::num($gap);
         return $this->WriteHTML('<columns column-count="' . max(1, $cols) . '" vAlign="' . htmlspecialchars($vAlign, ENT_QUOTES, 'UTF-8') . '" column-gap="' . $gap . '" />');
     }
 

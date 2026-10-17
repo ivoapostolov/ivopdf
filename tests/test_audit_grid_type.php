@@ -288,7 +288,7 @@ foreach (['DejaVu Sans', 'Inter'] as $fam) {
     }
     $texts = array_map(static fn($r) => $r->text, $runs);
     $caps = array_values(array_filter($runs, static fn($r) => near($r->fontSizePt, 20.0, 0.01)));
-    $small = array_values(array_filter($runs, static fn($r) => near($r->fontSizePt, 14.0, 0.01)));
+    $small = array_values(array_filter($runs, static fn($r) => near($r->fontSizePt, 14.25, 0.01)));
     // the space before a capital is drawn at its size and joins its run (" C"): compare the letters only
     $capText = str_replace(' ', '', implode('', array_map(static fn($r) => $r->text, $caps)));
     $smallText = str_replace(' ', '', implode('', array_map(static fn($r) => $r->text, $small)));
@@ -300,7 +300,7 @@ $small = 0;
 $full = 0;
 foreach (byId($page, 'p')->lines[0]->runs as $r) {
     if (!$r->isWhitespace) {
-        near($r->fontSizePt, 14.0, 0.01) ? $small++ : $full++;
+        near($r->fontSizePt, 14.25, 0.01) ? $small++ : $full++;
     }
 }
 check('font-variant-caps: all-small-caps shrinks capitals too', $small === 2 && $full === 0, "$small small, $full full");

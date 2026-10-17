@@ -92,6 +92,22 @@ class FontManager
             'bold_italic' => $this->fontDir . '/DejaVuSansMono-BoldOblique.ttf',
         ]);
 
+        // mPDF's default faces (body font: DejaVu Serif Condensed 11pt; `dejavusanscondensed` in many mPDF templates)
+        $this->registerFamily('dejavu serif condensed', [
+            'regular' => $this->fontDir . '/DejaVuSerifCondensed.ttf',
+            'bold' => $this->fontDir . '/DejaVuSerifCondensed-Bold.ttf',
+            'italic' => $this->fontDir . '/DejaVuSerifCondensed-Italic.ttf',
+            'bold_italic' => $this->fontDir . '/DejaVuSerifCondensed-BoldItalic.ttf',
+        ]);
+        $this->registerFamily('dejavu sans condensed', [
+            'regular' => $this->fontDir . '/DejaVuSansCondensed.ttf',
+            'bold' => $this->fontDir . '/DejaVuSansCondensed-Bold.ttf',
+            'italic' => $this->fontDir . '/DejaVuSansCondensed-Oblique.ttf',
+            'bold_italic' => $this->fontDir . '/DejaVuSansCondensed-BoldOblique.ttf',
+        ]);
+        $this->aliases['dejavuserifcondensed'] = 'dejavu serif condensed';
+        $this->aliases['dejavusanscondensed'] = 'dejavu sans condensed';
+
         // Common web & CSS generic font aliases mapped to bundled Unicode/Cyrillic TTFs
         $sansAliases = [
             'sans-serif', 'sans', 'system-ui', '-apple-system', 'blinkmacsystemfont',
@@ -206,6 +222,22 @@ class FontManager
         $variants = $this->families[$key] ?? [];
         $variants[$variant] = $filePath;
         $this->registerFamily($key, $variants);
+    }
+
+    /**
+     * Maps a CSS family name (e.g. a generic family) to a registered family, replacing the bundled mapping.
+     */
+    public function setAlias(string $alias, string $familyName): void
+    {
+        $key = strtolower(trim($familyName, " \t\n\r\0\x0B'\""));
+        if (!isset($this->families[$key])) {
+            return;
+        }
+        $this->aliases[strtolower(trim($alias))] = $key;
+        $this->unitMetricsCache = [];
+        $this->lineMetricsCache = [];
+        $this->fallbackCache = [];
+        $this->variantCache = [];
     }
 
     /**

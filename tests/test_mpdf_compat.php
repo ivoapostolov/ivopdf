@@ -393,7 +393,7 @@ check('CSS mode text is not printed as page content', !str_contains($pdf->output
 $pdf = new IvoPdf(['compress' => false]);
 $pdf->SetDefaultBodyCSS('background', '#ff0000')->WriteHTML('<p>x</p>');
 check('SetDefaultBodyCSS', str_contains($pdf->output(), '1.000 0.000 0.000 rg') || str_contains($pdf->output(), '1 0 0 rg'));
-check('class aliases Mpdf\Mpdf / Destination', (new \Mpdf\Mpdf([]))::class === IvoPdf::class && \Mpdf\Output\Destination::STRING_RETURN === 'S');
+check('class aliases Mpdf\Mpdf / Destination', (new \Mpdf\Mpdf([])) instanceof IvoPdf && \Mpdf\Output\Destination::STRING_RETURN === 'S');
 
 // ---------------------------------------------------------------------------
 echo "\n9. Catalog: SetDisplayMode, SetJS, SetCompression\n";

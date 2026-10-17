@@ -33,7 +33,7 @@ final class ImageCmykConverter
         }
         if ($space === 'DeviceCMYK') {
             unset($img['smask']);
-            $opt->addWarning('PDF/X: the alpha channel of a CMYK image was dropped (transparency is not allowed).');
+            $opt->addWarning(self::standard($opt) . ': the alpha channel of a CMYK image was dropped (transparency is not allowed).');
             return $img;
         }
         if ((int) ($img['bitsPerComponent'] ?? 8) !== 8 || ($space !== 'DeviceRGB' && $space !== 'DeviceGray')) {
@@ -55,7 +55,7 @@ final class ImageCmykConverter
         }
         if ($hasMask && $flatten) {
             $res['smask'] = null;
-            $opt->addWarning('PDF/X: an image alpha channel was composited onto white (transparency is not allowed).');
+            $opt->addWarning(self::standard($opt) . ': an image alpha channel was composited onto white (transparency is not allowed).');
         }
         if (count(self::$cache) >= 12) {
             self::$cache = [];
@@ -176,7 +176,7 @@ final class ImageCmykConverter
             $opt->addWarning("Image ({$size}) could not be converted to CMYK because " . self::$failure . '; left as is.');
             return $img;
         }
-        $opt->addWarning("PDF/X: image ({$size}) skipped: it could not be converted to CMYK / flattened because " . self::$failure . '.');
+        $opt->addWarning(self::standard($opt) . ": image ({$size}) skipped: it could not be converted to CMYK / flattened because " . self::$failure . '.');
         $cmyk = ColorOps::isCmykTarget() && ($img['colorSpace'] ?? '') !== 'DeviceGray';
         return array_replace($img, [
             'width' => 1,
@@ -218,6 +218,118 @@ final class ImageCmykConverter
             $line .= $cache[$key];
         }
         return $line;
+    }
+
+    /** Name of the standard that forbids what is being converted, for the warnings. */
+    private static function standard(Options $opt): string
+    {
+        return $opt->pdfx !== '' ? 'PDF/X' : (PdfFinisher::parsePdfa($opt->pdfa) !== null ? 'PDF/A' : 'colorSpace cmyk');
+    }
+
+    /**
+     * PDF/A with the sRGB output intent: a DeviceCMYK image (CMYK JPEG) is decoded and embedded as RGB; when it cannot
+     * be decoded a light gray placeholder takes its place (a warning tells), so the file stays conforming.
+     *
+     * @param array<string, mixed> $img
+     * @return array<string, mixed>
+     */
+    public static function cmykToRgb(array $img, Options $opt): array
+    {
+        if (($img['colorSpace'] ?? '') !== 'DeviceCMYK') {
+            return $img;
+        }
+        ColorOps::noteDowngrade();
+        $key = md5((string) $img['data']) . '|rgb';
+        if (isset(self::$cache[$key])) {
+            return array_replace($img, self::$cache[$key]);
+        }
+        $w = (int) $img['width'];
+        $h = (int) $img['height'];
+        $res = null;
+        $filter = (string) ($img['filter'] ?? '');
+        self::$failure = 'its pixel data could not be decoded';
+        if ($w > 0 && $h > 0 && (int) ($img['bitsPerComponent'] ?? 8) === 8) {
+            if ($filter === 'DCTDecode' && function_exists('imagecreatefromstring')) {
+                $need = $w * $h * 5 + 2 * strlen((string) $img['data']) + 4194304;
+                if (RenderLimits::fits($need)) {
+                    $gd = ImageRowStream::quietly(static fn() => imagecreatefromstring((string) $img['data']));
+                    if ($gd !== false && imagesx($gd) === $w && imagesy($gd) === $h) {
+                        $res = self::gdToRgb($gd, $w, $h); // GD converts CMYK / YCCK JPEGs (Adobe inversion included)
+                    }
+                } else {
+                    self::$failure = 'decoding it needs more memory than is left';
+                }
+            } elseif ($filter === 'FlateDecode') {
+                $parms = isset($img['decodeParms']) ? (string) $img['decodeParms'] : null;
+                $invert = str_starts_with(trim((string) ($img['decode'] ?? '')), '[1 0');
+                $rows = ImageRowStream::hasUnsupportedPredictor($parms) ? null : ImageRowStream::open((string) $img['data'], $w * 4, 4, ImageRowStream::hasPngPredictor($parms));
+                if ($rows !== null) {
+                    $res = self::cmykRowsToRgb($rows, $w, $h, $invert);
+                }
+            }
+        }
+        if ($res === null) {
+            $opt->addWarning(sprintf('PDF/A: a CMYK image (%d x %d px) could not be converted to RGB because %s; a gray box replaces it.', $w, $h, self::$failure));
+            return array_replace($img, [
+                'width' => 1, 'height' => 1, 'colorSpace' => 'DeviceRGB', 'bitsPerComponent' => 8,
+                'data' => (string) gzcompress("\xDD\xDD\xDD"), 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null,
+            ]);
+        }
+        if (count(self::$cache) >= 12) {
+            self::$cache = [];
+        }
+        self::$cache[$key] = $res;
+        return array_replace($img, $res);
+    }
+
+    /** @return ?array<string, mixed> */
+    private static function gdToRgb(\GdImage $gd, int $w, int $h): ?array
+    {
+        $z = deflate_init(ZLIB_ENCODING_DEFLATE, ['level' => 6]);
+        if ($z === false) {
+            return null;
+        }
+        $out = '';
+        for ($y = 0; $y < $h; $y++) {
+            RenderLimits::tick();
+            $row = '';
+            for ($x = 0; $x < $w; $x++) {
+                $c = imagecolorat($gd, $x, $y);
+                $row .= chr(($c >> 16) & 255) . chr(($c >> 8) & 255) . chr($c & 255);
+            }
+            $out .= deflate_add($z, $row, ZLIB_NO_FLUSH);
+        }
+        $out .= deflate_add($z, '', ZLIB_FINISH);
+        return ['data' => $out, 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null, 'colorSpace' => 'DeviceRGB'];
+    }
+
+    /** @return ?array<string, mixed> */
+    private static function cmykRowsToRgb(ImageRowStream $rows, int $w, int $h, bool $invert): ?array
+    {
+        $z = deflate_init(ZLIB_ENCODING_DEFLATE, ['level' => 6]);
+        if ($z === false) {
+            return null;
+        }
+        $out = '';
+        for ($y = 0; $y < $h; $y++) {
+            RenderLimits::tick();
+            $row = $rows->next();
+            if ($row === null) {
+                return null;
+            }
+            $line = '';
+            for ($x = 0; $x < $w; $x++) {
+                $p = substr($row, $x * 4, 4);
+                [$c, $m, $yy, $k] = [ord($p[0]), ord($p[1]), ord($p[2]), ord($p[3])];
+                if ($invert) {
+                    [$c, $m, $yy, $k] = [255 - $c, 255 - $m, 255 - $yy, 255 - $k];
+                }
+                $line .= chr((int) round((255 - $c) * (255 - $k) / 255)) . chr((int) round((255 - $m) * (255 - $k) / 255)) . chr((int) round((255 - $yy) * (255 - $k) / 255));
+            }
+            $out .= deflate_add($z, $line, ZLIB_NO_FLUSH);
+        }
+        $out .= deflate_add($z, '', ZLIB_FINISH);
+        return ['data' => $out, 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null, 'colorSpace' => 'DeviceRGB'];
     }
 
     private static function compositeRowOnWhite(string $row, int $w, int $channels, string $alpha): string

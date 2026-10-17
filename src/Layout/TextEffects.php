@@ -16,6 +16,19 @@ final class TextEffects
     /** Scale of synthesized small capitals relative to the surrounding font size */
     public const SMALL_CAPS_SCALE = 0.7;
 
+    /**
+     * Factor for synthesized small capitals at $fontSizePt: 0.7 of the size, rounded to a whole CSS pixel like
+     * Chrome / Edge (20pt = 26.67px -> 18.67px -> 19px = 14.25pt), so line breaks match the browser.
+     */
+    public static function smallCapsFactor(float $fontSizePt): float
+    {
+        if ($fontSizePt <= 0.0) {
+            return self::SMALL_CAPS_SCALE;
+        }
+        $px = max(1.0, round($fontSizePt / 0.75 * self::SMALL_CAPS_SCALE));
+        return $px * 0.75 / $fontSizePt;
+    }
+
     /** Properties a ::first-line rule may change (CSS Pseudo-Elements 4) */
     public const FIRST_LINE_PROPS = [
         'font-family', 'font-size', 'font-weight', 'font-style', 'font-variant', 'font-variant-caps', 'font-variant-ligatures',

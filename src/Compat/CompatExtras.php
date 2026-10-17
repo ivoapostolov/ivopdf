@@ -28,7 +28,7 @@ trait CompatExtras
     public function setPageOverlay(?\Closure $callback): self
     {
         $this->pageOverlay = $callback;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 

@@ -274,6 +274,11 @@ class TableLayout
             }
         }
 
+        // A table taller than its rows (`height`, or stretched as a flex / grid item): the rows grow to fill it
+        $edges = $outer !== null ? ($outer['top'] + $outer['bottom']) / 2.0 : $table->getVerticalSpacing();
+        $rowHeights = $this->fillTableHeight($table, $orderedRows, $rowHeights, $contentWidth,
+            $captionHeight + $bottomCaptionHeight + $edges + ($numRows + 1) * $spacingPt);
+
         // Compute Y offset for each row and set rowBox & groupBox coordinates
         $rowOffsets = [];
         $accY = $contentY + $spacingPt;
@@ -380,6 +385,48 @@ class TableLayout
             return max(0.0, $totalHeight + ($outer['top'] + $outer['bottom']) / 2.0 - $table->paddingTop - $table->paddingBottom);
         }
         return max(0.0, $totalHeight);
+    }
+
+    /**
+     * Distributes the height a table has beyond its rows (`height` / `min-height`, or a stretched flex / grid item:
+     * forcedBorderBoxHeight) over the rows like Blink: to the rows without an explicit height, in proportion to their
+     * heights (equally when they are all empty); when every row has an explicit height, over all rows.
+     *
+     * @param list<array{rowBox: LayoutBox, groupBox: ?LayoutBox}> $orderedRows
+     * @param array<int, float> $rowHeights
+     * @param float $outside border-box height outside the rows (captions, borders, padding, spacing)
+     * @return array<int, float>
+     */
+    private function fillTableHeight(LayoutBox $table, array $orderedRows, array $rowHeights, float $contentWidth, float $outside): array
+    {
+        if ($table->forcedBorderBoxHeight !== null) {
+            $target = $table->forcedBorderBoxHeight;
+        } else {
+            $explicit = $this->engine->getExplicitContentHeight($table, $contentWidth);
+            if ($explicit === null) {
+                return $rowHeights;
+            }
+            $target = $explicit + $table->getVerticalSpacing();
+        }
+        $extra = $target - $outside - array_sum($rowHeights);
+        if (!is_finite($extra) || $extra <= 0.01 || $rowHeights === []) {
+            return $rowHeights;
+        }
+        $targets = [];
+        foreach ($rowHeights as $r => $h) {
+            $rBox = $orderedRows[$r]['rowBox'] ?? null;
+            if ($rBox === null || $this->engine->getExplicitContentHeight($rBox, $contentWidth) === null) {
+                $targets[$r] = $h;
+            }
+        }
+        if ($targets === []) {
+            $targets = $rowHeights;
+        }
+        $sum = array_sum($targets);
+        foreach ($targets as $r => $h) {
+            $rowHeights[$r] += $sum > 0.01 ? $extra * $h / $sum : $extra / count($targets);
+        }
+        return $rowHeights;
     }
 
     /** Padding and border below the grid: a bottom caption goes below them. */

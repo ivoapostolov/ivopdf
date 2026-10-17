@@ -322,7 +322,7 @@ if ($has) {
             $line = $l;
         }
     }
-    check('page_text(): the baseline lies one font height (ascent + descent) below y, text top at y', $line !== null && abs($line[7] - (100 + $asc + $desc)) < 0.6, json_encode([$line, $asc, $desc]));
+    check('page_text(): the baseline lies one font height (getFontBaseline(): Helvetica AFM ascent + descent, as dompdf) below y', $line !== null && abs($line[7] - (100 + $metrics->getFontBaseline($font, 20))) < 0.6 && abs($metrics->getFontBaseline($font, 20) - 18.5) < 0.01, json_encode([$line, $asc, $desc]));
     $rects = $info[2]['draw'];
     $byX = static function (array $rects, float $y0): ?array {
         foreach ($rects as $r) {

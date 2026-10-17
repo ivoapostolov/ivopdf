@@ -33,6 +33,8 @@ final class PdfAChecker
     /** @var array<int, true> */
     private array $seen = [];
     private int $part = 2;
+    /** The PDF/A output intent is a CMYK profile (device RGB is then the colour space that needs a check) */
+    private bool $intentCmyk = false;
     private int $budget = 200000;
 
     /**
@@ -203,6 +205,7 @@ final class PdfAChecker
                     $this->add('PDF/A OutputIntent has no /DestOutputProfile ICC stream');
                 } else {
                     $icc = $this->reader->decodeStream($profile);
+                    $this->intentCmyk = strlen($icc) >= 20 && substr($icc, 16, 4) === 'CMYK';
                     if (strlen($icc) < 128 || substr($icc, 36, 4) !== 'acsp') {
                         $this->add('OutputIntent /DestOutputProfile is not a valid ICC profile');
                     } elseif ($this->part === 1 && ord($icc[8]) > 2) {
@@ -374,8 +377,8 @@ final class PdfAChecker
                 $this->add('Image /Interpolate true is not allowed in PDF/A (19005-1 6.2.4, 19005-2 6.2.8)');
             }
             $cs = $this->reader->resolve($s->get('ColorSpace'));
-            if ($cs instanceof PdfName && $cs->name === 'DeviceCMYK') {
-                $this->add('DeviceCMYK image while the OutputIntent is an RGB profile');
+            if ($cs instanceof PdfName && $cs->name === ($this->intentCmyk ? 'DeviceRGB' : 'DeviceCMYK')) {
+                $this->add($this->intentCmyk ? 'DeviceRGB image while the OutputIntent is a CMYK profile' : 'DeviceCMYK image while the OutputIntent is an RGB profile');
             }
         } elseif ($sub === 'Form') {
             $this->checkContentColors($s);
@@ -388,7 +391,11 @@ final class PdfAChecker
             return;
         }
         $data = $this->reader->decodeStream($s);
-        if ($data !== '' && preg_match('~(?:-?[\d.]+\s+){4}[kK]\s~', $data) === 1) {
+        if ($this->intentCmyk) {
+            if ($data !== '' && preg_match('~(?:^|[\s\]>)])(?:-?[\d.]+\s+){3}(?:rg|RG)\s~', $data) === 1) {
+                $this->add('DeviceRGB colour operator (rg/RG) used while the OutputIntent is a CMYK profile');
+            }
+        } elseif ($data !== '' && preg_match('~(?:-?[\d.]+\s+){4}[kK]\s~', $data) === 1) {
             $this->add('DeviceCMYK colour operator (k/K) used while the OutputIntent is an RGB profile');
         }
     }

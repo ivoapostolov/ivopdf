@@ -356,7 +356,11 @@ final class Html5Parser
 
         // Ensure UTF-8 meta wrapper if not a complete HTML document
         $hasHtmlTag = stripos($html, '<html') !== false || stripos($html, '<!doctype') !== false;
-        if (!$hasHtmlTag) {
+        if (!$hasHtmlTag && preg_match('~<(?:body|head)[\s>/]~i', $html) === 1) {
+            // A fragment that brings its own <head> / <body> (with attributes): wrap only in <html>, so libxml does not
+            // nest a second <body> and drop the author's attributes (the HTML5 parser merges them)
+            $wrappedHtml = '<!DOCTYPE html><html><meta http-equiv="Content-Type" content="text/html; charset=utf-8">' . $html . '</html>';
+        } elseif (!$hasHtmlTag) {
             $wrappedHtml = '<!DOCTYPE html><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head><body>' . $html . '</body></html>';
         } elseif (stripos($html, '<?xml') === false) {
             $wrappedHtml = '<?xml encoding="UTF-8">' . $html;

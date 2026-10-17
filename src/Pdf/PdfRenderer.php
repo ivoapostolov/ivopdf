@@ -445,6 +445,10 @@ class PdfRenderer
             if ($box->formControl !== null) {
                 $register = !$isFixedContext && $this->annotOwned && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5;
                 $out .= $this->formAppearance()->render($box, $yShift, $this->pageHeight, $this->currentPageIndex, $register);
+            } elseif ($box->tagName === 'progress' || $box->tagName === 'meter') {
+                // drawn like Edge; the fallback content between the tags is not shown (browsers do not show it either)
+                $out .= FormGauges::gauge($box, $localX, $this->pageHeight - ($localY + $boxH), $boxW, $boxH);
+                $skipChildren = true;
             } elseif ($box->tagName === 'img' && $box->imageSrc !== null) {
                 $objectFit = strtolower($box->style->get('object-fit', 'fill'));
                 $cx = $localX + $box->borderLeft + $box->paddingLeft;
@@ -487,9 +491,10 @@ class PdfRenderer
         }
 
         // 7. Render inline LineBoxes belonging to this box
-        $lineFrom = 0;
+        $gaugeBox = $skipChildren && ($box->tagName === 'progress' || $box->tagName === 'meter');
+        $lineFrom = $gaugeBox ? count($box->lines) : 0;
         $linesOrdered = false;
-        if (!$isFixedContext && count($box->lines) > 48) {
+        if (!$gaugeBox && !$isFixedContext && count($box->lines) > 48) {
             [$lineFrom, $linesOrdered] = ($this->cull ??= new RenderCull())->lineStart($box, $visibleVirtualTop);
         }
         for ($li = $lineFrom, $lineCount = count($box->lines); $li < $lineCount; $li++) {
@@ -661,11 +666,13 @@ class PdfRenderer
      * Text-showing operators of the glyphs of a right-to-left run (visual order). A mirrored glyph (the "[" drawn for a
      * logical "]") is shown on its own with its logical character as /ActualText: bidi-aware extractors reverse the run
      * but do not mirror its brackets back. The pieces are joined with relative Td moves at the glyphs' positions.
+     * $reversed false (see rtlReversedSpan()): extractors keep the run in visual order, so a mirrored glyph is already
+     * the character a reader expects and gets no /ActualText.
      *
      * @param list<array{0: int, 1: float, 2: float, 3: float, 4: string}> $glyphs
      * @return array{0: string, 1: float} operators, and how far the last Td moved the start of the text line (pt)
      */
-    private function rtlShowOps(\IvoPdf\Font\TtfParser $ttf, array $glyphs, float $fontSizePt, float $letterSpacingPt): array
+    private function rtlShowOps(\IvoPdf\Font\TtfParser $ttf, array $glyphs, float $fontSizePt, float $letterSpacingPt, bool $reversed = true): array
     {
         $pieces = [];
         $piece = [];
@@ -673,7 +680,7 @@ class PdfRenderer
         $start = 0.0;
         foreach ($glyphs as $g) {
             $cp = mb_strlen($g[4], 'UTF-8') === 1 ? mb_ord($g[4], 'UTF-8') : 0;
-            $mirrored = $cp > 0 && \IvoPdf\Text\Bidi::mirror($cp) !== $cp ? mb_chr(\IvoPdf\Text\Bidi::mirror($cp), 'UTF-8') : null;
+            $mirrored = $reversed && $cp > 0 && \IvoPdf\Text\Bidi::mirror($cp) !== $cp ? mb_chr(\IvoPdf\Text\Bidi::mirror($cp), 'UTF-8') : null;
             if ($mirrored !== null) {
                 if ($piece !== []) {
                     $pieces[] = [$start, $piece, null];
@@ -704,6 +711,34 @@ class PdfRenderer
             $ops .= ($actual !== null ? '/Span << /ActualText <' . strtoupper(bin2hex("\xFE\xFF" . (string) mb_convert_encoding($actual, 'UTF-16BE', 'UTF-8'))) . '> >> BDC ' . $show . ' EMC' : $show) . ' ';
         }
         return [rtrim($ops), $moved];
+    }
+
+    /**
+     * Whether bidi-aware extractors (MuPDF, PDFium) reverse the characters of run $idx: they reverse a stretch of
+     * text in one font that holds right-to-left letters. A run of brackets / punctuation alone in its font (Arabic text
+     * in a fallback font, the brackets in the paragraph's font) is not reversed and keeps its visual order.
+     */
+    private function rtlReversedSpan(LineBox $line, int $idx, \IvoPdf\Font\TtfParser $ttf): bool
+    {
+        $strong = static fn(string $t): bool => preg_match('/[\x{0590}-\x{08FF}\x{FB1D}-\x{FDFF}\x{FE70}-\x{FEFC}\x{10800}-\x{10FFF}\x{1E800}-\x{1EFFF}]/u', $t) === 1;
+        $run = $line->runs[$idx] ?? null;
+        if ($run === null || $strong($run->text)) {
+            return true;
+        }
+        foreach ([-1, 1] as $step) {
+            for ($k = $idx + $step; isset($line->runs[$k]); $k += $step) {
+                $n = $line->runs[$k];
+                if ($n->isWhitespace) {
+                    continue;
+                }
+                if ($n->inlineBox === null && $n->text !== '' && abs($n->fontSizePt - $run->fontSizePt) < 0.01 && $strong($n->text)
+                    && $this->fontManager->resolveFont($n->style->get('font-family', 'DejaVu Sans'), $n->style->get('font-weight', 'normal'), $n->style->get('font-style', 'normal')) === $ttf) {
+                    return true; // shown in the same font next to it: one stretch for the extractor
+                }
+                break;
+            }
+        }
+        return false;
     }
 
     /**
@@ -850,7 +885,7 @@ class PdfRenderer
                     $spaceAfter = false;
                 }
                 if ($logical === null && ($run->bidiLevel & 1) === 1) {
-                    [$showOps, $lineStartShift] = $this->rtlShowOps($ttf, self::rtlClusterText($run->glyphs), $run->fontSizePt, $run->letterSpacingPt);
+                    [$showOps, $lineStartShift] = $this->rtlShowOps($ttf, self::rtlClusterText($run->glyphs), $run->fontSizePt, $run->letterSpacingPt, $this->rtlReversedSpan($line, $runIdx, $ttf));
                 } else {
                     $showOps = $this->fontManager->encodeShapedGlyphs($ttf, $run->glyphs, $run->fontSizePt, $logical);
                 }

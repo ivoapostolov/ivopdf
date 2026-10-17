@@ -153,7 +153,7 @@ trait PdfComposeApi
         } else {
             $this->composeBackground = $this->composeOpenSource($pdfPath)->importPage($page);
         }
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -167,7 +167,7 @@ trait PdfComposeApi
         foreach ($this->importPdfPages($path, $pages) as $id) {
             $this->composeAppend[] = $this->composeTemplate($id);
         }
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -175,7 +175,7 @@ trait PdfComposeApi
     public function appendTemplate(int $templateId): self
     {
         $this->composeAppend[] = $this->composeTemplate($templateId);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -273,7 +273,7 @@ trait PdfComposeApi
             'relationship' => $relationship,
             'modTime' => $modTime,
         ];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 

@@ -23,13 +23,38 @@ final class FontMetrics
         $this->options = $options;
     }
 
-    /** @return string font descriptor usable as the `$font` argument of the canvas methods */
-    public function getFont(?string $family = null, string $subtype = 'normal'): string
+    /**
+     * dompdf's installed families (lib/fonts/installed-fonts.dist.json): the PDF core fonts are drawn with their
+     * metric-compatible Liberation faces and measured with the core fonts' AFM ascender / descender, as dompdf does.
+     */
+    private const CORE = [
+        'sans-serif' => 'helvetica', 'helvetica' => 'helvetica',
+        'serif' => 'times', 'times' => 'times', 'times-roman' => 'times',
+        'monospace' => 'courier', 'fixed' => 'courier', 'courier' => 'courier',
+        'symbol' => 'symbol', 'zapfdingbats' => 'zapfdingbats',
+    ];
+
+    /** AFM Ascender - Descender (FontBBox height when the AFM has none) per 1000 units, as Cpdf::getFontHeight() */
+    private const CORE_HEIGHT = ['helvetica' => 925, 'times' => 900, 'courier' => 786, 'symbol' => 1303, 'zapfdingbats' => 963];
+
+    /**
+     * dompdf: the font of a family / subtype, or null when the family is unknown (dompdf returns null too; measuring
+     * or drawing with null uses Helvetica, Cpdf's default). Without a family the default font (dompdf: serif) is used.
+     *
+     * @return ?string font descriptor usable as the `$font` argument of the canvas methods
+     */
+    public function getFont(?string $family = null, string $subtype = 'normal'): ?string
     {
         $family = $family === null || $family === '' ? (string) ($this->options?->get('defaultFont') ?? 'serif') : $family;
         $subtype = strtolower($subtype ?: 'normal');
         $weight = str_contains($subtype, 'bold') ? 'bold' : 'normal';
         $style = (str_contains($subtype, 'italic') || str_contains($subtype, 'oblique')) ? 'italic' : 'normal';
+        $key = str_replace(["'", '"'], '', mb_strtolower(trim($family), 'UTF-8'));
+        if (isset(self::CORE[$key])) {
+            $family = self::CORE[$key];
+        } elseif (!isset(self::$registered[$key]) && $this->manager()->getFamilyVariants($key) === null) {
+            return null;
+        }
         return $family . '|' . $weight . '|' . $style;
     }
 
@@ -170,7 +195,7 @@ final class FontMetrics
     {
     }
 
-    public function get_font(?string $family_raw = null, string $subtype_raw = 'normal'): string
+    public function get_font(?string $family_raw = null, string $subtype_raw = 'normal'): ?string
     {
         return $this->getFont($family_raw, $subtype_raw);
     }
@@ -234,9 +259,11 @@ final class FontMetrics
         return $w + $wordSpacing * substr_count($text, ' ');
     }
 
+    /** dompdf: the font height (ascent + descent) times the `fontHeightRatio` option (1.1). */
     public function getFontHeight($font, float $size): float
     {
-        return $size * 1.15;
+        $ratio = $this->options?->get('fontHeightRatio');
+        return $this->getFontBaseline($font, $size) * (is_numeric($ratio) && (float) $ratio > 0 ? (float) $ratio : 1.1);
     }
 
     /**
@@ -255,9 +282,16 @@ final class FontMetrics
         }
     }
 
-    /** dompdf: distance from the top of a text() line to its baseline - the font height (ascent + descent). */
+    /**
+     * dompdf: distance from the top of a text() line to its baseline - the font height (ascent + descent): the AFM
+     * values for the core fonts (Helvetica 0.925 em, Times 0.9, Courier 0.786), the font's own for the others.
+     */
     public function getFontBaseline($font, float $size): float
     {
+        $core = self::CORE[strtolower(self::parse((string) $font, $this->options)[0])] ?? null;
+        if ($core !== null) {
+            return self::CORE_HEIGHT[$core] / 1000.0 * $size;
+        }
         [$asc, $desc] = $this->ascentDescent($font, $size);
         return $asc + $desc;
     }
@@ -281,7 +315,7 @@ final class FontMetrics
     public static function parse(string $font, ?Options $options = null): array
     {
         $parts = explode('|', $font);
-        $family = $parts[0] !== '' ? $parts[0] : (string) ($options?->get('defaultFont') ?? 'serif');
+        $family = $parts[0] !== '' ? $parts[0] : 'helvetica'; // a null font (unknown family): Cpdf's default font
         $weight = ($parts[1] ?? 'normal') === 'bold' ? 'bold' : 'normal';
         $style = ($parts[2] ?? 'normal') === 'italic' ? 'italic' : 'normal';
         // a bare "Helvetica-Bold" / "dejavu sans bold" style name

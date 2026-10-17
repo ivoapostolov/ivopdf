@@ -305,6 +305,9 @@ class LayoutEngine
         if ($box->forcedBorderBoxHeight !== null || $display === 'table' || $display === 'inline-table') {
             return false;
         }
+        if (in_array($display, ['table-cell', 'table-row', 'table-row-group', 'table-header-group', 'table-footer-group'], true)) {
+            return false; // a cell / row height is a minimum: the row grows to its content (CSS 2.1 17.5.3)
+        }
         $hCss = strtolower(trim($box->style->get('height', 'auto')));
         if ($hCss === '' || $hCss === 'auto' || str_contains($hCss, 'content') || str_contains($hCss, 'stretch') || str_contains($hCss, 'fill')) {
             return false;
@@ -656,18 +659,44 @@ class LayoutEngine
             // context (table, overflow != visible, flow-root, ...) is placed beside the floats instead
             $beside = self::floatsFrom(...$floatsBelow($childY), y: $childY);
             $wrapsFloats = $beside !== null && !$this->establishesFormattingContext($child);
+            $cbWidth = null; // containing width of a BFC box beside floats whose width does not depend on the band
             if ($wrapsFloats) {
                 $bandLeft = $contentX;
                 $bandWidth = $contentWidth;
             } else {
                 [$bandLeft, $bandRight] = $getBandAtY($childY, 20.0);
                 $bandWidth = max(0.0, $bandRight - $bandLeft);
+                $need = $beside !== null ? $this->bfcWidthBesideFloats($child, $contentWidth) : null;
+                if ($need !== null) {
+                    // CSS 2.1 9.5 / Blink: a BFC box keeps its width (percentages of the containing block, not of the
+                    // band beside the floats); it goes beside the floats only where it fits, else down below them
+                    $cbWidth = $need['explicit'] ? $contentWidth : null;
+                    $y = $childY;
+                    for ($guard = 0; $bandWidth < $need['width'] - 0.01 && $guard < 10000; $guard++) {
+                        $next = INF;
+                        foreach (self::floatsFrom(...$floatsBelow($y), y: $y) ?? [[], []] as $side) {
+                            foreach ($side as $f) {
+                                $next = min($next, $f['bottom']);
+                            }
+                        }
+                        if ($next === INF) {
+                            break;
+                        }
+                        // the margins above the box stay above it at its new place
+                        $cursorY += $next - $y;
+                        $childY = $cursorY + $collapsedMarginTop;
+                        $y = $next;
+                        [$bandLeft, $bandRight] = $getBandAtY($childY, 20.0);
+                        $bandWidth = max(0.0, $bandRight - $bandLeft);
+                        $y = max($y, $childY);
+                    }
+                }
             }
 
             // Compute child width and handle horizontal `margin: auto` centering
             $child->forcedBorderBoxWidth = null;
             $child->forcedBorderBoxHeight = null;
-            $childBorderBoxW = $this->computeBorderBoxWidth($child, $bandWidth);
+            $childBorderBoxW = $this->computeBorderBoxWidth($child, $cbWidth ?? $bandWidth);
             $child->forcedBorderBoxWidth = $childBorderBoxW;
 
             $mlCss = strtolower(trim($child->style->get('margin-left', '0')));
@@ -692,7 +721,7 @@ class LayoutEngine
 
             $childX = $bandLeft + $child->marginLeft;
             $this->pendingFloats = $wrapsFloats ? $beside : null;
-            $this->layoutElement($child, $childX, $childY, $bandWidth);
+            $this->layoutElement($child, $childX, $childY, $cbWidth ?? $bandWidth);
 
             // Margins that escaped from the child's own first / last children join the child's margins
             $childTopEff = self::collapseMargins($child->marginTop, $child->collapsedMarginTop);
@@ -764,6 +793,30 @@ class LayoutEngine
             }
         }
         return $l === [] && $r === [] ? null : [$l, $r];
+    }
+
+    /**
+     * The margin-box width a BFC box needs beside floats, null when it simply fills the band (an auto-width block,
+     * flex or grid container). `explicit`: a definite `width` resolved against the containing block; an auto-width
+     * table needs its min-content width.
+     *
+     * @return array{width: float, explicit: bool}|null
+     */
+    private function bfcWidthBesideFloats(LayoutBox $box, float $containingWidth): ?array
+    {
+        if ($box->isTextNode() || in_array($box->tagName, ['img', 'svg', 'hr'], true) || $box->formControl !== null) {
+            return null;
+        }
+        $margins = static fn(): float => $box->marginLeft + $box->marginRight; // auto margins resolve to 0 here
+        $wCss = strtolower(trim($box->style->get('width', 'auto')));
+        if ($wCss !== 'auto' && $wCss !== '' && !str_contains($wCss, 'content') && !str_contains($wCss, 'stretch') && !str_contains($wCss, 'fill')) {
+            return ['width' => $this->computeBorderBoxWidth($box, $containingWidth) + $margins(), 'explicit' => true];
+        }
+        $display = $box->getDisplay();
+        if ($display === 'table' || $display === 'inline-table') {
+            return ['width' => $this->measureIntrinsicWidth($box, $containingWidth)['min'] + $margins(), 'explicit' => false];
+        }
+        return null;
     }
 
     /**
@@ -1024,56 +1077,9 @@ class LayoutEngine
 
     private function layoutImageBox(LayoutBox $box, float $containingWidth): void
     {
-        $imgData = $box->imageSrc !== null ? $this->imageLoader->load($box->imageSrc) : null;
-        $intrinsicW = $imgData !== null ? ($imgData['width'] * CssUnit::PX_TO_PT) : 100.0;
-        $intrinsicH = $imgData !== null ? ($imgData['height'] * CssUnit::PX_TO_PT) : 60.0;
+        [$intrinsicW, $intrinsicH] = $this->imageNaturalSize($box);
         $ratio = ($intrinsicH > 0.0) ? ($intrinsicW / $intrinsicH) : 1.0;
-
-        $wCss = strtolower(trim($box->style->get('width', 'auto')));
-        $hCss = strtolower(trim($box->style->get('height', 'auto')));
-
-        $hasExplicitW = ($wCss !== 'auto' && $wCss !== '');
-        $hasExplicitH = ($hCss !== 'auto' && $hCss !== '');
-
-        if ($hasExplicitW && $hasExplicitH) {
-            $w = $this->resolveBoxHorizontalDimension($box, $wCss, $containingWidth);
-            $h = $this->resolveBoxVerticalDimension($box, $hCss, $containingWidth);
-        } elseif ($hasExplicitW) {
-            $w = $this->resolveBoxHorizontalDimension($box, $wCss, $containingWidth);
-            $contentW = max(0.0, $w - $box->getHorizontalSpacing());
-            $h = ($contentW / $ratio) + $box->getVerticalSpacing();
-        } elseif ($hasExplicitH) {
-            $h = $this->resolveBoxVerticalDimension($box, $hCss, $containingWidth);
-            $contentH = max(0.0, $h - $box->getVerticalSpacing());
-            $w = ($contentH * $ratio) + $box->getHorizontalSpacing();
-        } else {
-            $w = min($containingWidth, $intrinsicW + $box->getHorizontalSpacing());
-            $contentW = max(0.0, $w - $box->getHorizontalSpacing());
-            $h = ($contentW / $ratio) + $box->getVerticalSpacing();
-        }
-
-        $maxWidthCss = strtolower(trim($box->style->get('max-width', 'none')));
-        if ($maxWidthCss !== 'none' && $maxWidthCss !== '') {
-            $maxW = $this->resolveBoxHorizontalDimension($box, $maxWidthCss, $containingWidth);
-            if ($w > $maxW) {
-                $w = $maxW;
-                if (!$hasExplicitH) {
-                    $contentW = max(0.0, $w - $box->getHorizontalSpacing());
-                    $h = ($contentW / $ratio) + $box->getVerticalSpacing();
-                }
-            }
-        }
-
-        $maxHeightCss = strtolower(trim($box->style->get('max-height', 'none')));
-        if ($maxHeightCss !== 'none' && $maxHeightCss !== '' && !str_ends_with($maxHeightCss, '%')) {
-            $maxH = $this->resolveBoxVerticalDimension($box, $maxHeightCss, $containingWidth);
-            if ($h > $maxH && $maxH > 0.0) {
-                $h = $maxH;
-                if (!$hasExplicitW) {
-                    $w = (max(0.0, $h - $box->getVerticalSpacing()) * $ratio) + $box->getHorizontalSpacing();
-                }
-            }
-        }
+        [$w, $h] = ReplacedSize::used($this, $box, $intrinsicW, $intrinsicH, $containingWidth);
 
         // `<img width="1e9">`: scaled down (keeping the aspect ratio) to CssUnit::MAX_LENGTH_PT
         $over = max(is_finite($w) ? $w : INF, is_finite($h) ? $h : INF) / CssUnit::MAX_LENGTH_PT;
@@ -1083,6 +1089,28 @@ class LayoutEngine
         }
         $box->width = max(0.0, is_nan($w) ? 0.0 : $w);
         $box->height = max(0.0, is_nan($h) ? 0.0 : $h);
+    }
+
+    /** Whether the text of $box may wrap between any two characters for min-content (see measureIntrinsicWidth()). */
+    private static function wrapsAnywhere(LayoutBox $box): bool
+    {
+        $wb = strtolower(trim($box->style->get('word-break', 'normal')));
+        return $wb === 'break-all' || $wb === 'break-word'
+            || strtolower(trim($box->style->get('overflow-wrap', 'normal'))) === 'anywhere'
+            || strtolower(trim($box->style->get('line-break', 'auto'))) === 'anywhere';
+    }
+
+    /**
+     * Natural size of an `<img>` in pt (a missing or broken image is 100 x 60).
+     *
+     * @return array{0: float, 1: float}
+     */
+    private function imageNaturalSize(LayoutBox $box): array
+    {
+        $imgData = $box->imageSrc !== null ? $this->imageLoader->load($box->imageSrc) : null;
+        return $imgData !== null
+            ? [$imgData['width'] * CssUnit::PX_TO_PT, $imgData['height'] * CssUnit::PX_TO_PT]
+            : [100.0, 60.0];
     }
 
     /**
@@ -1350,6 +1378,14 @@ class LayoutEngine
         $this->resolveBoxMetrics($box, $referenceWidth);
         $hSpace = $box->getHorizontalSpacing();
 
+        if ($box->tagName === 'img') {
+            // The used size after CSS (width / height, aspect ratio, min / max), not the natural size; a percentage
+            // width / max-width makes the image compressible: min-content contribution 0 (CSS Sizing 3 §5.2.2)
+            [$nw, $nh] = $this->imageNaturalSize($box);
+            $w = min(CssUnit::MAX_LENGTH_PT, ReplacedSize::used($this, $box, $nw, $nh, null)[0]);
+            return ['min' => ReplacedSize::isCompressible($box) ? 0.0 : $w, 'max' => $w];
+        }
+
         $wCss = strtolower(trim($box->style->get('width', 'auto')));
         if (!$ignoreExplicitWidth && $wCss !== 'auto' && $wCss !== '' && !str_ends_with($wCss, '%') && !str_contains($wCss, 'content')) {
             $fixedW = $this->resolveBoxHorizontalDimension($box, $wCss, $referenceWidth);
@@ -1363,12 +1399,6 @@ class LayoutEngine
         if ($box->tagName === 'wbr') {
             // <wbr> is a break opportunity: it ends the unbreakable run before it and starts a new one after it
             return ['min' => 0.0, 'max' => 0.0, 'minLead' => 0.0, 'minTrail' => 0.0, 'hasBreak' => false, 'startsBreak' => true, 'endsBreak' => true];
-        }
-
-        if ($box->tagName === 'img') {
-            $img = $box->imageSrc !== null ? $this->imageLoader->load($box->imageSrc) : null;
-            $w = ($img !== null ? $img['width'] * CssUnit::PX_TO_PT : 80.0) + $hSpace;
-            return ['min' => $w, 'max' => $w];
         }
 
         if ($box->formControl !== null) {
@@ -1426,20 +1456,38 @@ class LayoutEngine
             $leadW = 0.0;
             $trailW = 0.0;
             $lastIdx = count($words) - 1;
+            $hasBreak = $lastIdx > 0;
+            // `word-break: break-all | break-word`, `overflow-wrap: anywhere`, `line-break: anywhere`: soft wrap
+            // opportunities between the characters, so min-content is the widest character (CSS Text 3 §5.2, §5.5;
+            // `overflow-wrap: break-word` does not lower min-content)
+            $anywhere = !$noWrap && self::wrapsAnywhere($box);
+            $charW = [];
             foreach ($words as $wi => $word) {
-                $ww = $this->fontManager->measureText($word, $ff, $fw, $fs, $box->fontSizePt, $ls);
+                if ($anywhere && preg_match('/^.$/su', $word) !== 1) {
+                    $chars = preg_split('//u', $word, -1, PREG_SPLIT_NO_EMPTY) ?: [$word];
+                    $ww = 0.0;
+                    foreach ($chars as $ch) {
+                        $ww = max($ww, $charW[$ch] ??= $this->fontManager->measureText($ch, $ff, $fw, $fs, $box->fontSizePt, $ls));
+                    }
+                    $hasBreak = true;
+                    $first = $charW[$chars[0]];
+                    $last = $charW[$chars[count($chars) - 1]];
+                } else {
+                    $ww = $this->fontManager->measureText($word, $ff, $fw, $fs, $box->fontSizePt, $ls);
+                    $first = $last = $ww;
+                }
                 if ($ww > $minW) {
                     $minW = $ww;
                 }
                 if ($wi === 0) {
-                    $leadW = $ww;
+                    $leadW = $first;
                 }
                 if ($wi === $lastIdx) {
-                    $trailW = $ww;
+                    $trailW = $last;
                 }
             }
             return [
-                'min' => $minW, 'max' => $maxW, 'minLead' => $leadW, 'minTrail' => $trailW, 'hasBreak' => $lastIdx > 0,
+                'min' => $minW, 'max' => $maxW, 'minLead' => $leadW, 'minTrail' => $trailW, 'hasBreak' => $hasBreak,
                 'startsBreak' => !$noWrap && strspn($rawText, " \t\n\r\f") > 0,
                 'endsBreak' => !$noWrap && strspn(strrev($rawText), " \t\n\r\f") > 0,
                 // collapsible white space at the edges: one space between this text and its inline neighbours

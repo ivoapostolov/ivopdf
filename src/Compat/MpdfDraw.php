@@ -21,12 +21,13 @@ use IvoPdf\Compat\Dompdf\FontMetrics;
  *  - SetFont() / SetFontSize() / Set*Color() / SetLineWidth() / SetDash() set the pen of these calls (not of WriteHTML,
  *    whose text follows CSS, as in mPDF).
  *  - SetAutoPageBreak($auto, $margin) sets the bottom margin; DeletePages() / MovePages() rearrange the output pages;
- *    PageNo() renders what was written so far and returns its page count.
+ *    PageNo() returns the page count of what was written so far (see MpdfPageNo: only new content is laid out).
  *  - Any other public method of mPDF 8 is accepted by __call(): it does nothing, returns null and adds one warning per
  *    method (getWarnings()). Names that mPDF does not have still fail with the usual "undefined method" Error.
  */
 trait MpdfDraw
 {
+    use MpdfPageNo; // PageNo(): incremental page count
     private ?Canvas $mpdfCanvas = null;
     /** Canvas object that records the drawing calls since the last WriteHTML() (null: none open) */
     private ?int $mpdfSegment = null;
@@ -70,23 +71,16 @@ trait MpdfDraw
     // ------------------------------------------------------------------
 
     /** mPDF: automatic page breaks with the given bottom margin in mm (mPDF sets the margin to $margin, default 0). */
-    public function SetAutoPageBreak(bool $auto, float|int|string $margin = 0): self
+    public function SetAutoPageBreak(mixed $auto, mixed $margin = 0): self
     {
+        $auto = MpdfArgs::bool($auto);
+        $margin = MpdfArgs::num($margin);
         $this->options->margins['bottom'] = max(0.0, (float) $margin) * 72 / 25.4;
         if (!$auto) {
             $this->options->addStickyWarning('SetAutoPageBreak(false): IvoPDF always continues content on the next page; content is not clipped at the bottom margin.');
         }
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
-    }
-
-    /** Current page number: renders what has been written so far (the page on which it ends). */
-    public function PageNo(): int
-    {
-        if ($this->renderedPdf === null) {
-            $this->render();
-        }
-        return $this->pageCount;
     }
 
     /** mPDF 7 FPDI switch, not needed any more (imports always work): accepted and ignored. */
@@ -104,27 +98,34 @@ trait MpdfDraw
     }
 
     /** `{nb}` / `{nbpg}` are always replaced by the page count. */
-    public function AliasNbPages(string $alias = '{nb}'): void
+    public function AliasNbPages(mixed $alias = '{nb}'): void
     {
+        $alias = MpdfArgs::str($alias);
     }
 
-    public function AliasNbPageGroups(string $alias = '{nbpg}'): void
+    public function AliasNbPageGroups(mixed $alias = '{nbpg}'): void
     {
+        $alias = MpdfArgs::str($alias);
     }
 
     /** mPDF: deletes pages $startPage..$endPage (1-based, inclusive) of the output. */
-    public function DeletePages(int $startPage, int $endPage = -1): self
+    public function DeletePages(mixed $startPage, mixed $endPage = -1): self
     {
+        $startPage = MpdfArgs::int($startPage);
+        $endPage = MpdfArgs::int($endPage);
         $this->mpdfPageOps[] = ['delete', $startPage, $endPage < 1 ? $startPage : $endPage, 0];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** mPDF: moves pages $startPage..$endPage so that they start at $targetPage ($targetPage < $startPage). */
-    public function MovePages(int $targetPage, int $startPage, int $endPage = -1): self
+    public function MovePages(mixed $targetPage, mixed $startPage, mixed $endPage = -1): self
     {
+        $targetPage = MpdfArgs::int($targetPage);
+        $startPage = MpdfArgs::int($startPage);
+        $endPage = MpdfArgs::int($endPage);
         $this->mpdfPageOps[] = ['move', $startPage, $endPage < 1 ? $startPage : $endPage, $targetPage];
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
@@ -203,67 +204,87 @@ trait MpdfDraw
     }
 
     /** mPDF margins in mm (they apply to the whole document). */
-    public function SetLeftMargin(float|int $margin): self
+    public function SetLeftMargin(mixed $margin): self
     {
+        $margin = MpdfArgs::num($margin);
         return $this->mpdfMargin('left', $margin);
     }
 
-    public function SetRightMargin(float|int $margin): self
+    public function SetRightMargin(mixed $margin): self
     {
+        $margin = MpdfArgs::num($margin);
         return $this->mpdfMargin('right', $margin);
     }
 
-    public function SetTopMargin(float|int $margin): self
+    public function SetTopMargin(mixed $margin): self
     {
+        $margin = MpdfArgs::num($margin);
         return $this->mpdfMargin('top', $margin);
     }
 
     private function mpdfMargin(string $side, float|int $mm): self
     {
         $this->options->margins[$side] = max(0.0, (float) $mm) * 72 / 25.4;
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** mPDF AddFontDirectory(): an extra folder searched for `fontdata` files. */
-    public function AddFontDirectory(string $directory): self
+    public function AddFontDirectory(mixed $directory): self
     {
+        $directory = MpdfArgs::str($directory);
         $dirs = (array) ($this->options->compat['fontDir'] ?? []);
         $dirs[] = $directory;
         $this->options->compat['fontDir'] = $dirs;
         MpdfConfig::registerFonts($this->options, $this->fontManager);
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
     /** mPDF DefHeaderByName($name, $spec): a named header from the array / 'L|C|R' form of SetHeader(). */
-    public function DefHeaderByName(string $name, string|array $spec): self
+    public function DefHeaderByName(mixed $name, mixed $spec): self
     {
+        $name = MpdfArgs::str($name);
+        $spec = is_array($spec) ? $spec : MpdfArgs::str($spec);
         $this->mpdfDefHeaders[$name] = $this->mpdfBarVariants($spec, true)['all'] ?? $this->mpdfBarVariants($spec, true)['odd'] ?? '';
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function DefFooterByName(string $name, string|array $spec): self
+    public function DefFooterByName(mixed $name, mixed $spec): self
     {
+        $name = MpdfArgs::str($name);
+        $spec = is_array($spec) ? $spec : MpdfArgs::str($spec);
         $this->mpdfDefFooters[$name] = $this->mpdfBarVariants($spec, false)['all'] ?? $this->mpdfBarVariants($spec, false)['odd'] ?? '';
-        $this->renderedPdf = null;
+        $this->invalidate();
         return $this;
     }
 
-    public function SetHeaderByName(string $name, string $side = 'O', bool $write = false): self
+    public function SetHeaderByName(mixed $name, mixed $side = 'O', mixed $write = false): self
     {
+        $name = MpdfArgs::str($name);
+        $side = MpdfArgs::str($side);
+        $write = MpdfArgs::bool($write);
         return $this->SetHTMLHeaderByName($name, $side, $write);
     }
 
-    public function SetFooterByName(string $name, string $side = 'O'): self
+    public function SetFooterByName(mixed $name, mixed $side = 'O'): self
     {
+        $name = MpdfArgs::str($name);
+        $side = MpdfArgs::str($side);
         return $this->SetHTMLFooterByName($name, $side);
     }
 
     /** mPDF Annotation(): a sticky note at ($x, $y) mm, or at the current position when both are 0. */
-    public function Annotation(string $text, float|int $x = 0, float|int $y = 0, string $icon = 'Note', string $author = '', string $subject = '', float|int $opacity = 0, mixed $colarray = false, mixed $popup = '', mixed $file = ''): self
+    public function Annotation(mixed $text, mixed $x = 0, mixed $y = 0, mixed $icon = 'Note', mixed $author = '', mixed $subject = '', mixed $opacity = 0, mixed $colarray = false, mixed $popup = '', mixed $file = ''): self
     {
+        $text = MpdfArgs::str($text);
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $icon = MpdfArgs::str($icon);
+        $author = MpdfArgs::str($author);
+        $subject = MpdfArgs::str($subject);
+        $opacity = MpdfArgs::num($opacity);
         $attrs = ['content' => $text, 'title' => $author, 'icon' => $icon];
         if ($opacity > 0) {
             $attrs['opacity'] = (string) $opacity;
@@ -286,24 +307,24 @@ trait MpdfDraw
     // output helpers of mPDF 8
     // ------------------------------------------------------------------
 
-    public function OutputFile(string $fileName): void
+    public function OutputFile(mixed $fileName): void
     {
-        $this->save($fileName);
+        $this->mpdfOutput(MpdfArgs::str($fileName), 'F');
     }
 
     public function OutputBinaryData(): string
     {
-        return $this->output();
+        return (string) $this->mpdfOutput('', 'S');
     }
 
     public function OutputHttpInline(): void
     {
-        $this->stream('document.pdf', ['Attachment' => false]);
+        $this->mpdfOutput('', 'I');
     }
 
-    public function OutputHttpDownload(string $fileName): void
+    public function OutputHttpDownload(mixed $fileName): void
     {
-        $this->stream($fileName, ['Attachment' => true]);
+        $this->mpdfOutput(MpdfArgs::str($fileName), 'D');
     }
 
     // ------------------------------------------------------------------
@@ -311,8 +332,13 @@ trait MpdfDraw
     // ------------------------------------------------------------------
 
     /** mPDF SetFont($family, $style 'B' / 'I' / 'BI' / 'U', $size pt): the font of Cell(), Write(), Text() ... */
-    public function SetFont(string $family, string $style = '', float|int $size = 0, bool $write = true, bool $forcewrite = false): self
+    public function SetFont(mixed $family, mixed $style = '', mixed $size = 0, mixed $write = true, mixed $forcewrite = false): self
     {
+        $family = MpdfArgs::str($family);
+        $style = MpdfArgs::str($style);
+        $size = MpdfArgs::num($size);
+        $write = MpdfArgs::bool($write);
+        $forcewrite = MpdfArgs::bool($forcewrite);
         $this->mpdfPen['family'] = $family;
         $this->mpdfPen['style'] = strtoupper($style);
         if ($size > 0) {
@@ -321,8 +347,10 @@ trait MpdfDraw
         return $this;
     }
 
-    public function SetFontSize(float|int $size, bool $write = true): self
+    public function SetFontSize(mixed $size, mixed $write = true): self
     {
+        $size = MpdfArgs::num($size);
+        $write = MpdfArgs::bool($write);
         if ($size > 0) {
             $this->mpdfPen['size'] = (float) $size;
         }
@@ -330,27 +358,31 @@ trait MpdfDraw
     }
 
     /** Colors: (r, g, b) 0..255, a gray level (one value), an [r, g, b] array or a CSS color string. */
-    public function SetTextColor(mixed $r, mixed $g = -1, mixed $b = -1, mixed $col4 = -1, bool $return = false): self
+    public function SetTextColor(mixed $r, mixed $g = -1, mixed $b = -1, mixed $col4 = -1, mixed $return = false): self
     {
+        $return = MpdfArgs::bool($return);
         $this->mpdfPen['text'] = self::mpdfColor($r, $g, $b);
         return $this;
     }
 
-    public function SetFillColor(mixed $r, mixed $g = -1, mixed $b = -1, mixed $col4 = -1, bool $return = false): self
+    public function SetFillColor(mixed $r, mixed $g = -1, mixed $b = -1, mixed $col4 = -1, mixed $return = false): self
     {
+        $return = MpdfArgs::bool($return);
         $this->mpdfPen['fill'] = self::mpdfColor($r, $g, $b);
         return $this;
     }
 
-    public function SetDrawColor(mixed $r, mixed $g = -1, mixed $b = -1, mixed $col4 = -1, bool $return = false): self
+    public function SetDrawColor(mixed $r, mixed $g = -1, mixed $b = -1, mixed $col4 = -1, mixed $return = false): self
     {
+        $return = MpdfArgs::bool($return);
         $this->mpdfPen['draw'] = self::mpdfColor($r, $g, $b);
         return $this;
     }
 
     /** Line width in mm. */
-    public function SetLineWidth(float|int $width): self
+    public function SetLineWidth(mixed $width): self
     {
+        $width = MpdfArgs::num($width);
         $this->mpdfPen['lw'] = max(0.0, (float) $width);
         return $this;
     }
@@ -363,27 +395,34 @@ trait MpdfDraw
         return $this;
     }
 
-    public function SetLineCap(int $mode = 2): self
+    public function SetLineCap(mixed $mode = 2): self
     {
+        $mode = MpdfArgs::int($mode);
         $this->mpdfPen['cap'] = [0 => 'butt', 1 => 'round', 2 => 'square'][$mode] ?? 'butt';
         return $this;
     }
 
-    public function SetLineJoin(int $mode = 0): self
+    public function SetLineJoin(mixed $mode = 0): self
     {
+        $mode = MpdfArgs::int($mode);
         return $this;
     }
 
     /** Opacity (0..1) and blend mode of the drawing calls that follow. */
-    public function SetAlpha(float|int $alpha, string $bm = 'Normal', bool $return = false, string $mode = 'B'): self
+    public function SetAlpha(mixed $alpha, mixed $bm = 'Normal', mixed $return = false, mixed $mode = 'B'): self
     {
+        $alpha = MpdfArgs::num($alpha);
+        $bm = MpdfArgs::str($bm);
+        $return = MpdfArgs::bool($return);
+        $mode = MpdfArgs::str($mode);
         $this->mpdfCanvas()->set_opacity((float) $alpha, $bm);
         return $this;
     }
 
     /** Width in mm of a string in the current font (SetFont()). */
-    public function GetStringWidth(string $s, mixed ...$ignored): float
+    public function GetStringWidth(mixed $s, mixed ...$ignored): float
     {
+        $s = MpdfArgs::str($s);
         [$family, $weight, $style] = $this->mpdfFontCss();
         return $this->fontManager->measureText($s, $family, $weight, $style, $this->mpdfFontSize()) * 25.4 / 72;
     }
@@ -392,22 +431,27 @@ trait MpdfDraw
     // position
     // ------------------------------------------------------------------
 
-    public function SetXY(float|int $x, float|int $y): self
+    public function SetXY(mixed $x, mixed $y): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
         $this->SetY($y);
         return $this->SetX($x);
     }
 
-    public function SetX(float|int $x): self
+    public function SetX(mixed $x): self
     {
+        $x = MpdfArgs::num($x);
         $w = $this->mpdfPageMm()[0];
         $this->mpdfX = $x >= 0 ? (float) $x : $w + (float) $x;
         return $this;
     }
 
     /** Sets the position (and moves x back to the left margin, as mPDF). */
-    public function SetY(float|int $y, bool $resetx = true): self
+    public function SetY(mixed $y, mixed $resetx = true): self
     {
+        $y = MpdfArgs::num($y);
+        $resetx = MpdfArgs::bool($resetx);
         $h = $this->mpdfPageMm()[1];
         $this->mpdfY = $y >= 0 ? (float) $y : $h + (float) $y;
         if ($resetx || $this->mpdfX === null) {
@@ -436,8 +480,20 @@ trait MpdfDraw
      *
      * @return array<string, mixed>|null
      */
-    public function Image(string $file, float|int $x, float|int $y, float|int $w = 0, float|int $h = 0, string $type = '', string $link = '', bool $paint = true, bool $constrain = true, bool $watermark = false, bool $shownoimg = true, bool $allowvector = true): ?array
+    public function Image(mixed $file, mixed $x, mixed $y, mixed $w = 0, mixed $h = 0, mixed $type = '', mixed $link = '', mixed $paint = true, mixed $constrain = true, mixed $watermark = false, mixed $shownoimg = true, mixed $allowvector = true): ?array
     {
+        $file = MpdfArgs::str($file);
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $type = MpdfArgs::str($type);
+        $link = MpdfArgs::str($link);
+        $paint = MpdfArgs::bool($paint);
+        $constrain = MpdfArgs::bool($constrain);
+        $watermark = MpdfArgs::bool($watermark);
+        $shownoimg = MpdfArgs::bool($shownoimg);
+        $allowvector = MpdfArgs::bool($allowvector);
         if ($watermark) {
             $this->SetWatermarkImage($file);
             return null;
@@ -455,16 +511,25 @@ trait MpdfDraw
     }
 
     /** mPDF WriteFixedPosHTML(): HTML in a $w x $h mm box at ($x, $y) mm of the current page; $overflow 'hidden' clips it. */
-    public function WriteFixedPosHTML(string $html, float|int $x, float|int $y, float|int $w, float|int $h, string $overflow = 'visible', array $bounding = []): self
+    public function WriteFixedPosHTML(mixed $html, mixed $x, mixed $y, mixed $w, mixed $h, mixed $overflow = 'visible', array $bounding = []): self
     {
+        $html = MpdfArgs::str($html);
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $overflow = MpdfArgs::str($overflow);
         $k = 72 / 25.4;
         $this->mpdfCanvas()->html($this->convertMpdfPlaceholders($html), (float) $x * $k, (float) $y * $k, (float) $w * $k, (float) $h * $k, $overflow);
         return $this;
     }
 
     /** mPDF Text() / WriteText(): one line of text whose baseline is at ($x, $y) mm. */
-    public function Text(float|int $x, float|int $y, string $txt, mixed ...$ignored): self
+    public function Text(mixed $x, mixed $y, mixed $txt, mixed ...$ignored): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $txt = MpdfArgs::str($txt);
         $k = 72 / 25.4;
         $font = $this->mpdfFontDescriptor();
         $c = $this->mpdfCanvas();
@@ -478,21 +543,33 @@ trait MpdfDraw
         return $this;
     }
 
-    public function WriteText(float|int $x, float|int $y, string $txt): self
+    public function WriteText(mixed $x, mixed $y, mixed $txt): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $txt = MpdfArgs::str($txt);
         return $this->Text($x, $y, $txt);
     }
 
-    public function Line(float|int $x1, float|int $y1, float|int $x2, float|int $y2): self
+    public function Line(mixed $x1, mixed $y1, mixed $x2, mixed $y2): self
     {
+        $x1 = MpdfArgs::num($x1);
+        $y1 = MpdfArgs::num($y1);
+        $x2 = MpdfArgs::num($x2);
+        $y2 = MpdfArgs::num($y2);
         $k = 72 / 25.4;
         $this->mpdfCanvas()->line((float) $x1 * $k, (float) $y1 * $k, (float) $x2 * $k, (float) $y2 * $k, $this->mpdfPen['draw'], $this->mpdfPen['lw'] * $k, $this->mpdfPen['dash'], $this->mpdfPen['cap']);
         return $this;
     }
 
     /** $style: '' / 'D' outline, 'F' fill, 'DF' / 'FD' both. */
-    public function Rect(float|int $x, float|int $y, float|int $w, float|int $h, string $style = ''): self
+    public function Rect(mixed $x, mixed $y, mixed $w, mixed $h, mixed $style = ''): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $style = MpdfArgs::str($style);
         $k = 72 / 25.4;
         [$fill, $stroke] = self::mpdfPaint($style);
         $c = $this->mpdfCanvas();
@@ -505,13 +582,22 @@ trait MpdfDraw
         return $this;
     }
 
-    public function Circle(float|int $x, float|int $y, float|int $r, string $style = 'S'): self
+    public function Circle(mixed $x, mixed $y, mixed $r, mixed $style = 'S'): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $r = MpdfArgs::num($r);
+        $style = MpdfArgs::str($style);
         return $this->Ellipse($x, $y, $r, $r, $style);
     }
 
-    public function Ellipse(float|int $x, float|int $y, float|int $rx, float|int $ry, string $style = 'S'): self
+    public function Ellipse(mixed $x, mixed $y, mixed $rx, mixed $ry, mixed $style = 'S'): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $rx = MpdfArgs::num($rx);
+        $ry = MpdfArgs::num($ry);
+        $style = MpdfArgs::str($style);
         $k = 72 / 25.4;
         $pts = [];
         for ($i = 0; $i < 72; $i++) {
@@ -522,8 +608,14 @@ trait MpdfDraw
         return $this->mpdfShape($pts, $style);
     }
 
-    public function RoundedRect(float|int $x, float|int $y, float|int $w, float|int $h, float|int $r, string $style = ''): self
+    public function RoundedRect(mixed $x, mixed $y, mixed $w, mixed $h, mixed $r, mixed $style = ''): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $r = MpdfArgs::num($r);
+        $style = MpdfArgs::str($style);
         $r = max(0.0, min((float) $r, min((float) $w, (float) $h) / 2));
         $pts = [];
         foreach ([[(float) $x + $r, (float) $y + $r, 180.0], [(float) $x + (float) $w - $r, (float) $y + $r, 270.0], [(float) $x + (float) $w - $r, (float) $y + (float) $h - $r, 0.0], [(float) $x + $r, (float) $y + (float) $h - $r, 90.0]] as [$cx, $cy, $from]) {
@@ -537,8 +629,15 @@ trait MpdfDraw
     }
 
     /** mPDF Arrow(): a line from ($x1, $y1) to ($x2, $y2) mm with a triangular head at the end. */
-    public function Arrow(float|int $x1, float|int $y1, float|int $x2, float|int $y2, float|int $headsize = 3, string $fill = 'B', float|int $angle = 25): self
+    public function Arrow(mixed $x1, mixed $y1, mixed $x2, mixed $y2, mixed $headsize = 3, mixed $fill = 'B', mixed $angle = 25): self
     {
+        $x1 = MpdfArgs::num($x1);
+        $y1 = MpdfArgs::num($y1);
+        $x2 = MpdfArgs::num($x2);
+        $y2 = MpdfArgs::num($y2);
+        $headsize = MpdfArgs::num($headsize);
+        $fill = MpdfArgs::str($fill);
+        $angle = MpdfArgs::num($angle);
         $this->Line($x1, $y1, $x2, $y2);
         $dir = atan2((float) $y2 - (float) $y1, (float) $x2 - (float) $x1);
         $a = deg2rad((float) $angle);
@@ -551,8 +650,13 @@ trait MpdfDraw
     }
 
     /** mPDF Link(): a clickable area ($link: URL, '#name' or an AddLink() id). */
-    public function Link(float|int $x, float|int $y, float|int $w, float|int $h, string|int $link): self
+    public function Link(mixed $x, mixed $y, mixed $w, mixed $h, mixed $link): self
     {
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $link = is_int($link) ? $link : MpdfArgs::str($link);
         $k = 72 / 25.4;
         $url = is_int($link) ? '#ivo-mlink-' . $link : $link;
         $this->mpdfCanvas()->add_link($url, (float) $x * $k, (float) $y * $k, (float) $w * $k, (float) $h * $k);
@@ -566,15 +670,21 @@ trait MpdfDraw
     }
 
     /** mPDF SetLink(): the target of an AddLink() id, $y mm on the current page ($page is ignored: the current page). */
-    public function SetLink(int $link, float|int $y = 0, int $page = -1): self
+    public function SetLink(mixed $link, mixed $y = 0, mixed $page = -1): self
     {
+        $link = MpdfArgs::int($link);
+        $y = MpdfArgs::num($y);
+        $page = MpdfArgs::int($page);
         $this->mpdfCanvas()->namedDestAt('ivo-mlink-' . $link, max(0.0, (float) $y) * 72 / 25.4);
         return $this;
     }
 
     /** mPDF Rotate(): rotates the drawing calls that follow $angle degrees counter-clockwise around ($x, $y) mm; 0 ends it. */
-    public function Rotate(float|int $angle, float|int $x = -1, float|int $y = -1): self
+    public function Rotate(mixed $angle, mixed $x = -1, mixed $y = -1): self
     {
+        $angle = MpdfArgs::num($angle);
+        $x = MpdfArgs::num($x);
+        $y = MpdfArgs::num($y);
         $c = $this->mpdfCanvas();
         if ($this->mpdfRotated) {
             $c->restore();
@@ -590,21 +700,26 @@ trait MpdfDraw
         return $this;
     }
 
-    public function StartTransform(bool $returnstring = false): ?string
+    public function StartTransform(mixed $returnstring = false): ?string
     {
+        $returnstring = MpdfArgs::bool($returnstring);
         $this->mpdfCanvas()->save();
         return null;
     }
 
-    public function StopTransform(bool $returnstring = false): ?string
+    public function StopTransform(mixed $returnstring = false): ?string
     {
+        $returnstring = MpdfArgs::bool($returnstring);
         $this->mpdfCanvas()->restore();
         return null;
     }
 
     /** Scales by $s_x / $s_y percent around ($x, $y) mm (default: the current position). */
-    public function transformScale(float|int $s_x, float|int $s_y, mixed $x = '', mixed $y = '', bool $returnstring = false): ?string
+    public function transformScale(mixed $s_x, mixed $s_y, mixed $x = '', mixed $y = '', mixed $returnstring = false): ?string
     {
+        $s_x = MpdfArgs::num($s_x);
+        $s_y = MpdfArgs::num($s_y);
+        $returnstring = MpdfArgs::bool($returnstring);
         if ((float) $s_x == 0.0 || (float) $s_y == 0.0) {
             throw new \InvalidArgumentException('Please do not use values equal to zero for scaling');
         }
@@ -615,15 +730,20 @@ trait MpdfDraw
         return null;
     }
 
-    public function transformTranslate(float|int $t_x, float|int $t_y, bool $returnstring = false): ?string
+    public function transformTranslate(mixed $t_x, mixed $t_y, mixed $returnstring = false): ?string
     {
+        $t_x = MpdfArgs::num($t_x);
+        $t_y = MpdfArgs::num($t_y);
+        $returnstring = MpdfArgs::bool($returnstring);
         $this->mpdfCanvas()->transform(1, 0, 0, 1, (float) $t_x * 72 / 25.4, -(float) $t_y * 72 / 25.4);
         return null;
     }
 
     /** Rotates $angle degrees around ($x, $y) mm, with mPDF's matrix. */
-    public function transformRotate(float|int $angle, mixed $x = '', mixed $y = '', bool $returnstring = false): ?string
+    public function transformRotate(mixed $angle, mixed $x = '', mixed $y = '', mixed $returnstring = false): ?string
     {
+        $angle = MpdfArgs::num($angle);
+        $returnstring = MpdfArgs::bool($returnstring);
         [$px, $py] = $this->mpdfPivot($x, $y);
         $a = deg2rad(-(float) $angle);
         $cos = cos($a);
@@ -632,8 +752,11 @@ trait MpdfDraw
         return null;
     }
 
-    public function transformSkew(float|int $angle_x, float|int $angle_y, mixed $x = '', mixed $y = '', bool $returnstring = false): ?string
+    public function transformSkew(mixed $angle_x, mixed $angle_y, mixed $x = '', mixed $y = '', mixed $returnstring = false): ?string
     {
+        $angle_x = MpdfArgs::num($angle_x);
+        $angle_y = MpdfArgs::num($angle_y);
+        $returnstring = MpdfArgs::bool($returnstring);
         [$px, $py] = $this->mpdfPivot($x, $y);
         $tb = tan(deg2rad(-(float) $angle_y));
         $tc = tan(deg2rad(-(float) $angle_x));
@@ -649,8 +772,16 @@ trait MpdfDraw
      * mPDF Cell(): a $w x $h mm box with text. $border 1 / 'LTRB', $ln 0 = right, 1 = next line, 2 = below,
      * $align 'L' / 'C' / 'R', $fill true = SetFillColor() background, $link URL / '#name' / AddLink() id.
      */
-    public function Cell(float|int $w, float|int $h = 0, string $txt = '', int|string $border = 0, int $ln = 0, string $align = '', bool|int $fill = false, string|int $link = '', mixed ...$ignored): self
+    public function Cell(mixed $w, mixed $h = 0, mixed $txt = '', mixed $border = 0, mixed $ln = 0, mixed $align = '', mixed $fill = false, mixed $link = '', mixed ...$ignored): self
     {
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $txt = MpdfArgs::str($txt);
+        $border = is_int($border) ? $border : MpdfArgs::str($border);
+        $ln = MpdfArgs::int($ln);
+        $align = MpdfArgs::str($align);
+        $fill = MpdfArgs::bool($fill);
+        $link = is_int($link) ? $link : MpdfArgs::str($link);
         $this->mpdfLastH = (float) $h > 0 ? (float) $h : $this->mpdfLastH;
         if ($this->mpdfY === null) {
             $html = $this->mpdfCellHtml((float) $w, (float) $h, $txt, $border, $align, (bool) $fill, $link, $w == 0 || $ln > 0);
@@ -674,14 +805,29 @@ trait MpdfDraw
     }
 
     /** mPDF WriteCell(): Cell() without the right-to-left / OTL processing. */
-    public function WriteCell(float|int $w, float|int $h = 0, string $txt = '', int|string $border = 0, int $ln = 0, string $align = '', bool|int $fill = false, string|int $link = '', mixed ...$ignored): self
+    public function WriteCell(mixed $w, mixed $h = 0, mixed $txt = '', mixed $border = 0, mixed $ln = 0, mixed $align = '', mixed $fill = false, mixed $link = '', mixed ...$ignored): self
     {
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $txt = MpdfArgs::str($txt);
+        $border = is_int($border) ? $border : MpdfArgs::str($border);
+        $ln = MpdfArgs::int($ln);
+        $align = MpdfArgs::str($align);
+        $fill = MpdfArgs::bool($fill);
+        $link = is_int($link) ? $link : MpdfArgs::str($link);
         return $this->Cell($w, $h, $txt, $border, $ln, $align, $fill, $link);
     }
 
     /** mPDF MultiCell(): text wrapped in a $w mm wide box (0 = to the right margin), $h mm per line. */
-    public function MultiCell(float|int $w, float|int $h, string $txt, int|string $border = 0, string $align = '', bool|int $fill = false, string|int $link = '', mixed ...$ignored): self
+    public function MultiCell(mixed $w, mixed $h, mixed $txt, mixed $border = 0, mixed $align = '', mixed $fill = false, mixed $link = '', mixed ...$ignored): self
     {
+        $w = MpdfArgs::num($w);
+        $h = MpdfArgs::num($h);
+        $txt = MpdfArgs::str($txt);
+        $border = is_int($border) ? $border : MpdfArgs::str($border);
+        $align = MpdfArgs::str($align);
+        $fill = MpdfArgs::bool($fill);
+        $link = is_int($link) ? $link : MpdfArgs::str($link);
         $k = 72 / 25.4;
         $style = $this->mpdfTextCss() . sprintf('line-height:%.3Fmm;', (float) $h) . self::mpdfBorderCss($border, $this->mpdfPen['draw'], $this->mpdfPen['lw'])
             . ($fill ? 'background:' . self::mpdfCss($this->mpdfPen['fill']) . ';' : '') . 'text-align:' . self::mpdfAlign($align, 'J') . ';margin:0;padding:0 1mm;';
@@ -701,8 +847,11 @@ trait MpdfDraw
     }
 
     /** mPDF Write(): flowing text, $h mm line height. */
-    public function Write(float|int $h, string $txt, mixed $currentx = 0, string|int $link = '', mixed ...$ignored): self
+    public function Write(mixed $h, mixed $txt, mixed $currentx = 0, mixed $link = '', mixed ...$ignored): self
     {
+        $h = MpdfArgs::num($h);
+        $txt = MpdfArgs::str($txt);
+        $link = is_int($link) ? $link : MpdfArgs::str($link);
         $this->mpdfLastH = (float) $h > 0 ? (float) $h : $this->mpdfLastH;
         $text = nl2br(htmlspecialchars($txt, ENT_QUOTES, 'UTF-8'), false);
         if ($this->mpdfY === null) {
@@ -805,7 +954,7 @@ trait MpdfDraw
             $this->mpdfSegment = $this->mpdfCanvas->open_object();
             $this->mpdfSegments[$marker] = $this->mpdfSegment;
         }
-        $this->renderedPdf = null;
+        $this->renderedPdf = null; // drawing does not move the content: PageNo() keeps its layout
         return $this->mpdfCanvas;
     }
 
@@ -891,7 +1040,7 @@ trait MpdfDraw
             $tx = $a === 'R' ? $x * $k + $w * $k - $pad - $tw : ($a === 'C' ? $x * $k + ($w * $k - $tw) / 2 : $x * $k + $pad);
             [$asc, $desc] = $metrics->ascentDescent($font, $size);
             $ty = $y * $k + ($h * $k - ($asc + $desc)) / 2; // vertically centred, as mPDF's valign 'M'
-            $c->text($tx, $ty - $desc, $txt, $font, $size, $this->mpdfPen['text']);
+            $c->text($tx, $ty + $asc - $metrics->getFontBaseline($font, $size), $txt, $font, $size, $this->mpdfPen['text']); // baseline at $ty + ascent
         }
         if ($link !== '' && $link !== 0) {
             $c->add_link(is_int($link) ? '#ivo-mlink-' . $link : $link, $x * $k, $y * $k, $w * $k, $h * $k);

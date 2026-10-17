@@ -12,22 +12,77 @@ use IvoPdf\Options;
  * 'spot' => name, 'tint' => float and 'cmyk' => alternate [c, m, y, k] at full tint.
  *
  * The output target ('rgb' or 'cmyk', see Options::colorSpace / PDF/X) decides whether RGB colors are converted;
- * CMYK and spot colors always keep their model. When transparency is forbidden (PDF/X-1a, X-3) translucent
- * colors are flattened against a white page.
+ * CMYK and spot colors keep their model, except in PDF/A with the sRGB output intent: a device CMYK colour needs a
+ * CMYK output intent there (ISO 19005-1 6.2.3.3, 19005-2/3 6.2.4.3), so CMYK and spot colors are written as their RGB
+ * equivalent (mPDF's PDFAauto does the same) and a warning tells. With a CMYK ICC output profile (Options::$pdfaIccProfile)
+ * PDF/A output is CMYK instead (every RGB color converted, like colorSpace = 'cmyk'). When transparency is forbidden
+ * (PDF/X-1a, X-3) translucent colors are flattened against a white page.
  */
 final class ColorOps
 {
     private static bool $cmykTarget = false;
     private static bool $flatten = false;
+    /** PDF/A with the sRGB output intent: no device CMYK at all */
+    private static bool $rgbOnly = false;
+    /** a CMYK / spot color or image was written as RGB because of $rgbOnly */
+    private static bool $downgraded = false;
+    /** @var list<string> */
+    private static array $notes = [];
     private static ?ColorConverter $converter = null;
 
-    /** Applies the colorSpace / pdfx options (and loads the spot color registry); validates option combinations. */
+    /** Applies the colorSpace / pdfx / pdfa options (and loads the spot color registry); validates option combinations. */
     public static function configure(Options $options): void
     {
         PdfX::validate($options);
         self::$cmykTarget = PdfX::forcesCmyk($options);
         self::$flatten = PdfX::forbidsTransparency($options);
+        self::$rgbOnly = false;
+        self::$notes = [];
+        $pdfa = PdfFinisher::parsePdfa($options->pdfa);
+        if ($pdfa !== null && PdfX::level($options) === '') {
+            if (PdfAIntent::profile($options, $pdfa['part']) !== null) {
+                self::$cmykTarget = true; // CMYK output intent: everything is written in CMYK
+            } else {
+                if (self::$cmykTarget) {
+                    self::$notes[] = "PDF/A: colorSpace 'cmyk' needs a CMYK output intent; without a CMYK ICC profile (Options::\$pdfaIccProfile, mPDF 'ICCProfile') the document is written in RGB for the sRGB output intent.";
+                }
+                self::$cmykTarget = false;
+                self::$rgbOnly = true;
+            }
+        }
         SpotColors::load($options->spotColors);
+    }
+
+    /** Starts a render: forgets the conversions of the previous one (configure() runs again while compiling). */
+    public static function startRender(): void
+    {
+        self::$downgraded = false;
+    }
+
+    /** True in PDF/A with the sRGB output intent (CMYK / spot colors and CMYK images are written as RGB). */
+    public static function isRgbOnly(): bool
+    {
+        return self::$rgbOnly;
+    }
+
+    /** @internal records that a CMYK color / image was written as RGB (PDF/A with the sRGB output intent) */
+    public static function noteDowngrade(): void
+    {
+        self::$downgraded = true;
+    }
+
+    /**
+     * Warnings about the color conversions of the current render (configuration notes, CMYK written as RGB).
+     *
+     * @return list<string>
+     */
+    public static function warnings(): array
+    {
+        $out = self::$notes;
+        if (self::$downgraded) {
+            $out[] = 'PDF/A: CMYK / spot colors and CMYK images were converted to RGB (the output intent is sRGB; a device CMYK color would make the file non-conforming). Give a CMYK ICC profile (Options::$pdfaIccProfile, mPDF "ICCProfile") to keep CMYK.';
+        }
+        return $out;
     }
 
     public static function setConverter(?ColorConverter $converter): void
@@ -72,6 +127,12 @@ final class ColorOps
     {
         $c = self::flatten($c);
         $cs = $c['cs'] ?? 'rgb';
+        if (self::$rgbOnly) {
+            if ($cs !== 'rgb') {
+                self::$downgraded = true; // [0..2] hold the RGB equivalent of a CMYK / spot color
+            }
+            return sprintf('%.3F %.3F %.3F %s', $c[0], $c[1], $c[2], $stroke ? 'RG' : 'rg');
+        }
         if ($cs === 'spot' && $allowSpot && is_string($c['spot'] ?? null)) {
             $def = SpotColors::get($c['spot']);
             if ($def !== null) {
@@ -154,6 +215,14 @@ final class ColorOps
     {
         if (self::$cmykTarget) {
             return 'DeviceCMYK';
+        }
+        if (self::$rgbOnly) {
+            foreach ($stops as $s) {
+                if (($s['color']['cs'] ?? 'rgb') !== 'rgb') {
+                    self::$downgraded = true;
+                }
+            }
+            return 'DeviceRGB';
         }
         foreach ($stops as $s) {
             if (($s['color']['cs'] ?? 'rgb') === 'rgb') {

@@ -106,6 +106,12 @@ class Options
 
     /** PDF/A conformance: '' (off), '1b' (produced as 2b), '2b' or '3b'; `true` means '2b'. Incompatible with encryption. */
     public string $pdfa = '';
+    /**
+     * Optional CMYK ICC output profile file for the PDF/A OutputIntent (mPDF 'ICCProfile'): the document is then written
+     * in CMYK. Without it the intent is sRGB and CMYK / spot colors are converted to RGB (with a warning), because a
+     * device CMYK color needs a CMYK output intent in PDF/A. PDF/A-1 needs an ICC version 2 profile.
+     */
+    public string $pdfaIccProfile = '';
 
     /** PDF/X conformance: '' (off), 'X-1a' (also `true`), 'X-3' or 'X-4'. X-1a/X-3 convert everything to CMYK and flatten transparency; incompatible with pdfa, encryption and signatures. */
     public string $pdfx = '';
@@ -250,6 +256,7 @@ class Options
         $out = [];
         $margins = [];
         $compat = [];
+        $icc = '';
         foreach ($settings as $key => $value) {
             if (\IvoPdf\Compat\MpdfConfig::captures((string) $key, $value)) {
                 $compat[$key] = $value; // mPDF-only keys: kept in Options::$compat
@@ -295,11 +302,19 @@ class Options
                 case 'enable_remote':
                     $out['isRemoteEnabled'] = (bool) $value;
                     break;
-                case 'PDFA': // mPDF
-                    $out['pdfa'] = $value;
+                case 'PDFA': // mPDF: true means its PDFAversion, '1-B' by default (native `pdfa => true` stays 2b)
+                    $out['pdfa'] = $value === true ? self::mpdfPdfaVersion($settings['PDFAversion'] ?? '1-B') : $value;
+                    break;
+                case 'PDFAversion': // mPDF: '1-B', '2-B', '3-B'; only applies with PDFA => true
+                    if (($settings['PDFA'] ?? false) === true) {
+                        $out['pdfa'] = self::mpdfPdfaVersion($value);
+                    }
                     break;
                 case 'PDFX': // mPDF
                     $out['pdfx'] = $value;
+                    break;
+                case 'ICCProfile': // mPDF: the output profile of PDF/A (or PDF/X)
+                    $icc = is_string($value) ? $value : '';
                     break;
                 case 'restrictColorSpace': // mPDF: 3 = CMYK, 2 = RGB
                     $out['colorSpace'] = (int) $value === 3 ? 'cmyk' : 'rgb';
@@ -325,6 +340,9 @@ class Options
         }
         if (!empty($margins)) {
             $out['margins'] = array_merge(is_array($out['margins'] ?? null) ? $out['margins'] : [], $margins);
+        }
+        if ($icc !== '') {
+            $out[!empty($out['pdfx']) && empty($out['pdfa']) ? 'pdfxIccProfile' : 'pdfaIccProfile'] = $icc;
         }
         if ($compat !== []) {
             $out['compat'] = \IvoPdf\Compat\MpdfConfig::normalize($compat);
@@ -371,6 +389,32 @@ class Options
     public function clearWarnings(): void
     {
         $this->warnings = $this->stickyWarnings;
+    }
+
+    /**
+     * @internal Puts back the warnings of an earlier moment (a measuring layout pass must not change what
+     * getWarnings() reports).
+     *
+     * @param list<string> $warnings
+     */
+    public function restoreWarnings(array $warnings): void
+    {
+        $this->warnings = $warnings;
+    }
+
+    /**
+     * @internal A fingerprint of every setting (warnings excluded), or null when a setting cannot be serialized
+     * (a closure in `compat`). Equal fingerprints mean the same layout for the same HTML.
+     */
+    public function fingerprint(): ?string
+    {
+        $vars = get_object_vars($this);
+        unset($vars['warnings'], $vars['stickyWarnings']);
+        try {
+            return md5(serialize($vars));
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /** @var list<string> warnings about the configuration (e.g. a missing mPDF fontdata file) that every render reports again */
@@ -461,6 +505,13 @@ class Options
             return 'https:' . $trimmed;
         }
         return $src;
+    }
+
+    /** mPDF PDFAversion ('1-B', '3-B', …) -> IvoPDF pdfa level ('1b', '3b', …) */
+    private static function mpdfPdfaVersion(mixed $version): string
+    {
+        $v = strtolower(str_replace(['-', ' '], '', (string) $version));
+        return in_array($v, ['1b', '2b', '3b'], true) ? $v : '1b';
     }
 
     private static function shortPath(string $path): string

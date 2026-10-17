@@ -957,7 +957,11 @@ class PdfDocument
     private function buildImageObject(array $imgData): int
     {
         if (ColorOps::isCmykTarget() || ColorOps::isFlattening()) {
-            $imgData = ImageCmykConverter::convert($imgData, $this->options, ColorOps::isCmykTarget(), ColorOps::isFlattening());
+            // PDF/A-1 has no soft masks either: with a CMYK intent the alpha is composited onto white before the conversion
+            $flattenImage = ColorOps::isFlattening() || (PdfFinisher::parsePdfa($this->options->pdfa)['part'] ?? 0) === 1;
+            $imgData = ImageCmykConverter::convert($imgData, $this->options, ColorOps::isCmykTarget(), $flattenImage);
+        } elseif (ColorOps::isRgbOnly() && ($imgData['colorSpace'] ?? '') === 'DeviceCMYK') {
+            $imgData = ImageCmykConverter::cmykToRgb($imgData, $this->options); // PDF/A with the sRGB output intent
         }
         $smaskRef = '';
         if (!empty($imgData['smask'])) {

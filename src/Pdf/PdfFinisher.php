@@ -199,17 +199,22 @@ final class PdfFinisher
     {
         $opt = $this->options;
 
-        $icc = IccProfile::srgb();
+        // sRGB, or the CMYK output profile of Options::$pdfaIccProfile (then every color is CMYK, see ColorOps)
+        $cmykIcc = PdfAIntent::profile($opt, $pdfa['part']);
+        $icc = $cmykIcc ?? IccProfile::srgb();
+        $n = $cmykIcc !== null ? 4 : 3;
         $iccId = ++$counter;
         if ($opt->compress) {
             $z = (string) gzcompress($icc, 6);
-            $objects[$iccId] = sprintf("<< /N 3 /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream", strlen($z), $z);
+            $objects[$iccId] = sprintf("<< /N %d /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream", $n, strlen($z), $z);
         } else {
-            $objects[$iccId] = sprintf("<< /N 3 /Length %d >>\nstream\n%s\nendstream", strlen($icc), $icc);
+            $objects[$iccId] = sprintf("<< /N %d /Length %d >>\nstream\n%s\nendstream", $n, strlen($icc), $icc);
         }
 
         $intentId = ++$counter;
-        $objects[$intentId] = "<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (sRGB IEC61966-2.1) /RegistryName (http://www.color.org) /Info (sRGB IEC61966-2.1) /DestOutputProfile {$iccId} 0 R >>";
+        $objects[$intentId] = $cmykIcc !== null
+            ? '<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (Custom) /Info ' . self::pdfText(PdfAIntent::info($opt)) . " /DestOutputProfile {$iccId} 0 R >>"
+            : "<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (sRGB IEC61966-2.1) /RegistryName (http://www.color.org) /Info (sRGB IEC61966-2.1) /DestOutputProfile {$iccId} 0 R >>";
 
         $xmp = $this->buildXmp($pdfa, $timestamp);
         $metaId = ++$counter;
