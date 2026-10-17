@@ -40,9 +40,9 @@ final class DirAttribute
     {
         if (($tag === 'ul' || $tag === 'ol' || $tag === 'menu')
             && strtolower(trim($style->get('direction', 'ltr'))) === 'rtl'
-            && trim($style->get('padding-left', '0')) === '16pt'
+            && trim($style->get('padding-left', '0')) === '30pt'
             && in_array(trim($style->get('padding-right', '0')), ['0', '0pt', '0px', ''], true)) {
-            $style->set('padding-right', '16pt');
+            $style->set('padding-right', '30pt');
             $style->set('padding-left', '0');
         }
     }

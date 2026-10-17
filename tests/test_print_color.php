@@ -125,7 +125,7 @@ $html = '<div style="background:cmyk(0 100% 100% 0);width:200px;height:100px"></
 check('background emits "0 1 1 0 k"', str_contains($bytes, '0.000 1.000 1.000 0.000 k'));
 check('text color emits "1 0 0 0 k"', str_contains($bytes, '1.000 0.000 0.000 0.000 k'));
 check('border emits a CMYK yellow fill', str_contains($bytes, '0.000 0.000 1.000 0.000 k'));
-$px = pixel($bytes, 40, 40);
+$px = pixel($bytes, 50, 50); // inside the box (page margin 36pt + body margin 6pt)
 check('PyMuPDF renders the cmyk() box red', $px === null || ($px[0] > 200 && $px[1] < 90 && $px[2] < 90), $px ? implode(',', $px) : 'python/fitz unavailable (skipped)');
 [$plain] = make('<p style="color:#ff0000">x</p>');
 check('plain RGB documents are unchanged (rg, no OutputIntent)', str_contains($plain, ' rg') && !str_contains($plain, 'OutputIntent') && str_starts_with($plain, '%PDF-1.7'));
@@ -145,7 +145,7 @@ check('tint transform is a FunctionType 2 from 0 to the CMYK alternate', str_con
 check('registered in the shared /ColorSpace resources', preg_match('~/ColorSpace << /Sp1 \[/Separation~', $bytes) === 1);
 check('text uses "/Sp1 cs 1 scn"', str_contains($bytes, '/Sp1 cs 1.000 scn'));
 check('50% tint', str_contains($bytes, '/Sp1 cs 0.500 scn'));
-$px = pixel($bytes, 40, 100);
+$px = pixel($bytes, 50, 100);
 check('PyMuPDF renders the 50% tint box in a light red', $px === null || ($px[0] > 200 && $px[1] > 80 && $px[1] < 200 && $px[2] < 200), $px ? implode(',', $px) : 'skipped');
 [$unknown] = make('<p style="color:spot(NOPE, 100%)">x</p>');
 check('unknown spot name is ignored (no Separation)', !str_contains($unknown, '/Separation'));

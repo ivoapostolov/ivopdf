@@ -14,6 +14,7 @@ class Paginator
 {
     private float $topMargin;
     private float $printableHeight;
+    private bool $firstPageLeft = false;
 
     /** Per-page geometry (null = uniform pages): fn(pageIndex, pageName): printable height */
     private ?\Closure $heightFn = null;
@@ -111,6 +112,9 @@ class Paginator
     /**
      * Named pages (`page: name`): a box whose page name differs from the page it would start on begins a new page.
      */
+    /** Box that enforcePageName() just moved to the top of a new page: its own break-before is already satisfied */
+    private ?LayoutBox $brokenForPageName = null;
+
     private function enforcePageName(LayoutBox $box, ?string $required): void
     {
         $k = $this->getPageIndexForY($box->y);
@@ -118,14 +122,15 @@ class Paginator
             return;
         }
         [$pageTop, $pageBottom] = $this->getPageBounds($k);
-        if ($box->y - max(0.0, $box->marginTop) <= $pageTop + 1.0) {
+        if ($box->y - $this->leadingSpace($box) <= $pageTop + 1.0) {
             if ($k > 0) {
                 $this->setPageName($k, $required);
             }
             return;
         }
-        $this->pushBoxAndFollowing($box, $pageBottom - $box->y);
+        $this->pushBoxAndFollowing($box, $this->forcedBreakDelta($box, $pageBottom));
         $this->setPageName($k + 1, $required);
+        $this->brokenForPageName = $box;
     }
 
     /**
@@ -186,12 +191,13 @@ class Paginator
 
         // Handle explicit page-break-before: always
         $breakBefore = strtolower(trim($box->style->get('page-break-before', 'auto')));
-        $beforeSide = self::breakSide($breakBefore);
+        $beforeSide = $this->breakSide($breakBefore);
         if ($breakBefore === 'always' || $breakBefore === 'page' || $beforeSide !== null) {
             $curPage = $this->getPageIndexForY($box->y);
             [$pageTop, $pageBottom] = $this->getPageBounds($curPage);
-            // A box that merely carries its top margin below the page top is already at the start of the page
-            if ($box->y - max(0.0, $box->marginTop) > $pageTop + 1.0) {
+            // A box that merely carries its top margin below the page top is already at the start of the page,
+            // and so is one that a page-name change (mPDF <pagebreak orientation>) has just moved to a new page
+            if ($this->brokenForPageName !== $box && $box->y - $this->leadingSpace($box) > $pageTop + 1.0) {
                 $target = $curPage + 1;
             } else {
                 $target = $curPage;
@@ -201,7 +207,7 @@ class Paginator
                 $target++;
             }
             if ($target !== $curPage) {
-                $this->pushBoxAndFollowing($box, $this->getPageBounds($target)[0] - $box->y);
+                $this->pushBoxAndFollowing($box, $this->forcedBreakDelta($box, $this->getPageBounds($target)[0]));
             }
         }
 
@@ -251,9 +257,10 @@ class Paginator
                 $startPage = $this->getPageIndexForY($line->y);
                 [$pageTop, $pageBottom] = $this->getPageBounds($startPage);
 
-                if ($line->y + $line->height > $pageBottom + 0.5 && $line->y > $pageTop + 0.5) {
+                $forced = $line->forceBreak && $line->y > $pageTop + 0.5;
+                if (($forced || $line->y + $line->height > $pageBottom + 0.5) && $line->y > $pageTop + 0.5) {
                     // Avoid a single orphan line left at the bottom of the previous page
-                    if ($i === 1 && $count > 2 && $box->lines[0]->y > $pageTop + 0.5 && $this->getPageIndexForY($box->lines[0]->y) === $startPage) {
+                    if (!$forced && $i === 1 && $count > 2 && $box->lines[0]->y > $pageTop + 0.5 && $this->getPageIndexForY($box->lines[0]->y) === $startPage) {
                         $i = 0;
                         $line = $box->lines[0];
                     }
@@ -289,7 +296,7 @@ class Paginator
 
         // Handle explicit page-break-after: always
         $breakAfter = strtolower(trim($box->style->get('page-break-after', 'auto')));
-        $afterSide = self::breakSide($breakAfter);
+        $afterSide = $this->breakSide($breakAfter);
         if ($afterSide !== null) {
             // The following content starts on the next page of the requested side (an empty page is skipped over if needed)
             $bottomY = $box->y + $box->height;
@@ -310,16 +317,82 @@ class Paginator
     }
 
     /**
+     * Shift that moves $box to the top of a page starting at $pageTop after a forced break. Unlike at an
+     * unforced break, the margin after a forced break is kept (as browsers do): the box's own top margin, or for
+     * an empty break carrier (`<div style="page-break-before:always"></div>`) the top margin of the next box.
+     */
+    private function forcedBreakDelta(LayoutBox $box, float $pageTop): float
+    {
+        if ($this->isEmptyBreakCarrier($box)) {
+            $next = $this->nextInFlowSibling($box);
+            if ($next !== null && $this->syncedY($next) >= $box->y - 0.01) {
+                return max(0.0, $pageTop + max(0.0, $next->marginTop, $next->collapsedMarginTop) - $next->y);
+            }
+        }
+        return $pageTop + max(0.0, $box->marginTop, $box->collapsedMarginTop) - $box->y;
+    }
+
+    /** Current y of a box that may still owe a lazy shift (see pushBoxAndFollowing()). */
+    private function syncedY(LayoutBox $box): float
+    {
+        $this->sync($box);
+        return $box->y;
+    }
+
+    /** An empty block (`<div style="page-break-before:always"></div>`, mPDF <pagebreak>): no content, no edges. */
+    private function isEmptyBreakCarrier(LayoutBox $box): bool
+    {
+        return $box->height <= 0.01 && $box->lines === [] && $box->paddingTop + $box->borderTop <= 0.0;
+    }
+
+    /**
+     * Space above a box that holds no content: its top margin plus, while it is the first in-flow child, the
+     * margins, borders and padding of its ancestors (a forced break there is a break before the ancestor).
+     */
+    private function leadingSpace(LayoutBox $box): float
+    {
+        $space = max(0.0, $box->marginTop, $box->collapsedMarginTop); // margins escaped from its first child collapse into it
+        if ($this->isEmptyBreakCarrier($box) && ($next = $this->nextInFlowSibling($box)) !== null && $this->syncedY($next) - $box->y < 0.5) {
+            // the next box's top margin collapsed through this empty box and lies above it
+            $space = max($space, $next->marginTop, $next->collapsedMarginTop);
+        }
+        $cur = $box;
+        for ($parent = $box->parent; $parent !== null; $cur = $parent, $parent = $parent->parent) {
+            $first = null;
+            foreach ($parent->children as $c) {
+                if ($c->isPositionedOutOfFlow() || ($c->isTextNode() && trim((string) $c->textContent) === '')) {
+                    continue;
+                }
+                $first = $c;
+                break;
+            }
+            if ($first !== $cur || $parent->lines !== []) {
+                break;
+            }
+            $space += $parent->paddingTop + $parent->borderTop + max(0.0, $parent->marginTop, $parent->collapsedMarginTop);
+        }
+        return $space;
+    }
+
+    /**
      * Page side demanded by a `left` / `right` / `recto` / `verso` forced break: 1 = left page (odd 0-based index),
      * 0 = right page, null = not a side break. Page 1 is a right (recto) page.
      */
-    private static function breakSide(string $value): ?int
+    private function breakSide(string $value): ?int
     {
-        return match ($value) {
+        $side = match ($value) {
             'left', 'verso' => 1,
             'right', 'recto' => 0,
             default => null,
         };
+        // Right-to-left page progression: page 1 is a left page, so the parities swap
+        return $side !== null && $this->firstPageLeft ? 1 - $side : $side;
+    }
+
+    /** Page 1 is a left page (root element direction rtl): `left`/`verso` fall on even indexes, `right`/`recto` on odd ones */
+    public function setFirstPageLeft(bool $left): void
+    {
+        $this->firstPageLeft = $left;
     }
 
     /**
@@ -359,15 +432,19 @@ class Paginator
         // TableLayout places <tfoot> visually last wherever it is written: paginate in that same order
         $footGroups = [];
         $otherChildren = [];
+        $bottomCaptions = [];
         foreach ($table->children as $child) {
             if ($child->tagName === 'tfoot' || $child->getDisplay() === 'table-footer-group') {
                 $footGroups[] = $child;
+            } elseif (($child->tagName === 'caption' || $child->getDisplay() === 'table-caption')
+                && strtolower(trim($child->style->get('caption-side', 'top'))) === 'bottom') {
+                $bottomCaptions[] = $child; // caption-side: bottom follows the last row (and the footer) across page breaks
             } else {
                 $otherChildren[] = $child;
             }
         }
-        if ($footGroups !== []) {
-            $table->children = array_merge($otherChildren, $footGroups);
+        if ($footGroups !== [] || $bottomCaptions !== []) {
+            $table->children = array_merge($otherChildren, $footGroups, $bottomCaptions);
         }
 
         foreach ($table->children as $child) {
@@ -399,6 +476,23 @@ class Paginator
         $footReserve = $canRepeatTfoot ? $tfoot->height : 0.0;
         if (!$canRepeatTfoot) {
             array_push($rows, ...$footRows);
+        }
+
+        // A header that does not fit at the bottom of the page, or would stay there without any body row below it,
+        // moves to the next page together with the whole table (browsers never leave an orphaned header)
+        if ($thead !== null && $thead->height > 0.5 && $thead->height < $this->printableHeight * 0.35) {
+            $this->sync($thead);
+            $startPage = $this->getPageIndexForY($table->y);
+            [$tPageTop, $tPageBottom] = $this->getPageBounds($startPage);
+            $firstRow = $rows[0] ?? null;
+            if ($firstRow !== null) {
+                $this->sync($firstRow);
+            }
+            $headBottom = $thead->y + $thead->height;
+            $needBottom = $firstRow !== null && $firstRow->height < $this->printableHeight * 0.5 ? $firstRow->y + $firstRow->height : $headBottom;
+            if ($table->y > $tPageTop + 1.0 && max($headBottom, $needBottom) > $tPageBottom - $footReserve + 0.5) {
+                $this->pushBoxAndFollowing($table, $this->getPageBounds($startPage + 1)[0] - $table->y);
+            }
         }
 
         $tableStartPage = $this->getPageIndexForY($table->y);
@@ -477,7 +571,7 @@ class Paginator
 
         // Handle explicit page-break-after on the table itself
         $breakAfter = strtolower(trim($table->style->get('page-break-after', 'auto')));
-        $afterSide = self::breakSide($breakAfter);
+        $afterSide = $this->breakSide($breakAfter);
         if ($afterSide !== null) {
             $bottomY = $table->y + $table->height;
             $target = $this->getPageIndexForY(max($this->topMargin, $bottomY - 0.5)) + 1;
@@ -740,6 +834,11 @@ class Paginator
         }
 
         $max = $box->y + $box->height;
+        if ($box === $this->root && $box->paddingBottom <= 0.0 && $box->borderBottom <= 0.0
+            && in_array(strtolower(trim($box->style->get('height', 'auto'))), ['auto', ''], true)) {
+            // The body's height ends with its last child's bottom margin: a trailing margin does not start a page
+            $max = $box->y;
+        }
         foreach ($box->lines as $line) {
             $b = $line->y + $line->height;
             if ($b > $max) {

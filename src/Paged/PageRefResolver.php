@@ -154,6 +154,10 @@ final class PageRefResolver
         if ($lastLeader >= 0) {
             $leader = $runs[$lastLeader];
             $containerRight = $owner->getContentX() + $owner->getContentWidth();
+            if ($leader->style->has('ivo-leader-outdent')) {
+                // mPDF <dottab outdent>: the tab stop (end of the tail text) is that far left of the right edge
+                $containerRight -= max(0.0, (float) $leader->style->get('ivo-leader-outdent'));
+            }
             $tailEnd = $leader->x + $leader->width;
             for ($i = $lastLeader + 1; $i < $n; $i++) {
                 $tailEnd = max($tailEnd, $runs[$i]->x + $runs[$i]->width + $runs[$i]->paddingRight);

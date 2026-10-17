@@ -30,6 +30,9 @@ trait MpdfApi
     private string $mpdfHeadCss = '';
     /** @var array<string, string> */
     private array $mpdfBodyCss = [];
+
+    /** Whether the document came through WriteHTML() (mPDF defaults) rather than loadHtml() (browser defaults) */
+    private bool $mpdfWritten = false;
     private string $mpdfZoom = '';
     private string $mpdfLayout = '';
     private string $mpdfJs = '';
@@ -59,9 +62,15 @@ trait MpdfApi
     {
         $this->mpdfMem = ['ix' => [], 'blank' => []];
         $this->footnoteMem = [];
+        $this->footnoteState = ['push' => [], 'floor' => [], 'ratchet' => false, 'freeze' => false, 'changed' => false, 'last' => false, 'memo' => []];
         $savedWm = [$this->options->watermarkText, $this->options->watermarkOpacity];
         try {
-            for ($pass = 0; $pass < 5; $pass++) {
+            // CSS footnotes may need more passes to settle; from the ninth on every page keeps the largest room it has needed, from the thirteenth on pushed calls stay pushed
+            for ($pass = 0; $pass < 24; $pass++) {
+                $this->footnoteState['ratchet'] = $pass >= 8;
+                $this->footnoteState['freeze'] = $pass >= 12;
+                $this->footnoteState['changed'] = false;
+                $this->footnoteState['last'] = $pass === 23;
                 $this->renderCore();
                 $again = false;
                 $next = $this->mpdfNextMem;
@@ -70,7 +79,7 @@ trait MpdfApi
                     $again = true;
                 }
                 // CSS footnotes: the pages of the calls decide how much room every page reserves
-                if ($this->footnoteNext !== null && $this->footnoteNext != $this->footnoteMem) {
+                if ($this->footnoteNext !== null && ($this->footnoteNext != $this->footnoteMem || $this->footnoteState['changed'])) {
                     $this->footnoteMem = $this->footnoteNext;
                     $again = true;
                 }
@@ -108,7 +117,8 @@ trait MpdfApi
         $out = MpdfTags::transform($html, $state, $this->mpdfMem);
         $this->mpdfState = $state;
 
-        $css = '';
+        // Documents written through the mPDF API get mPDF's default body margin, 0 (browsers and dompdf: 8px)
+        $css = $this->mpdfWritten ? 'body{margin:0}' : '';
         $body = $this->mpdfBodyCss;
         if ($this->mpdfRtl) {
             $body['direction'] = 'rtl';
@@ -330,6 +340,7 @@ trait MpdfApi
      */
     private function mpdfWriteHtml(string $html, int $mode): self
     {
+        $this->mpdfWritten = true;
         if ($mode === 1) {
             $css = (string) preg_replace('~</?style\b[^>]*>~i', '', $html);
             $this->mpdfHeadCss .= $css . "\n";

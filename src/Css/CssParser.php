@@ -52,13 +52,23 @@ class CssParser
 
     /** @var \WeakMap<ComputedStyle, array<string, ComputedStyle>>|null Per parent style: computed style prototypes of its children by tag + attributes */
     private ?\WeakMap $styleMemo = null;
+    /** @var \WeakMap<object, array<string, ComputedStyle>>|null Like $styleMemo, keyed by ComputedStyle::shareToken(): cousins (same ancestors' tags + attributes) share their children's prototypes */
+    private ?\WeakMap $tokenMemo = null;
     private int $styleMemoRules = -1;
-    /** @var array<int, bool> rule order => the rule's outcome does not depend on the subject's sibling position */
+    private ?bool $positionRules = null;
+    /** @var array<int, int> rule order => 2: the outcome depends on neither the position of the subject nor of its ancestors, 1: not on the subject's sibling position, 0: it may */
     private array $positionFreeRules = [];
 
     /** Media viewport (the printable page area) used to evaluate width/height/orientation media features */
     private float $mediaWidthPt = 523.28;
     private float $mediaHeightPt = 769.89;
+
+    /**
+     * Elements whose computed style objects may be shared between boxes (only TableShrink changes them later, on
+     * copies): 2 = always, 1 = only while no rule depends on the position of an element (a shared row style stands for
+     * rows at different positions, so cell styles cached per parent style object would leak from row to row).
+     */
+    private const SHARED_STYLE_TAGS = ['td' => 2, 'th' => 2, 'tr' => 1, 'thead' => 1, 'tbody' => 1, 'tfoot' => 1];
 
     private const NEVER_MATCHING_PSEUDOS = [
         'hover', 'focus', 'focus-within', 'focus-visible', 'active', 'visited', 'target', 'placeholder-shown',
@@ -501,6 +511,8 @@ class CssParser
         } else {
             if ($this->styleMemoRules !== count($this->rules)) {
                 $this->styleMemo = new \WeakMap();
+                $this->positionRules = null;
+                $this->tokenMemo = new \WeakMap();
                 $this->styleMemoRules = count($this->rules);
             }
             $memoKey = $tag;
@@ -509,9 +521,10 @@ class CssParser
                     $memoKey .= "\0" . $attr->nodeName . "\1" . $attr->nodeValue;
                 }
             }
-            $hit = ($this->styleMemo[$parentStyle] ?? [])[$memoKey] ?? null;
+            $hit = ($this->tokenMemo[$parentStyle->shareToken()] ?? [])[$memoKey] ?? ($this->styleMemo[$parentStyle] ?? [])[$memoKey] ?? null;
             if ($hit !== null) {
-                return clone $hit;
+                // Table parts hand out the cached (shared, read-only) style itself: 10 000 identical cells keep one style
+                return $hit->isShared() ? $hit : clone $hit;
             }
         }
 
@@ -570,49 +583,97 @@ class CssParser
 
         \IvoPdf\Text\DirAttribute::finish($style, $tag);
 
-        if ($memoKey !== null && $this->rulesIgnorePosition($el)) {
-            $entries = $this->styleMemo[$parentStyle] ?? [];
-            if (count($entries) < 256) {
-                $entries[$memoKey] = clone $style;
-                $this->styleMemo[$parentStyle] = $entries;
+        if ($memoKey !== null) {
+            $freedom = $this->positionFreedom($el);
+            if ($freedom === 2) {
+                // Position-free through the whole ancestor chain: every element with the same ancestor tags and
+                // attributes (not just the siblings) gets this style, so the entries hang off the parent's share token
+                $style->shareToken();
+                $memo = $this->tokenMemo;
+                $memoParent = $parentStyle->shareToken();
+            } else {
+                $memo = $freedom === 1 ? $this->styleMemo : null;
+                $memoParent = $parentStyle;
+            }
+            if ($memo !== null) {
+                $entries = $memo[$memoParent] ?? [];
+                if (count($entries) < 256) {
+                    $proto = clone $style;
+                    $entries[$memoKey] = $proto;
+                    $memo[$memoParent] = $entries;
+                    if (($sharing = self::SHARED_STYLE_TAGS[$tag] ?? 0) === 2 || ($sharing === 1 && !$this->hasPositionRules())) {
+                        return $proto->share(); // the first cell already uses the shared object
+                    }
+                }
             }
         }
 
         return $style;
     }
 
-    /**
-     * True when no rule that can apply to $el depends on the element's position among its siblings (sibling
-     * combinators, structural pseudo-classes on the subject), i.e. identical siblings always get identical styles.
-     */
-    private function rulesIgnorePosition(DOMElement $el): bool
+    /** Whether any rule of the stylesheet depends on the position of an element (sibling combinators, structural pseudo-classes). */
+    private function hasPositionRules(): bool
     {
-        foreach ($this->candidateRules($el) as $rule) {
-            $order = $rule['order'];
-            if (!isset($this->positionFreeRules[$order])) {
-                $free = true;
-                foreach ($rule['compiled'] as $i => $part) {
-                    if ($i % 2 === 1) {
-                        if ($part === '+' || $part === '~') {
-                            $free = false;
-                            break;
-                        }
-                    } elseif ($i === count($rule['compiled']) - 1) {
-                        foreach ($part['pseudos'] as [$name]) {
-                            if (!in_array($name, self::NEVER_MATCHING_PSEUDOS, true)) {
-                                $free = false;
+        if ($this->positionRules === null) {
+            $this->positionRules = false;
+            foreach ($this->rules as $rule) {
+                if ($this->ruleFreedom($rule) < 2) {
+                    $this->positionRules = true;
+                    break;
+                }
+            }
+        }
+        return $this->positionRules;
+    }
+
+    /**
+     * @param array<string, mixed> $rule
+     */
+    private function ruleFreedom(array $rule): int
+    {
+        $order = $rule['order'];
+        if (!isset($this->positionFreeRules[$order])) {
+            $count = count($rule['compiled']);
+            $freedom = 2;
+            foreach ($rule['compiled'] as $i => $part) {
+                if ($i % 2 === 1) {
+                    if ($part === '+' || $part === '~') {
+                        $freedom = 0;
+                        break;
+                    }
+                } else {
+                    foreach ($part['pseudos'] as [$name]) {
+                        if (!in_array($name, self::NEVER_MATCHING_PSEUDOS, true)) {
+                            if ($i === $count - 1) {
+                                $freedom = 0;
                                 break 2;
                             }
+                            $freedom = 1;
                         }
                     }
                 }
-                $this->positionFreeRules[$order] = $free;
             }
-            if (!$this->positionFreeRules[$order]) {
-                return false;
+            $this->positionFreeRules[$order] = $freedom;
+        }
+        return $this->positionFreeRules[$order];
+    }
+
+    /**
+     * 2 when no rule that can apply to $el depends on the position of the element or of one of its ancestors among
+     * their siblings (sibling combinators, structural pseudo-classes anywhere in the selector): elements with the same
+     * ancestor tags and attributes always get identical styles. 1 when only the element's own sibling position is
+     * irrelevant (identical siblings get identical styles). 0 otherwise.
+     */
+    private function positionFreedom(DOMElement $el): int
+    {
+        $level = 2;
+        foreach ($this->candidateRules($el) as $rule) {
+            $level = min($level, $this->ruleFreedom($rule));
+            if ($level === 0) {
+                return 0;
             }
         }
-        return true;
+        return $level;
     }
 
     /**
@@ -830,13 +891,12 @@ class CssParser
                 $b = trim($el->getAttribute('border'));
                 if ($b !== '' && $b !== '0') {
                     $bw = is_numeric($b) ? "{$b}px" : $b;
-                    $style->set('border', "{$bw} solid #cbd5e1");
+                    $style->set('border', "{$bw} outset gray"); // browsers / dompdf: table[border] { border: Npx outset gray }
                 }
             }
             if ($el->hasAttribute('cellspacing')) {
                 $cs = trim($el->getAttribute('cellspacing'));
-                if ($cs !== '' && $cs !== '0') {
-                    $style->set('border-collapse', 'separate');
+                if ($cs !== '') {
                     $style->set('border-spacing', is_numeric($cs) ? "{$cs}px" : $cs);
                 }
             }
@@ -853,7 +913,7 @@ class CssParser
             if ($parentTable !== null && $parentTable->hasAttribute('border')) {
                 $b = trim($parentTable->getAttribute('border'));
                 if ($b !== '' && $b !== '0') {
-                    $style->set('border', '1px solid #cbd5e1');
+                    $style->set('border', '1px inset gray'); // cells of a table[border]
                 }
             }
             if ($el->hasAttribute('nowrap')) {
@@ -1310,6 +1370,9 @@ class CssParser
                 return !$el->hasAttribute('required');
             case 'lang':
                 return $this->matchesLang($el, strtolower(trim($arg, " \t'\"")));
+            case 'dir':
+                $want = strtolower(trim($arg));
+                return ($want === 'ltr' || $want === 'rtl') && $this->resolvedDir($el) === $want;
         }
 
         $argLower = strtolower(trim($arg));
@@ -1387,6 +1450,25 @@ class CssParser
             }
         }
         return false;
+    }
+
+    /**
+     * Directionality for :dir(): the nearest `dir` attribute on the element or an ancestor (`auto` = first strong
+     * character of the element's text, ltr when there is none); `<bdi>` defaults to auto; otherwise ltr.
+     */
+    private function resolvedDir(DOMElement $el): string
+    {
+        for ($node = $el; $node instanceof DOMElement; $node = $node->parentNode) {
+            $tag = strtolower($node->tagName);
+            $dir = $node->hasAttribute('dir') ? strtolower(trim($node->getAttribute('dir'))) : ($tag === 'bdi' ? 'auto' : '');
+            if ($dir === 'ltr' || $dir === 'rtl') {
+                return $dir;
+            }
+            if ($dir === 'auto') {
+                return \IvoPdf\Text\Bidi::firstStrong($node->textContent) === 1 ? 'rtl' : 'ltr';
+            }
+        }
+        return 'ltr';
     }
 
     private function matchesLang(DOMElement $el, string $lang): bool

@@ -34,7 +34,7 @@ final class ImageVariants
     }
 
     /**
-     * Decodes raw image bytes (JPEG with EXIF orientation applied, PNG, GIF, WebP, BMP, TIFF) into an RGB(A) raster.
+     * Decodes raw image bytes (JPEG with EXIF orientation applied, PNG, GIF, WebP, BMP, TIFF, ICO) into an RGB(A) raster.
      */
     public static function rasterFromBytes(string $raw, int $maxPixels): ?RasterImage
     {
@@ -43,6 +43,10 @@ final class ImageVariants
         }
         if (TiffDecoder::isTiff($raw)) {
             return TiffDecoder::decode($raw, $maxPixels);
+        }
+        if (IcoDecoder::isIco($raw)) {
+            $ico = IcoDecoder::decode($raw, $maxPixels);
+            return is_string($ico) ? self::rasterFromBytes($ico, $maxPixels) : $ico;
         }
         if (!function_exists('imagecreatefromstring')) {
             return null;

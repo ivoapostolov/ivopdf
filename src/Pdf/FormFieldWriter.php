@@ -307,6 +307,9 @@ final class FormFieldWriter
                 $parts[] = "/AP << /N {$apId} 0 R >>";
                 $parts[] = '/DA (' . $da . ')';
                 $parts[] = '/Q ' . $wd->align;
+                if ($wd->background !== '') {
+                    $parts[] = '/MK << /BG [' . $wd->background . '] >>';
+                }
         }
 
         return '<< ' . implode(' ', $parts) . ' >>';

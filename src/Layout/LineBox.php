@@ -15,6 +15,9 @@ class LineBox
     public float $height = 0.0;
     public float $baselineOffset = 0.0;
 
+    /** The paginator starts a page with this line (footnote-policy: line | block); ignored at the top of a page. */
+    public bool $forceBreak = false;
+
     /** @var list<TextRun> */
     public array $runs = [];
 

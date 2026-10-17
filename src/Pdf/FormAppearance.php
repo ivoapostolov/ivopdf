@@ -72,6 +72,17 @@ final class FormAppearance
         }
 
         if ($this->activeForms && $register) {
+            if ($c->placeholder !== '' && $c->value === '' && !$c->isButton() && $c->kind !== FormControl::SELECT) {
+                // The placeholder is page content, as browsers print it; it is not the field's value, so the
+                // widget appearance stays empty and the field gets an opaque background (/MK /BG) that hides the
+                // placeholder once a viewer draws a typed value
+                $page .= sprintf("q 1 0 0 1 %.3F %.3F cm\n%sQ\n", $x, $pdfBottom, $widget->normalAp);
+                $empty = clone $c;
+                $empty->placeholder = '';
+                $widget->normalAp = $this->textAppearance($box, $empty, $widget, $color);
+                $bg = CssColor::parse($box->style->get('background-color', '#ffffff'));
+                $widget->background = $bg !== null && $bg[3] > 0.5 ? sprintf('%.3F %.3F %.3F', $bg[0], $bg[1], $bg[2]) : '1 1 1';
+            }
             $this->pdf->addFormWidget($pageIndex, $widget->rect, $widget);
             return $page;
         }

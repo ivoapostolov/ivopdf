@@ -142,8 +142,8 @@ final class FirstPseudo
     private static function applyInitialLetter(LayoutBox $block, ComputedStyle $style, int $lines): void
     {
         $bodyPt = $block->style->getFontSizePt();
-        $lh = trim($block->style->get('line-height', '1.4'));
-        $lhPt = is_numeric($lh) ? (float) $lh * $bodyPt : (\IvoPdf\Css\CssUnit::toPt($lh, $bodyPt, $bodyPt, $bodyPt) ?: 1.4 * $bodyPt);
+        $lh = trim($block->style->get('line-height', 'normal'));
+        $lhPt = is_numeric($lh) ? (float) $lh * $bodyPt : (\IvoPdf\Css\CssUnit::toPt($lh, $bodyPt, $bodyPt, $bodyPt) ?: 1.17 * $bodyPt);
         $cap = 0.72;
         $size = (($lines - 1) * $lhPt + $cap * $bodyPt) / $cap;
         $style->set('font-size', round($size, 2) . 'pt');

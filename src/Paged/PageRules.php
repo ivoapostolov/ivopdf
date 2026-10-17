@@ -19,6 +19,9 @@ class PageRules
     /** @var array<string, array{props: array<string, string>, boxes: array<string, array<string, string>>}> */
     private array $rules = [];
 
+    /** Page 1 is a left page (root element direction rtl) */
+    public bool $firstPageLeft = false;
+
     /**
      * Registers one `@page <selector> { body }` rule. Later rules override earlier ones property by property.
      */
@@ -102,7 +105,8 @@ class PageRules
      */
     public function resolve(int $pageIndex, ?string $name = null): array
     {
-        $side = $pageIndex % 2 === 0 ? ':right' : ':left';
+        // Page 1 is a right page, or a left page when the root element's direction is rtl
+        $side = ($pageIndex % 2 === 0) !== $this->firstPageLeft ? ':right' : ':left';
         $keys = ['', $side];
         if ($pageIndex === 0) {
             $keys[] = ':first';

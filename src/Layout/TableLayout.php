@@ -38,15 +38,38 @@ class TableLayout
             $contentWidth = $table->getContentWidth();
         }
 
-        // <caption> boxes are laid out above the grid
+        // <caption> boxes are laid out above the grid (caption-side: top) or below it (caption-side: bottom)
         $captionHeight = 0.0;
+        $bottomCaptionHeight = 0.0;
+        /** @var list<LayoutBox> $bottomCaptions */
+        $bottomCaptions = [];
         foreach ($table->children as $child) {
             if ($child->tagName === 'caption' || $child->getDisplay() === 'table-caption') {
-                $this->engine->resolveBoxMetrics($child, $contentWidth);
-                $child->forcedBorderBoxWidth = max(0.0, $contentWidth - $child->marginLeft - $child->marginRight);
-                $this->engine->layoutElement($child, $contentX + $child->marginLeft, $contentY + $captionHeight + $child->marginTop, $contentWidth);
+                // The caption box is outside the table's border box (CSS 2.1 17.4): as wide as the table, above or below it
+                $this->engine->resolveBoxMetrics($child, $table->width);
+                $child->forcedBorderBoxWidth = max(0.0, $table->width - $child->marginLeft - $child->marginRight);
+                if (strtolower(trim($child->style->get('caption-side', 'top'))) === 'bottom') {
+                    // positioned after the grid height is known (see below)
+                    $this->engine->layoutElement($child, $table->x + $child->marginLeft, $table->y + $child->marginTop, $table->width);
+                    $bottomCaptions[] = $child;
+                    $bottomCaptionHeight += $child->getOuterHeight();
+                    continue;
+                }
+                $this->engine->layoutElement($child, $table->x + $child->marginLeft, $table->y + $captionHeight + $child->marginTop, $table->width);
                 $captionHeight += $child->getOuterHeight();
             }
+        }
+        $table->captionTop = $captionHeight;
+        $table->captionBottom = $bottomCaptionHeight;
+        if ($bottomCaptions !== []) {
+            // Bottom captions come last in child order so pagination keeps them after the last row
+            $kept = [];
+            foreach ($table->children as $child) {
+                if (!in_array($child, $bottomCaptions, true)) {
+                    $kept[] = $child;
+                }
+            }
+            $table->children = array_merge($kept, $bottomCaptions);
         }
         $contentY += $captionHeight;
         $spacingPt = $borderCollapse
@@ -88,21 +111,14 @@ class TableLayout
 
         $orderedRows = array_merge($headRows, $bodyRows, $footRows);
         if (empty($orderedRows)) {
-            return $captionHeight;
+            $this->placeBottomCaptions($bottomCaptions, $table->x, $contentY + $this->gridBottomEdge($table, $borderCollapse));
+            return $captionHeight + $bottomCaptionHeight;
         }
 
         // Build 2D occupancy grid for cells (handling colspan & rowspan)
         /** @var array<int, array<int, bool>> $occupied */
         $occupied = [];
-        /**
-         * @var list<array{
-         *   cell: LayoutBox,
-         *   rowIdx: int,
-         *   colIdx: int,
-         *   rowSpan: int,
-         *   colSpan: int
-         * }> $cellPlacements
-         */
+        /** @var list<CellPlacement> $cellPlacements */
         $cellPlacements = [];
         $numCols = 0;
         $numRows = count($orderedRows);
@@ -136,24 +152,20 @@ class TableLayout
                     $numCols = $colCursor + $cSpan;
                 }
 
-                $cellPlacements[] = [
-                    'cell' => $cell,
-                    'rowIdx' => $rIdx,
-                    'colIdx' => $colCursor,
-                    'rowSpan' => $rSpan,
-                    'colSpan' => $cSpan,
-                ];
+                $cellPlacements[] = new CellPlacement($cell, $rIdx, $colCursor, $rSpan, $cSpan);
 
                 $colCursor += $cSpan;
             }
         }
 
         if ($numCols === 0) {
-            return $captionHeight;
+            $this->placeBottomCaptions($bottomCaptions, $table->x, $contentY + $this->gridBottomEdge($table, $borderCollapse));
+            return $captionHeight + $bottomCaptionHeight;
         }
 
         // Resolve column widths
-        $totalHorizontalSpacing = ($numCols > 1) ? ($numCols - 1) * $spacingPt : 0.0;
+        // Separated borders: border-spacing between the columns and between the outer columns and the table edge
+        $totalHorizontalSpacing = ($numCols + 1) * $spacingPt;
         $usableWidth = max(0.0, $contentWidth - $totalHorizontalSpacing);
         $colElementWidths = $this->readColumnWidths($table, $numCols, $usableWidth);
         $colWidths = TableMetrics::isFixed($table)
@@ -171,7 +183,7 @@ class TableLayout
 
         // Compute X offset for each column
         $colOffsets = [];
-        $accX = $contentX;
+        $accX = $contentX + $spacingPt;
         for ($c = 0; $c < $numCols; $c++) {
             $colOffsets[$c] = $accX;
             $accX += $colWidths[$c] + $spacingPt;
@@ -187,10 +199,10 @@ class TableLayout
             }
         }
 
-        foreach ($cellPlacements as &$cp) {
-            $cell = $cp['cell'];
-            $cIdx = $cp['colIdx'];
-            $cSpan = $cp['colSpan'];
+        foreach ($cellPlacements as $cp) {
+            $cell = $cp->cell;
+            $cIdx = $cp->colIdx;
+            $cSpan = $cp->colSpan;
 
             $cellW = 0.0;
             for ($c = $cIdx; $c < $cIdx + $cSpan; $c++) {
@@ -199,7 +211,7 @@ class TableLayout
             if ($cSpan > 1) {
                 $cellW += ($cSpan - 1) * $spacingPt;
             }
-            $cp['cellWidth'] = $cellW;
+            $cp->cellWidth = $cellW;
 
             $this->engine->resolveBoxMetrics($cell, $cellW);
             $collapseExtraW = $borderCollapse ? ($cell->borderLeft + $cell->borderRight) / 2.0 : 0.0;
@@ -207,8 +219,8 @@ class TableLayout
             $cell->forcedBorderBoxHeight = null;
             $this->engine->layoutElement($cell, 0.0, 0.0, $cellW);
 
-            if ($cp['rowSpan'] === 1) {
-                $rIdx = $cp['rowIdx'];
+            if ($cp->rowSpan === 1) {
+                $rIdx = $cp->rowIdx;
                 $needH = $cell->height - ($borderCollapse ? ($cell->borderTop + $cell->borderBottom) / 2.0 : 0.0);
                 if ($needH > $rowHeights[$rIdx]) {
                     $rowHeights[$rIdx] = $needH;
@@ -219,14 +231,14 @@ class TableLayout
 
         // Accommodate multi-row (rowspan > 1) cells
         foreach ($cellPlacements as $cp) {
-            if ($cp['rowSpan'] > 1) {
-                $rStart = $cp['rowIdx'];
-                $rSpan = $cp['rowSpan'];
+            if ($cp->rowSpan > 1) {
+                $rStart = $cp->rowIdx;
+                $rSpan = $cp->rowSpan;
                 $spanH = ($rSpan - 1) * $spacingPt;
                 for ($r = $rStart; $r < $rStart + $rSpan; $r++) {
                     $spanH += $rowHeights[$r];
                 }
-                $needed = $cp['cell']->height - $spanH - ($borderCollapse ? ($cp['cell']->borderTop + $cp['cell']->borderBottom) / 2.0 : 0.0);
+                $needed = $cp->cell->height - $spanH - ($borderCollapse ? ($cp->cell->borderTop + $cp->cell->borderBottom) / 2.0 : 0.0);
                 if ($needed > 0.01) {
                     $add = $needed / $rSpan;
                     for ($r = $rStart; $r < $rStart + $rSpan; $r++) {
@@ -238,7 +250,7 @@ class TableLayout
 
         // Compute Y offset for each row and set rowBox & groupBox coordinates
         $rowOffsets = [];
-        $accY = $contentY;
+        $accY = $contentY + $spacingPt;
         for ($r = 0; $r < $numRows; $r++) {
             $rowOffsets[$r] = $accY;
             if (isset($orderedRows[$r])) {
@@ -276,14 +288,19 @@ class TableLayout
             $gBox->height = $gb['maxBottom'] - $gb['minY'];
         }
 
+        $rtl = strtolower(trim($table->style->get('direction', 'ltr'))) === 'rtl';
         // Position cells and apply vertical-align (top | middle | bottom)
         foreach ($cellPlacements as $cp) {
-            $cell = $cp['cell'];
-            $cIdx = $cp['colIdx'];
-            $rStart = $cp['rowIdx'];
-            $rSpan = $cp['rowSpan'];
+            $cell = $cp->cell;
+            $cIdx = $cp->colIdx;
+            $rStart = $cp->rowIdx;
+            $rSpan = $cp->rowSpan;
 
             $cellX = $colOffsets[$cIdx] ?? $contentX;
+            if ($rtl) {
+                // direction: rtl: the first column is the rightmost one
+                $cellX = $contentX + $contentWidth - ($cellX - $contentX) - $cp->cellWidth;
+            }
             $cellY = $rowOffsets[$rStart] ?? $contentY;
 
             $targetHeight = ($rSpan - 1) * $spacingPt;
@@ -301,7 +318,11 @@ class TableLayout
             $cell->height = max($naturalHeight, $targetHeight);
 
             $vAlign = strtolower($cell->style->get('vertical-align', 'middle'));
-            $extraVertical = max(0.0, $cell->height - $naturalHeight);
+            // Free space below the content (a cell with an explicit height has it too, not only a cell in a taller row)
+            $contentBottom = self::contentBottom($cell);
+            $extraVertical = $contentBottom === null
+                ? max(0.0, $cell->height - $naturalHeight)
+                : max(0.0, ($cell->y + $cell->height - $cell->paddingBottom - $cell->borderBottom) - $contentBottom);
             if ($extraVertical > 0.1 && ($vAlign === 'middle' || $vAlign === 'bottom')) {
                 $shiftY = ($vAlign === 'middle') ? ($extraVertical / 2.0) : $extraVertical;
                 foreach ($cell->lines as $line) {
@@ -317,16 +338,53 @@ class TableLayout
         for ($r = 0; $r < $numRows; $r++) {
             $totalHeight += $rowHeights[$r];
         }
-        if ($numRows > 1) {
-            $totalHeight += ($numRows - 1) * $spacingPt;
-        }
-        $totalHeight += $captionHeight;
+        $totalHeight += ($numRows + 1) * $spacingPt;
+        $this->placeBottomCaptions($bottomCaptions, $table->x, $contentY + $totalHeight + $this->gridBottomEdge($table, $borderCollapse));
+        $totalHeight += $captionHeight + $bottomCaptionHeight;
 
         if ($borderCollapse) {
             // LayoutEngine adds the full vertical spacing; collapsed tables only own half of their border
             return max(0.0, $totalHeight - ($table->borderTop + $table->borderBottom) / 2.0 - $table->paddingTop - $table->paddingBottom);
         }
         return max(0.0, $totalHeight);
+    }
+
+    /** Padding and border below the grid: a bottom caption goes below them. */
+    private function gridBottomEdge(LayoutBox $table, bool $borderCollapse): float
+    {
+        return $borderCollapse ? $table->borderBottom / 2.0 : $table->paddingBottom + $table->borderBottom;
+    }
+
+    /** Bottom edge of a cell's in-flow content (lines and child boxes with their bottom margins), null when empty. */
+    private static function contentBottom(LayoutBox $cell): ?float
+    {
+        $bottom = null;
+        foreach ($cell->lines as $line) {
+            $b = $line->y + $line->height;
+            $bottom = $bottom === null ? $b : max($bottom, $b);
+        }
+        foreach ($cell->children as $child) {
+            if ($child->isPositionedOutOfFlow() || $child->isTextNode() || $child->isInlineLevel()) {
+                continue;
+            }
+            $b = $child->y + $child->height + max(0.0, $child->marginBottom);
+            $bottom = $bottom === null ? $b : max($bottom, $b);
+        }
+        return $bottom;
+    }
+
+    /**
+     * Moves `caption-side: bottom` captions (laid out at the grid origin) to $topY, stacked downwards.
+     *
+     * @param list<LayoutBox> $captions
+     */
+    private function placeBottomCaptions(array $captions, float $contentX, float $topY): void
+    {
+        $y = $topY;
+        foreach ($captions as $cap) {
+            $cap->translate($contentX + $cap->marginLeft - $cap->x, $y + $cap->marginTop - $cap->y);
+            $y += $cap->getOuterHeight();
+        }
     }
 
     /**
@@ -340,7 +398,7 @@ class TableLayout
     }
 
     /**
-     * @param list<array{cell: LayoutBox, rowIdx: int, colIdx: int, rowSpan: int, colSpan: int}> $cellPlacements
+     * @param list<CellPlacement> $cellPlacements
      * @return list<float>
      */
     private function calculateColumnWidths(array $cellPlacements, int $numCols, float $usableWidth, array $colElementWidths = []): array
@@ -355,11 +413,11 @@ class TableLayout
         $maxWidths = array_fill(0, $numCols, 0.0);
 
         foreach ($cellPlacements as $cp) {
-            if ($cp['colSpan'] !== 1) {
+            if ($cp->colSpan !== 1) {
                 continue;
             }
-            $c = $cp['colIdx'];
-            $cell = $cp['cell'];
+            $c = $cp->colIdx;
+            $cell = $cp->cell;
 
             $this->engine->resolveBoxMetrics($cell, $usableWidth);
             $wCss = strtolower(trim($cell->style->get('width', 'auto')));
@@ -387,11 +445,11 @@ class TableLayout
 
         // Spanning cells: make sure the spanned columns together satisfy the cell's minimum width
         foreach ($cellPlacements as $cp) {
-            if ($cp['colSpan'] <= 1) {
+            if ($cp->colSpan <= 1) {
                 continue;
             }
-            $intr = $this->engine->measureIntrinsicWidth($cp['cell'], $usableWidth);
-            $cols = range($cp['colIdx'], min($numCols - 1, $cp['colIdx'] + $cp['colSpan'] - 1));
+            $intr = $this->engine->measureIntrinsicWidth($cp->cell, $usableWidth);
+            $cols = range($cp->colIdx, min($numCols - 1, $cp->colIdx + $cp->colSpan - 1));
             $sumMin = 0.0;
             $sumMax = 0.0;
             foreach ($cols as $c) {

@@ -224,7 +224,7 @@ if ($spans !== null) {
 // ---------------------------------------------------------------------------
 echo "\n3. @page :first / :left / :right margins\n";
 // ---------------------------------------------------------------------------
-$pageCss = '<style>@page{size:A5;margin:30pt} @page :first{margin-top:100pt} @page :left{margin-left:50pt;margin-right:20pt} @page :right{margin-left:20pt;margin-right:50pt}</style>';
+$pageCss = '<style>body{margin:0} @page{size:A5;margin:30pt} @page :first{margin-top:100pt} @page :left{margin-left:50pt;margin-right:20pt} @page :right{margin-left:20pt;margin-right:50pt}</style>';
 $pdf = makePdf($pageCss . '<p style="margin:0">First page</p>' . '<div style="page-break-before:always"><p style="margin:0">Second page</p></div><div style="page-break-before:always"><p style="margin:0">Third page</p></div>');
 $spans = pdfSpans($pdf);
 check('three pages', $pdf->getPageCount() === 3, (string) $pdf->getPageCount());

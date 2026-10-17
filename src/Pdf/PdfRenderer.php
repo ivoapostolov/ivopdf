@@ -35,6 +35,13 @@ class PdfRenderer
     private int $currentPageIndex = 0;
     private int $totalPages = 1;
 
+    /**
+     * False while painting a line (or a box inside a line) that is not owned by the current page. A line belongs to
+     * exactly one page: the one whose slice contains its top edge. Links, form widgets and destinations are only
+     * emitted for owned lines, so that content the page clip hides never leaves ghost annotations behind.
+     */
+    private bool $annotOwned = true;
+
     public function __construct(
         PdfDocument $pdf,
         FontManager $fontManager,
@@ -243,12 +250,19 @@ class PdfRenderer
         $localY = $box->y - $yShift;
         $boxW = $box->width;
         $boxH = $box->height;
+        // A table's border and background enclose its grid; captions sit outside them
+        $paintTop = $boxTop + $box->captionTop;
+        $paintBottom = $boxBottom - $box->captionBottom;
+        if ($paintTop !== $boxTop || $paintBottom !== $boxBottom) {
+            $localY += $box->captionTop;
+            $boxH = max(0.0, $paintBottom - $paintTop);
+        }
 
         // If a large wrapper container spans multiple pages, clamp its background/border rect to the current page
         if (!$isFixedContext && $this->totalPages > 1 && $box->tagName !== 'body') {
-            $clampedTop = max($boxTop, $visibleVirtualTop);
-            $clampedBottom = min($boxBottom, $visibleVirtualBottom);
-            if ($clampedBottom > $clampedTop && ($boxTop < $visibleVirtualTop || $boxBottom > $visibleVirtualBottom)) {
+            $clampedTop = max($paintTop, $visibleVirtualTop);
+            $clampedBottom = min($paintBottom, $visibleVirtualBottom);
+            if ($clampedBottom > $clampedTop && ($paintTop < $visibleVirtualTop || $paintBottom > $visibleVirtualBottom)) {
                 $localY = $clampedTop - $yShift;
                 $boxH = $clampedBottom - $clampedTop;
             }
@@ -258,7 +272,10 @@ class PdfRenderer
         $needsGraphicsRestore = false;
 
         // Named destinations (id / a[name]) and heading bookmarks
-        if (!$isFixedContext && $box->domElement !== null && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5) {
+        // (a display: inline element has no box of its own: its anchors are registered at its line fragments or,
+        // when empty, by registerEmptyInlineAnchors())
+        if (!$isFixedContext && $this->annotOwned && $box->domElement !== null && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5
+            && ($box->getDisplay() !== 'inline' || $box->isPositionedOutOfFlow() || $box->parent === null)) {
             $destY = $this->pageHeight - $localY;
             foreach (['id', 'name'] as $attr) {
                 $anchor = trim($box->domElement->getAttribute($attr));
@@ -273,6 +290,11 @@ class PdfRenderer
                 }
             }
             \IvoPdf\Compat\MpdfRenderHooks::apply($this->pdf, $box->domElement, $this->currentPageIndex, $localX, $destY); // mPDF <bookmark>, <annotation>
+        }
+
+        // Empty inline anchors (<a name="x"></a>) between block siblings, in a box without any text line
+        if (!$isFixedContext && $this->annotOwned && empty($box->lines) && !empty($box->children)) {
+            $this->registerEmptyInlineAnchors($box, $yShift, $visibleVirtualTop, $visibleVirtualBottom);
         }
 
         // Handle opacity
@@ -358,7 +380,8 @@ class PdfRenderer
             $out .= $this->drawBackgroundImage($box, $localX, $localY, $boxW, $boxH, $radii);
 
             // 4. Clickable box link if <a> is styled as block/inline-block/flex
-            if ($box->href !== null && $box->href !== '' && ($box->tagName === 'a' || !$box->isInlineLevel())) {
+            if ($box->href !== null && $box->href !== '' && ($box->tagName === 'a' || !$box->isInlineLevel())
+                && ($isFixedContext || ($this->annotOwned && $boxBottom > $visibleVirtualTop + 0.5 && $boxTop < $visibleVirtualBottom - 0.5))) {
                 $pdfY = $this->pageHeight - ($localY + $boxH);
                 $this->pdf->addLinkAnnotation($this->currentPageIndex, $localX, $pdfY, $boxW, $boxH, $box->href);
             }
@@ -381,7 +404,7 @@ class PdfRenderer
         // 6. Replaced content: <img>, <svg> or a form control (static frame + interactive AcroForm widget)
         if ($isVisibleOnPage) {
             if ($box->formControl !== null) {
-                $register = !$isFixedContext && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5;
+                $register = !$isFixedContext && $this->annotOwned && $boxTop >= $visibleVirtualTop - 0.5 && $boxTop < $visibleVirtualBottom - 0.5;
                 $out .= $this->formAppearance()->render($box, $yShift, $this->pageHeight, $this->currentPageIndex, $register);
             } elseif ($box->tagName === 'img' && $box->imageSrc !== null) {
                 $objectFit = strtolower($box->style->get('object-fit', 'fill'));
@@ -402,8 +425,20 @@ class PdfRenderer
                     $cw,
                     $ch,
                     $this->pageHeight,
-                    $box->style->get('color', '#111827')
+                    $box->style->get('color', '#111827'),
+                    [
+                        'size' => $box->fontSizePt,
+                        'family' => $box->style->get('font-family', 'DejaVu Sans'),
+                        'weight' => $box->style->get('font-weight', 'normal'),
+                        'style' => $box->style->get('font-style', 'normal'),
+                    ]
                 );
+                // <a href> inside the SVG markup
+                if ($this->svgRenderer->links !== [] && ($isFixedContext || ($this->annotOwned && $boxBottom > $visibleVirtualTop + 0.5 && $boxTop < $visibleVirtualBottom - 0.5))) {
+                    foreach ($this->svgRenderer->links as [$lx0, $ly0, $lx1, $ly1, $lhref]) {
+                        $this->pdf->addLinkAnnotation($this->currentPageIndex, $lx0, $this->pageHeight - $ly1, $lx1 - $lx0, $ly1 - $ly0, $lhref);
+                    }
+                }
             }
 
             // List item marker (bullet or number)
@@ -422,7 +457,7 @@ class PdfRenderer
             $line = $box->lines[$li];
             $lineTop = $line->y;
             $lineBottom = $line->y + $line->height;
-            if (!$isFixedContext && $lineTop > $visibleVirtualBottom + 0.5) {
+            if (!$isFixedContext && $lineTop >= $visibleVirtualBottom - 0.5) {
                 if ($linesOrdered) {
                     break; // every following line starts even lower
                 }
@@ -431,7 +466,12 @@ class PdfRenderer
             if (!$isFixedContext && $lineBottom < $visibleVirtualTop - 0.5) {
                 continue;
             }
+            // The page owns a line when its top edge lies in the slice; a line that only reaches into the slice from
+            // above is painted (clipped) but its links, widgets and anchors belong to the previous page
+            $wasOwned = $this->annotOwned;
+            $this->annotOwned = $wasOwned && ($isFixedContext || $this->currentPageIndex === 0 || $lineTop >= $visibleVirtualTop - 0.5);
             $out .= $this->renderLineBox($line, $yShift, $isFixedContext);
+            $this->annotOwned = $wasOwned;
         }
 
         // 8. Render child boxes in CSS painting order (negative z-index, in-flow, positioned, positive z-index).
@@ -465,7 +505,25 @@ class PdfRenderer
 
         // 9. Draw Borders on top of background/children
         if ($isVisibleOnPage && ($boxW > 0.05 || $boxH > 0.05)) {
-            $out .= $this->drawBorders($box, $localX, $localY, $boxW, $boxH, $radii);
+            if ($box->legendGap !== null) {
+                // <fieldset>: no border behind the <legend> (even-odd clip around the legend's rectangle)
+                [$gx0, $gx1, $gy0, $gy1] = $box->legendGap;
+                $gapTop = $box->y - $yShift + $gy0;
+                $out .= sprintf(
+                    "q %.2F %.2F %.2F %.2F re %.2F %.2F %.2F %.2F re W* n\n",
+                    $localX - 50.0,
+                    $this->pageHeight - ($localY + $boxH + 50.0),
+                    $boxW + 100.0,
+                    $boxH + 100.0 + ($localY - ($box->y - $yShift)),
+                    $box->x + $gx0,
+                    $this->pageHeight - ($gapTop + $gy1),
+                    $gx1 - $gx0,
+                    $gy1 - $gy0
+                );
+                $out .= $this->drawBorders($box, $localX, $localY, $boxW, $boxH, $radii) . "Q\n";
+            } else {
+                $out .= $this->drawBorders($box, $localX, $localY, $boxW, $boxH, $radii);
+            }
         }
 
         // 10. Outline (outside the border box, never affects layout)
@@ -489,8 +547,19 @@ class PdfRenderer
     {
         $out = $this->drawInlineDecorations($line, $yShift);
 
+        if ($this->annotOwned && !$replacePageTokens) {
+            $this->registerInlineAnchors($line, $yShift);
+        }
+
         foreach ($line->runs as $run) {
             if ($run->inlineBox !== null) {
+                $linked = $run->href !== null && $run->href !== '' && $this->annotOwned
+                    && $run->inlineBox->tagName !== 'a' && $run->inlineBox->isInlineLevel();
+                if ($linked) {
+                    // <a href><img></a> / <a href><svg></a> / inline-block content: the replaced box is the click target
+                    $ib = $run->inlineBox;
+                    $this->pdf->addLinkAnnotation($this->currentPageIndex, $ib->x, $this->pageHeight - ($ib->y - $yShift + $ib->height), $ib->width, $ib->height, (string) $run->href);
+                }
                 $out .= $this->renderBoxTree(
                     $run->inlineBox,
                     $yShift,
@@ -508,6 +577,7 @@ class PdfRenderer
             $baselinePdfY = $this->pageHeight - $runBaselineDocY;
 
             $text = $run->text;
+            $runX = $run->x;
             if (str_contains($text, '{')) {
                 $text = strtr($text, [
                     '{PAGE_NUM}' => (string) ($this->currentPageIndex + 1),
@@ -515,6 +585,16 @@ class PdfRenderer
                     '{PAGE_COUNT}' => (string) $this->totalPages,
                     '{nbpg}' => (string) $this->totalPages,
                 ]);
+                if ($text !== $run->text) {
+                    // Laid out with one-digit numbers: keep centred / right-aligned numbers in place
+                    $align = strtolower(trim($run->style->get('text-align', 'start')));
+                    $rtl = strtolower(trim($run->style->get('direction', 'ltr'))) === 'rtl';
+                    $f = $align === 'center' ? 0.5 : (($align === 'right' || ($align === 'end' && !$rtl) || ($align === 'start' && $rtl)) ? 1.0 : 0.0);
+                    if ($f > 0.0) {
+                        $real = $this->fontManager->measureText($text, $run->style->get('font-family', 'DejaVu Sans'), $run->style->get('font-weight', 'normal'), $run->style->get('font-style', 'normal'), $run->fontSizePt, $run->letterSpacingPt);
+                        $runX += ($run->width - $real) * $f;
+                    }
+                }
             }
 
             if ($text === '' || ($run->isWhitespace && strtolower($run->style->get('text-decoration', 'none')) === 'none')) {
@@ -541,11 +621,14 @@ class PdfRenderer
             if ($run->glyphs !== null && $text === $run->text) {
                 // Shaped run (ligatures, kerning, Arabic forms, RTL): positioned glyph ids in visual order
                 // Reordered Indic glyphs carry /ActualText so that copy/paste and search see the logical text
-                $logical = preg_match('/[\x{0900}-\x{0D7F}]/u', $text) === 1 || in_array('', array_column($run->glyphs, 4), true) ? $text : null;
+                $logical = $run->actualText ?? (preg_match('/[\x{0900}-\x{0D7F}]/u', $text) === 1 || in_array('', array_column($run->glyphs, 4), true) ? $text : null);
                 $showOps = $this->fontManager->encodeShapedGlyphs($ttf, $run->glyphs, $run->fontSizePt, $logical);
             } else {
                 $hexGids = $this->fontManager->encodeTextToHexGids($ttf, $text);
                 $showOps = $hexGids !== '' ? '<' . $hexGids . '> Tj' : '';
+                if ($showOps !== '' && $run->actualText !== null && $text === $run->text) {
+                    $showOps = '/Span << /ActualText <' . strtoupper(bin2hex("\xFE\xFF" . (string) mb_convert_encoding($run->actualText, 'UTF-16BE', 'UTF-8'))) . '> >> BDC ' . $showOps . ' EMC';
+                }
             }
             if ($showOps !== '') {
                 $tcCmd = abs($run->letterSpacingPt) > 0.001 ? sprintf('%.3F Tc ', $run->letterSpacingPt) : '';
@@ -558,7 +641,7 @@ class PdfRenderer
                     $run->fontSizePt,
                     $tcCmd,
                     ColorOps::fillOp($color),
-                    $run->x,
+                    $runX,
                     $baselinePdfY,
                     $showOps,
                     $tcReset,
@@ -615,13 +698,83 @@ class PdfRenderer
             }
 
             // Clickable Link Annotation (external URLs and internal #anchors)
-            if ($run->href !== null && $run->href !== '') {
+            if ($run->href !== null && $run->href !== '' && $this->annotOwned) {
                 $pdfRunBottom = $baselinePdfY - $run->descent;
                 $this->pdf->addLinkAnnotation($this->currentPageIndex, $run->x, $pdfRunBottom, $run->width, $run->height, $run->href);
             }
         }
 
         return $out;
+    }
+
+    /**
+     * Destinations of empty inline-level children (<a name="x"></a>, <span id="x"></span>) of a box without line boxes:
+     * they take no space, so they point at the top of the next in-flow sibling (else the end of the previous one).
+     */
+    private function registerEmptyInlineAnchors(LayoutBox $box, float $yShift, float $visTop, float $visBottom): void
+    {
+        $children = $box->children;
+        foreach ($children as $i => $child) {
+            $el = $child->domElement;
+            if ($el === null || $child->isTextNode() || !$el->hasAttributes()) {
+                continue;
+            }
+            $names = [];
+            foreach (['id', 'name'] as $attr) {
+                $anchor = trim($el->getAttribute($attr));
+                if ($anchor !== '' && ($attr === 'id' || $child->tagName === 'a')) {
+                    $names[] = $anchor;
+                }
+            }
+            if ($names === [] || !$child->isInlineLevel() || $child->isPositionedOutOfFlow() || !empty($child->lines)) {
+                continue;
+            }
+            $y = null;
+            for ($k = $i + 1, $n = count($children); $k < $n && $y === null; $k++) {
+                if (!$children[$k]->isInlineLevel() && !$children[$k]->isPositionedOutOfFlow()) {
+                    $y = max($box->getContentY(), $children[$k]->y - max(0.0, $children[$k]->marginTop)); // above the block's margin
+                }
+            }
+            for ($k = $i - 1; $k >= 0 && $y === null; $k--) {
+                if (!$children[$k]->isInlineLevel() && !$children[$k]->isPositionedOutOfFlow()) {
+                    $y = $children[$k]->y + $children[$k]->height;
+                }
+            }
+            // No block sibling: where its (empty) line would start, the top of the parent's content box (below any
+            // padding and border), not the parent's border edge
+            $y ??= $box->getContentY();
+            if ($y >= $visTop - 0.5 && $y < $visBottom - 0.5) {
+                foreach ($names as $name) {
+                    $this->pdf->registerDestination($name, $this->currentPageIndex, $this->pageHeight - ($y - $yShift));
+                }
+            }
+        }
+    }
+
+    /**
+     * Registers the link destinations (id / a[name]) of inline elements at the top of their first line fragment.
+     * Anchors travel with the runs as zero-paint entries of TextRun::$decorations (see InlineLayout).
+     */
+    private function registerInlineAnchors(LineBox $line, float $yShift): void
+    {
+        foreach ($line->runs as $run) {
+            if (empty($run->decorations)) {
+                continue;
+            }
+            foreach ($run->decorations as $deco) {
+                $el = $deco->domElement;
+                if ($el === null || !$el->hasAttributes()) {
+                    continue;
+                }
+                $destY = $this->pageHeight - ($line->y - $yShift);
+                foreach (['id', 'name'] as $attr) {
+                    $anchor = trim($el->getAttribute($attr));
+                    if ($anchor !== '' && ($attr === 'id' || $deco->tagName === 'a')) {
+                        $this->pdf->registerDestination($anchor, $this->currentPageIndex, $destY);
+                    }
+                }
+            }
+        }
     }
 
     /**

@@ -24,7 +24,7 @@ final class TableMetrics
     /**
      * Column widths for fixed layout: <col> widths first, then first-row cell widths; the rest is split equally.
      *
-     * @param list<array{cell: LayoutBox, rowIdx: int, colIdx: int, rowSpan: int, colSpan: int}> $cellPlacements
+     * @param list<CellPlacement> $cellPlacements
      * @param array<int, float> $colElementWidths
      * @return list<float>
      */
@@ -37,10 +37,10 @@ final class TableMetrics
             }
         }
         foreach ($cellPlacements as $cp) {
-            if ($cp['rowIdx'] !== 0) {
+            if ($cp->rowIdx !== 0) {
                 continue;
             }
-            $cell = $cp['cell'];
+            $cell = $cp->cell;
             $engine->resolveBoxMetrics($cell, $usableWidth);
             $css = strtolower(trim($cell->style->get('width', 'auto')));
             if ($css === 'auto' || $css === '') {
@@ -50,9 +50,9 @@ final class TableMetrics
             if ($px <= 0.0) {
                 continue;
             }
-            $span = max(1, $cp['colSpan']);
+            $span = max(1, $cp->colSpan);
             for ($k = 0; $k < $span; $k++) {
-                $c = $cp['colIdx'] + $k;
+                $c = $cp->colIdx + $k;
                 if ($c < $numCols && $w[$c] === null) {
                     $w[$c] = $px / $span;
                 }
@@ -194,6 +194,17 @@ final class TableMetrics
             $sp = $engine->resolveLength($table->style->get('border-spacing', '0'), $referenceWidth, $table->fontSizePt) * ($n + 1);
         }
         $edge = $table->getHorizontalSpacing();
-        return ['min' => $sumMin + $edge + $sp, 'max' => max($sumMin, $sumMax) + $edge + $sp];
+        $min = $sumMin + $edge + $sp;
+        $max = max($sumMin, $sumMax) + $edge + $sp;
+        // A caption never breaks inside a word: its min-content width widens the table (as in browsers)
+        foreach ($table->children as $child) {
+            if ($child->tagName === 'caption' || $child->getDisplay() === 'table-caption') {
+                $engine->resolveBoxMetrics($child, $referenceWidth);
+                $capMin = $engine->measureIntrinsicWidth($child, $referenceWidth)['min'] + $child->marginLeft + $child->marginRight; // the caption is outside the border box
+                $min = max($min, $capMin);
+                $max = max($max, $capMin);
+            }
+        }
+        return ['min' => $min, 'max' => $max];
     }
 }

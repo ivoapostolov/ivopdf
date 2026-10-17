@@ -32,6 +32,9 @@ class InlineLayout
     /** @var list<array{members: list<TextRun>, oid: int, decorated: bool, left: float, right: float, leftEdge: float, rightEdge: float}> inline element edges, innermost first */
     private array $spanRecords = [];
 
+    /** @var list<array{0: int, 1: LayoutBox}> empty inline elements with an id / name: [index of the token that follows, element] */
+    private array $emptyAnchors = [];
+
     public function __construct(LayoutEngine $engine, FontManager $fontManager)
     {
         $this->engine = $engine;
@@ -65,6 +68,15 @@ class InlineLayout
      */
     public ?\Closure $bandProvider = null;
 
+    /**
+     * Set by the block layout together with $bandProvider when the inline content contains floats: 'place'
+     * (fn(LayoutBox $float, float $y): array handle) places a float at or below y, 'move' (fn(array $handle,
+     * float $dy)) shifts it to the final line position, 'reset' undoes all placements (::first-line trial passes).
+     *
+     * @var array{place: \Closure, move: \Closure, reset: \Closure}|null
+     */
+    public ?array $floatHooks = null;
+
     /** Container currently being laid out in ::first-line probe passes */
     private ?LayoutBox $firstLineProbe = null;
 
@@ -79,11 +91,16 @@ class InlineLayout
     {
         $this->firstLineProbe = $container;
         $band = $this->bandProvider;
+        $hooks = $this->floatHooks;
         try {
-            $trial = function (int $budget, ?int $breakAt) use ($container, $inlineNodes, $startX, $startY, $availableWidth, $band): array {
+            $trial = function (int $budget, ?int $breakAt) use ($container, $inlineNodes, $startX, $startY, $availableWidth, $band, $hooks): array {
                 $probe = clone $container;
                 $probe->lines = [];
                 $this->bandProvider = $band;
+                if ($hooks !== null) {
+                    ($hooks['reset'])(); // floats placed by an earlier trial pass
+                    $this->floatHooks = $hooks;
+                }
                 $y = $this->layoutInlineSequenceCore($probe, $inlineNodes, $startX, $startY, $availableWidth, $budget, $breakAt);
                 $chars = 0;
                 if (isset($probe->lines[0])) {
@@ -121,6 +138,7 @@ class InlineLayout
             return $y;
         } finally {
             $this->bandProvider = null;
+            $this->floatHooks = null;
             $this->firstLineProbe = null;
         }
     }
@@ -212,17 +230,32 @@ class InlineLayout
         $tokens = [];
         $band = $this->bandProvider;
         $this->bandProvider = null; // only this paragraph wraps around floats, not nested inline-blocks
+        $floatHooks = $this->floatHooks;
+        $this->floatHooks = null;
         $outerBidiFlag = $this->bidiFlag;
         $outerSpans = $this->spanRecords;
+        $outerAnchors = $this->emptyAnchors;
         $this->bidiFlag = false;
         $this->spanRecords = [];
+        $this->emptyAnchors = [];
+        $outerCollecting = $this->collectingFloats;
+        $this->collectingFloats = $floatHooks !== null;
         foreach ($inlineNodes as $node) {
+            if ($floatHooks !== null && $this->isFloatNode($node)) {
+                $this->collectInlineTokens($node, $availableWidth, $tokens);
+                continue;
+            }
+            $this->collectingFloats = false; // floats nested deeper belong to other block containers
             $this->collectInlineTokens($node, $availableWidth, $tokens);
+            $this->collectingFloats = $floatHooks !== null;
         }
+        $this->collectingFloats = $outerCollecting;
         $needsBidi = $this->bidiFlag;
         $spans = $this->spanRecords;
+        $this->attachEmptyAnchors($tokens);
         $this->bidiFlag = $outerBidiFlag;
         $this->spanRecords = $outerSpans;
+        $this->emptyAnchors = $outerAnchors;
 
         if (empty($tokens)) {
             return $startY;
@@ -260,18 +293,32 @@ class InlineLayout
         $availW = $availableWidth;
         $lineDx = 0.0;
         $lineY = $startY;
-        $strutLh = $this->resolveLineHeight($container->style->get('line-height', '1.4'), $container->fontSizePt);
+        $strutLh = $this->resolveLineHeight($container->style, $container->fontSizePt);
+        // Floats in the inline content: those that did not fit beside their line wait for the top of the next line;
+        // placed ones remember their line (index into $rawLines) and the estimated line top used for the placement
+        /** @var list<LayoutBox> $pendingFloats */
+        $pendingFloats = [];
+        /** @var list<array{handle: array, line: int, y: float}> $placedFloats */
+        $placedFloats = [];
+        if ($floatHooks !== null && $band === null) {
+            $band = static fn(float $y, float $h): array => [$startX, $startX + $availableWidth];
+        }
 
-        $flushLine = function (bool $forced) use (&$rawLines, &$currentRuns, &$currentWidth, &$availW, &$lineDx, &$lineY, $band, $startX, $strutLh, $container): void {
+        $flushLine = function (bool $forced) use (&$rawLines, &$currentRuns, &$currentWidth, &$availW, &$lineDx, &$lineY, $band, $startX, $strutLh, $container, &$pendingFloats, &$placedFloats, $floatHooks): void {
             \IvoPdf\RenderLimits::tick();
             $this->trimTrailingWhitespace($currentRuns);
             $rawLines[] = ['runs' => $currentRuns, 'forcedBreak' => $forced, 'dx' => $lineDx, 'w' => $availW];
             if ($band !== null) {
                 $h = $strutLh;
                 foreach ($currentRuns as $r) {
-                    $h = max($h, $r->inlineBox !== null ? $r->ascent + $r->descent : $this->resolveLineHeight($r->style->get('line-height', '1.4'), $r->fontSizePt));
+                    $h = max($h, $r->inlineBox !== null ? $r->ascent + $r->descent : $this->resolveLineHeight($r->style, $r->fontSizePt));
                 }
                 $lineY += $h;
+                foreach ($pendingFloats as $pf) {
+                    // CSS 2.1 9.5.1: a float that did not fit on its line goes to the top of the next line
+                    $placedFloats[] = ['handle' => ($floatHooks['place'])($pf, $lineY), 'line' => count($rawLines), 'y' => $lineY];
+                }
+                $pendingFloats = [];
                 [$bl, $br] = $band($lineY, $strutLh);
                 $lineDx = $bl - $startX;
                 $availW = max(10.0, $br - $bl);
@@ -284,6 +331,31 @@ class InlineLayout
             \IvoPdf\RenderLimits::tick();
             if ($token->isLineBreak) {
                 $flushLine(true);
+                continue;
+            }
+            if ($token->floatBox !== null) {
+                if ($floatHooks === null || $band === null) {
+                    continue;
+                }
+                $fb = $token->floatBox;
+                $fw = $fb->getOuterWidth();
+                $lineContent = 0.0;
+                foreach ($currentRuns as $r) {
+                    if (!$r->isWhitespace || $this->preservesSpaces($r)) {
+                        $lineContent = $currentWidth;
+                        break;
+                    }
+                }
+                if ($pendingFloats === [] && ($lineContent + $fw <= $availW + 0.05 || $currentRuns === [])) {
+                    // Fits beside the content of the current line: at the top of this line, which re-wraps around it
+                    $handle = ($floatHooks['place'])($fb, $lineY);
+                    $placedFloats[] = ['handle' => $handle, 'line' => count($rawLines), 'y' => $lineY];
+                    [$bl, $br] = $band($lineY, $strutLh);
+                    $lineDx = $bl - $startX;
+                    $availW = max(10.0, $br - $bl);
+                } else {
+                    $pendingFloats[] = $fb;
+                }
                 continue;
             }
 
@@ -386,6 +458,10 @@ class InlineLayout
         if (!empty($currentRuns)) {
             $flushLine(true);
         }
+        foreach ($pendingFloats as $pf) {
+            $placedFloats[] = ['handle' => ($floatHooks['place'])($pf, $lineY), 'line' => count($rawLines), 'y' => $lineY];
+        }
+        $pendingFloats = [];
 
         // Drop empty trailing lines produced only by collapsed whitespace
         while (!empty($rawLines) && empty($rawLines[count($rawLines) - 1]['runs']) && !$rawLines[count($rawLines) - 1]['forcedBreak']) {
@@ -402,6 +478,8 @@ class InlineLayout
 
         $cursorY = $startY;
         $totalLines = count($rawLines);
+        /** @var array<int, float> $lineTops */
+        $lineTops = [];
 
         foreach ($rawLines as $lineIdx => $lineData) {
             $runs = $lineData['runs'];
@@ -431,13 +509,15 @@ class InlineLayout
                 }
             }
 
+            $lineTops[$lineIdx] = $cursorY;
             $lineBox = new LineBox();
             $lineStartX = $startX + $lineData['dx'];
             $lineBox->x = $lineStartX;
             $lineBox->y = $cursorY;
 
-            $maxAscent = 0.0;
-            $maxDescent = 0.0;
+            // Negative half-leading (line-height smaller than the font's content area) can make either side negative
+            $maxAscent = -INF;
+            $maxDescent = -INF;
             $maxLineHeight = 0.0;
             $runsTotalWidth = 0.0;
             $spaceCount = 0;
@@ -448,8 +528,8 @@ class InlineLayout
                     $spaceCount++;
                 }
 
-                $lhPt = $this->resolveLineHeight($run->style->get('line-height', '1.4'), $run->fontSizePt);
-                $halfLeading = $run->inlineBox !== null ? 0.0 : max(0.0, ($lhPt - ($run->ascent + $run->descent)) / 2.0);
+                $lhPt = $this->resolveLineHeight($run->style, $run->fontSizePt);
+                $halfLeading = $run->inlineBox !== null ? 0.0 : ($lhPt - ($run->ascent + $run->descent)) / 2.0; // may be negative (CSS 2.1 10.8.1)
                 $vOffset = $this->verticalOffset($run);
 
                 $asc = $run->ascent + $halfLeading + $run->paddingTop - $vOffset;
@@ -462,14 +542,18 @@ class InlineLayout
                 }
             }
 
-            // The strut: every line is at least as tall as the container's own line-height
-            $strutLh = $this->resolveLineHeight($container->style->get('line-height', '1.4'), $container->fontSizePt);
-            if ($maxAscent + $maxDescent <= 0.01) {
+            // The strut (CSS 2.1 10.8.1): every line starts with a zero-width box of the container's font and
+            // line-height, so an image-only line still keeps the descent below the baseline, as in browsers
+            $strutLh = $this->resolveLineHeight($container->style, $container->fontSizePt);
+            [$strutAsc, $strutDesc] = $this->strutMetrics($container, $strutLh);
+            $maxAscent = max($maxAscent, $strutAsc);
+            $maxDescent = max($maxDescent, $strutDesc);
+            if (!is_finite($maxAscent) || !is_finite($maxDescent)) {
                 $maxAscent = $strutLh * 0.78;
                 $maxDescent = $strutLh * 0.22;
             }
 
-            $lineHeight = max($maxLineHeight, $maxAscent + $maxDescent);
+            $lineHeight = max(0.0, $maxLineHeight, $maxAscent + $maxDescent);
             if ($maxAscent + $maxDescent < $lineHeight) {
                 // Distribute remaining leading evenly so the glyphs sit centered inside the line box
                 $extra = ($lineHeight - $maxAscent - $maxDescent) / 2.0;
@@ -512,6 +596,11 @@ class InlineLayout
                     }
                     $run->inlineBox->translate($run->x - $run->inlineBox->x, $boxY - $run->inlineBox->y);
                 }
+                if ($run->relDx !== 0.0 || $run->relDy !== 0.0) {
+                    $run->x += $run->relDx;
+                    $run->y += $run->relDy;
+                    $run->inlineBox?->translate($run->relDx, $run->relDy);
+                }
 
                 $advance = $run->width + $run->paddingLeft + $run->paddingRight;
                 if (($run->isWhitespace || isset($charGaps[spl_object_id($run)])) && $extraSpacePerGap > 0.0) {
@@ -528,7 +617,23 @@ class InlineLayout
             $cursorY += $lineHeight;
         }
 
+        // Floats were placed at estimated line tops: align them with the final ones
+        foreach ($placedFloats as $pf) {
+            $top = $lineTops[$pf['line']] ?? $cursorY;
+            if ($pf['handle'][2] === $pf['y'] && abs($top - $pf['y']) > 0.01) {
+                ($floatHooks['move'])($pf['handle'], $top - $pf['y']);
+            }
+        }
+
         return $cursorY;
+    }
+
+    /** Whether the inline layout is collecting the floats of the block container being laid out. */
+    private bool $collectingFloats = false;
+
+    private function isFloatNode(LayoutBox $node): bool
+    {
+        return !$node->isTextNode() && in_array(strtolower(trim($node->style->get('float', 'none'))), ['left', 'right'], true);
     }
 
     /**
@@ -554,6 +659,18 @@ class InlineLayout
         $width = ($res['units'] / 1000.0) * $run->fontSizePt;
         if ($res['count'] > 0 && abs($run->letterSpacingPt) > 0.001) {
             $width += $res['count'] * $run->letterSpacingPt;
+        }
+        if (str_contains($run->text, '{') && preg_match('/\{(?:PAGE_NUM|PAGE_COUNT|PAGENO|nbpg)\}/', $run->text) === 1) {
+            // Page-number placeholders are replaced while drawing: lay them out as one digit wide, not as the
+            // placeholder text (the renderer re-aligns the real number)
+            $width = $this->fontManager->measureText(
+                (string) preg_replace('/\{(?:PAGE_NUM|PAGE_COUNT|PAGENO|nbpg)\}/', '0', $run->text),
+                $style->get('font-family', 'DejaVu Sans'),
+                $style->get('font-weight', 'normal'),
+                $style->get('font-style', 'normal'),
+                $run->fontSizePt,
+                $run->letterSpacingPt
+            );
         }
         $run->width = $width;
     }
@@ -876,7 +993,7 @@ class InlineLayout
         }
         if ($valign !== 'baseline' && $valign !== '' && preg_match('/^-?[\d.]/', $valign)) {
             // Length / percentage: positive raises the box
-            $ref = $this->resolveLineHeight($run->style->get('line-height', '1.4'), $run->fontSizePt);
+            $ref = $this->resolveLineHeight($run->style, $run->fontSizePt);
             return -CssUnit::toPt($valign, $ref, $run->fontSizePt);
         }
         return 0.0;
@@ -1007,6 +1124,43 @@ class InlineLayout
         }
     }
 
+    /** Longest string (bytes) shaped as one word; longer unbroken fragments are cut into consecutive chunks without a break opportunity. */
+    private const MAX_SHAPE_CHUNK = 8192;
+
+    /**
+     * Shaping a multi-megabyte fragment at once needs ~1 KB per character: cut such fragments into chunks that follow
+     * each other with no break opportunity (the forced character breaking of splitOversizedWordToken() still applies).
+     *
+     * @param list<array{0: string, 1: bool, 2: bool}> $frags
+     * @return list<array{0: string, 1: bool, 2: bool}>
+     */
+    private static function chunkFragments(array $frags): array
+    {
+        $needs = false;
+        foreach ($frags as $f) {
+            if (strlen($f[0]) > self::MAX_SHAPE_CHUNK) {
+                $needs = true;
+                break;
+            }
+        }
+        if (!$needs) {
+            return $frags;
+        }
+        $out = [];
+        foreach ($frags as [$text, $breakAllowed, $isSoft]) {
+            $len = strlen($text);
+            for ($o = 0; $o < $len;) {
+                $chunk = $len <= self::MAX_SHAPE_CHUNK ? $text : mb_strcut($text, $o, self::MAX_SHAPE_CHUNK, 'UTF-8');
+                if ($chunk === '') {
+                    $chunk = substr($text, $o, self::MAX_SHAPE_CHUNK);
+                }
+                $out[] = [$chunk, $o === 0 ? $breakAllowed : false, $o === 0 ? $isSoft : false];
+                $o += strlen($chunk);
+            }
+        }
+        return $out;
+    }
+
     /**
      * Splits a single oversized word TextRun into multiple character-level TextRuns that each fit within $maxWidth.
      *
@@ -1047,19 +1201,36 @@ class InlineLayout
             return $r;
         };
 
-        foreach ($chars as $ch) {
-            $candidate = $currentStr . $ch;
-            $w = $this->fontManager->measureText($candidate, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
+        // Linear: the advance of every distinct character is measured once and summed; a finished line is measured
+        // once as a whole (kerning), so the work is proportional to the word length, not to length x line length
+        $adv = [];
+        $sum = 0.0;
+        $n = count($chars);
+        $start = 0;
+        for ($k = 0; $k < $n; $k++) {
+            $ch = $chars[$k];
+            $a = $adv[$ch] ?? ($adv[$ch] = $this->fontManager->measureText($ch, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt));
             $padLeft = empty($pieces) ? $token->paddingLeft : 0.0;
-            if ($currentStr !== '' && ($w + $padLeft > $limit)) {
-                $pieces[] = $makePiece($currentStr, $currentW);
-                $currentStr = $ch;
-                $currentW = $this->fontManager->measureText($ch, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
+            if ($k > $start && $sum + $a + $padLeft > $limit) {
+                $text = implode('', array_slice($chars, $start, $k - $start));
+                $w = $this->fontManager->measureText($text, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
+                while ($k - $start > 1 && $w + $padLeft > $limit) { // kerning / shaping made the line wider than the sum
+                    $k--;
+                    $text = implode('', array_slice($chars, $start, $k - $start));
+                    $w = $this->fontManager->measureText($text, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
+                }
+                $pieces[] = $makePiece($text, $w);
+                $start = $k;
+                $sum = 0.0;
                 $limit = $lineMaxWidth;
-            } else {
-                $currentStr = $candidate;
-                $currentW = $w;
+                $k--; // re-examine the first character of the next line
+                continue;
             }
+            $sum += $a;
+        }
+        if ($start < $n) {
+            $currentStr = implode('', array_slice($chars, $start));
+            $currentW = $this->fontManager->measureText($currentStr, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt);
         }
 
         if ($currentStr !== '') {
@@ -1079,6 +1250,15 @@ class InlineLayout
      */
     private function collectInlineTokens(LayoutBox $node, float $availableWidth, array &$tokens): void
     {
+        if (!$node->isTextNode() && $node->parent !== null && $this->collectingFloats
+            && in_array(strtolower(trim($node->style->get('float', 'none'))), ['left', 'right'], true)) {
+            // A float of the block container met in its inline content (already sized by the block layout)
+            $marker = new TextRun('', $node->style, 0.0, $node->fontSizePt, 0.0, 0.0);
+            $marker->floatBox = $node;
+            $marker->breakBefore = false;
+            $tokens[] = $marker;
+            return;
+        }
         if ($node->tagName === 'br') {
             $brRun = new TextRun('', $node->style, 0.0, $node->fontSizePt);
             $brRun->isLineBreak = true;
@@ -1214,6 +1394,9 @@ class InlineLayout
         }
 
         if ($first === null) {
+            if (self::hasAnchor($node)) {
+                $this->emptyAnchors[] = [$afterCount, $node]; // <a name="x"></a>: lands on the next token, takes no space
+            }
             // Empty inline element with padding/border still occupies horizontal space
             if ($leftEdge + $rightEdge + $node->marginLeft + $node->marginRight > 0.05 && $this->hasInlineDecoration($node)) {
                 $run = new TextRun("\u{200B}", $node->style, 0.0, $node->fontSizePt, $node->fontSizePt * 0.8, $node->fontSizePt * 0.2);
@@ -1230,12 +1413,24 @@ class InlineLayout
 
         $this->addBidiControls($node, $tokens[$first], $tokens[$last]);
 
+        if (strtolower(trim($node->style->get('position', 'static'))) === 'relative') {
+            // position: relative on an inline element shifts its fragments (and its background) after line layout
+            [$rdx, $rdy] = $this->relativeOffset($node, $availableWidth);
+            if ($rdx !== 0.0 || $rdy !== 0.0) {
+                for ($i = $beforeCount; $i < $afterCount; $i++) {
+                    $tokens[$i]->relDx += $rdx;
+                    $tokens[$i]->relDy += $rdy;
+                }
+            }
+        }
+
         $decorated = $this->hasInlineDecoration($node);
+        $anchored = !$decorated && self::hasAnchor($node);
         $oid = spl_object_id($node);
         for ($i = $beforeCount; $i < $afterCount; $i++) {
             $tokens[$i]->paddingTop = max($tokens[$i]->paddingTop, $padTop + $node->borderTop);
             $tokens[$i]->paddingBottom = max($tokens[$i]->paddingBottom, $padBottom + $node->borderBottom);
-            if ($decorated) {
+            if ($decorated || $anchored) {
                 array_unshift($tokens[$i]->decorations, $node);
             }
         }
@@ -1256,6 +1451,63 @@ class InlineLayout
                 'leftEdge' => $leftEdge,
                 'rightEdge' => $rightEdge,
             ];
+        }
+    }
+
+    /**
+     * `position: relative` offsets of an inline element: left wins over right, top over bottom.
+     *
+     * @return array{0: float, 1: float}
+     */
+    private function relativeOffset(LayoutBox $node, float $availableWidth): array
+    {
+        $len = function (string $prop) use ($node, $availableWidth): ?float {
+            $v = strtolower(trim($node->style->get($prop, 'auto')));
+            if ($v === 'auto' || $v === '' || ($prop !== 'left' && $prop !== 'right' && str_ends_with($v, '%'))) {
+                return null;
+            }
+            return $this->engine->resolveLength($v, $availableWidth, $node->fontSizePt);
+        };
+        $dx = $len('left') ?? (($r = $len('right')) !== null ? -$r : 0.0);
+        $dy = $len('top') ?? (($b = $len('bottom')) !== null ? -$b : 0.0);
+        return [$dx, $dy];
+    }
+
+    /** Whether the element is a link destination (id attribute, or name on <a>). */
+    private static function hasAnchor(LayoutBox $node): bool
+    {
+        $el = $node->domElement;
+        if ($el === null || !$el->hasAttributes()) {
+            return false;
+        }
+        return trim($el->getAttribute('id')) !== '' || ($node->tagName === 'a' && trim($el->getAttribute('name')) !== '');
+    }
+
+    /**
+     * Gives the anchors of empty inline elements to the nearest following (else preceding) visible token. They ride in
+     * TextRun::$decorations, which paints nothing for an element without background or border; the renderer reads them
+     * to register named destinations at the position of the first line fragment.
+     *
+     * @param list<TextRun> $tokens
+     */
+    private function attachEmptyAnchors(array $tokens): void
+    {
+        foreach ($this->emptyAnchors as [$index, $node]) {
+            $target = null;
+            for ($i = $index, $n = count($tokens); $i < $n; $i++) {
+                if (!$tokens[$i]->isLineBreak && !$tokens[$i]->isWhitespace) {
+                    $target = $tokens[$i];
+                    break;
+                }
+            }
+            for ($i = min($index, count($tokens)) - 1; $target === null && $i >= 0; $i--) {
+                if (!$tokens[$i]->isLineBreak && !$tokens[$i]->isWhitespace) {
+                    $target = $tokens[$i];
+                }
+            }
+            if ($target !== null) {
+                $target->decorations[] = $node;
+            }
         }
     }
 
@@ -1331,9 +1583,13 @@ class InlineLayout
         foreach ($parts as $part) {
             $isSpace = trim($part, " \t\n\r\f") === '';
             if ($isSpace) {
-                $part = $preserveSpaces ? str_replace("\t", '    ', $part) : ' ';
-                $w = $this->fontManager->measureText($part, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt)
-                    + $wordSpacingPt * strlen($part);
+                if ($preserveSpaces && str_contains($part, "\t")) {
+                    [$part, $w] = $this->expandTabs($part, $tokens, $style, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt, $wordSpacingPt);
+                } else {
+                    $part = $preserveSpaces ? $part : ' ';
+                    $w = $this->fontManager->measureText($part, $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt)
+                        + $wordSpacingPt * strlen($part);
+                }
                 $run = new TextRun($part, $style, $w, $fontSizePt, $ascentPt, $descentPt, true, $href);
                 $run->letterSpacingPt = $letterSpacingPt;
                 $tokens[] = $run;
@@ -1353,7 +1609,7 @@ class InlineLayout
             } else {
                 $pieces = \IvoPdf\Text\WordBreakMode::apply($pieces, $style);
             }
-            foreach (SoftBreaker::expand($pieces, $style) as [$piece, $breakAllowed, $isSoft]) {
+            foreach (self::chunkFragments(SoftBreaker::expand($pieces, $style)) as [$piece, $breakAllowed, $isSoft]) {
                 // font-variant: small-caps without native glyphs: lowercase letters become capitals at a reduced size
                 $subs = $scMode > 0 ? TextEffects::smallCapsSegments($piece, $scMode) : [[$piece, false]];
                 foreach ($subs as $subIdx => [$subText, $isSmall]) {
@@ -1361,6 +1617,7 @@ class InlineLayout
                     $cSize = $fontSizePt;
                     $cAscent = $ascentPt;
                     $cDescent = $descentPt;
+                    $origText = $subText;
                     if ($isSmall) {
                         $cStyle = $this->smallCapsStyle($style, $fontSizePt);
                         $cSize = $fontSizePt * TextEffects::SMALL_CAPS_SCALE;
@@ -1369,8 +1626,12 @@ class InlineLayout
                         $subText = mb_strtoupper($subText, 'UTF-8');
                     }
                     // Characters missing from the font are rendered with a fallback family (glued to the same word)
-                    foreach ($this->splitByFontCoverage($subText, $cStyle, $fontFamily, $fontWeight, $fontStyle) as $si => [$segment, $segStyle]) {
+                    $segments = $this->splitByFontCoverage($subText, $cStyle, $fontFamily, $fontWeight, $fontStyle);
+                    foreach ($segments as $si => [$segment, $segStyle]) {
                         $run = new TextRun($segment, $segStyle, 0.0, $cSize, $cAscent, $cDescent, false, $href);
+                        if ($isSmall && count($segments) === 1 && $origText !== $segment) {
+                            $run->actualText = $origText; // extracted / searched as the original lowercase text
+                        }
                         $run->letterSpacingPt = $letterSpacingPt;
                         $run->wide = $wide;
                         $this->shapeRun($run);
@@ -1384,6 +1645,78 @@ class InlineLayout
                 }
             }
         }
+    }
+
+    /** @var array{n: int, id: int, w: float}|null running width of the current line in the token list (tab stops) */
+    private ?array $tabColumn = null;
+
+    /**
+     * Width of the tokens on the current (source) line: from the last forced break to the end of $tokens.
+     *
+     * @param list<TextRun> $tokens
+     */
+    private function currentLineWidth(array $tokens): float
+    {
+        $n = count($tokens);
+        $c = $this->tabColumn;
+        if ($c !== null && $c['n'] <= $n && ($c['n'] === 0 || spl_object_id($tokens[$c['n'] - 1]) === $c['id'])) {
+            $w = $c['w'];
+            $from = $c['n'];
+        } else {
+            $w = 0.0;
+            $from = 0;
+        }
+        for ($i = $from; $i < $n; $i++) {
+            $w = $tokens[$i]->isLineBreak ? 0.0 : $w + $tokens[$i]->width;
+        }
+        $this->tabColumn = ['n' => $n, 'id' => $n > 0 ? spl_object_id($tokens[$n - 1]) : 0, 'w' => $w];
+        return $w;
+    }
+
+    /**
+     * Expands tab characters of a preserved-whitespace run to tab stops (CSS `tab-size`: a number of space
+     * advances or a length), measured from the start of the line. Returns the replacement text (spaces
+     * of equivalent width) and its total width.
+     *
+     * @param list<TextRun> $tokens
+     * @return array{0: string, 1: float}
+     */
+    private function expandTabs(
+        string $part,
+        array $tokens,
+        ComputedStyle $style,
+        string $fontFamily,
+        string $fontWeight,
+        string $fontStyle,
+        float $fontSizePt,
+        float $letterSpacingPt,
+        float $wordSpacingPt
+    ): array {
+        $spaceW = $this->fontManager->measureText(' ', $fontFamily, $fontWeight, $fontStyle, $fontSizePt, $letterSpacingPt) + $wordSpacingPt;
+        $raw = trim($style->get('tab-size', '8'));
+        if (is_numeric($raw)) {
+            $tabW = max(0.0, (float) $raw) * $spaceW;
+        } else {
+            $tabW = $this->engine->resolveLength($raw, 0.0, $fontSizePt);
+            if ($tabW < 0.0) {
+                $tabW = 8 * $spaceW;
+            }
+        }
+        $col = $this->currentLineWidth($tokens);
+        $start = $col;
+        $text = '';
+        foreach (str_split($part) as $ch) {
+            if ($ch === "\t") {
+                $next = $tabW > 0.01 ? (floor(($col + 0.01) / $tabW) + 1) * $tabW : $col;
+                $adv = $next - $col;
+                $text .= str_repeat(' ', $spaceW > 0.01 ? max(1, (int) round($adv / $spaceW)) : 1);
+                $col = $next;
+            } else {
+                $text .= ' ';
+                $col += $spaceW;
+            }
+        }
+        return [$text, $col - $start];
     }
 
     /** @var array<string, array{0: ComputedStyle, 1: ComputedStyle}> synthesized small-caps style clones */
@@ -1520,11 +1853,30 @@ class InlineLayout
         return $kept;
     }
 
-    private function resolveLineHeight(string $val, float $fontSizePt): float
+    /**
+     * Ascent and descent of the strut of $container, each including half the leading of its line-height.
+     *
+     * @return array{0: float, 1: float}
+     */
+    private function strutMetrics(LayoutBox $container, float $strutLh): array
     {
-        $v = strtolower(trim($val));
+        $fs = $container->fontSizePt;
+        if ($fs <= 0.0) {
+            return [0.0, 0.0];
+        }
+        $st = $container->style;
+        $ttf = $this->fontManager->resolveFont($st->get('font-family', 'DejaVu Sans'), $st->get('font-weight', 'normal'), $st->get('font-style', 'normal'));
+        $a = ($ttf->ascent / 1000.0) * $fs;
+        $d = (abs($ttf->descent) / 1000.0) * $fs;
+        $half = ($strutLh - ($a + $d)) / 2.0;
+        return [$a + $half, $d + $half];
+    }
+
+    private function resolveLineHeight(ComputedStyle $style, float $fontSizePt): float
+    {
+        $v = strtolower(trim($style->get('line-height', 'normal')));
         if ($v === '' || $v === 'normal') {
-            return $fontSizePt * 1.2;
+            return $this->fontManager->normalLineHeight($style->get('font-family', 'DejaVu Sans'), $style->get('font-weight', 'normal'), $style->get('font-style', 'normal'), $fontSizePt);
         }
         if (is_numeric($v)) {
             return ((float) $v) * $fontSizePt;

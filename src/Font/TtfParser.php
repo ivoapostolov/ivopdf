@@ -280,7 +280,12 @@ class TtfParser
             $sTypoAscender = $this->readInt16($offset + 68);
             $sTypoDescender = $this->readInt16($offset + 70);
             $sTypoLineGap = $this->readInt16($offset + 72);
-            if ($sTypoAscender > 0) {
+            // Line metrics as browsers use them: the OS/2 typo values when the font sets USE_TYPO_METRICS
+            // (fsSelection bit 7) or has no hhea values, otherwise hhea (equal to usWin* in well-made fonts,
+            // which is what DirectWrite/Edge reads)
+            $fsSelection = $this->readUInt16($offset + 62);
+            $useTypo = ($fsSelection & 0x80) !== 0 || $this->ascent <= 0;
+            if ($sTypoAscender > 0 && $useTypo) {
                 $this->ascent = $this->scale($sTypoAscender);
                 $this->descent = $this->scale($sTypoDescender);
                 $this->lineGap = $this->scale($sTypoLineGap);

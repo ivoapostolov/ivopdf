@@ -104,6 +104,9 @@ class ImageLoader
             }
         } elseif (BmpDecoder::isBmp($rawBytes)) {
             $parsed = BmpDecoder::decode($rawBytes, $this->getMaxPixels())?->toParsed('bmp');
+        } elseif (IcoDecoder::isIco($rawBytes)) {
+            $ico = IcoDecoder::decode($rawBytes, $this->getMaxPixels());
+            $parsed = is_string($ico) ? $this->parsePng($ico) : $ico?->toParsed('ico');
         } elseif (TiffDecoder::isTiff($rawBytes)) {
             $parsed = TiffDecoder::decode($rawBytes, $this->getMaxPixels())?->toParsed('tiff');
         } elseif (stripos($rawBytes, '<svg') !== false) {

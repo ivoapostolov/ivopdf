@@ -226,13 +226,13 @@ if ($pages === null) {
         $cards .= "<div style=\"display:inline-block;width:100pt;height:46pt;margin:4pt 6pt 8pt 0;vertical-align:top;background:#ccc\">CARD{$k}</div>";
     }
     $ys = [];
-    foreach ([50, 52] as $n) {
+    foreach ([52, 54] as $n) { // the card row no longer fits on page 1 (page margin + body margin 8px + 52 lines)
         $pdf = render(str_repeat("<p style='margin:0;line-height:14pt'>x</p>", $n) . $cards . '<p>END</p>');
         $pages = pdfWords($pdf);
         $c = wordsMatching($pages[count($pages) - 1], 'CARD0');
         $ys[$n] = $c !== [] ? $c[0][1] : -1.0;
     }
-    check('inline-block row after a page break starts at the top of the new page', $ys[50] > 0 && abs($ys[50] - $ys[52]) < 1.0 && $ys[50] < 60.0, json_encode($ys));
+    check('inline-block row after a page break starts at the top of the new page', $ys[52] > 0 && abs($ys[52] - $ys[54]) < 1.0 && $ys[52] < 60.0, json_encode($ys));
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +316,13 @@ $brNoBr = render('<div id="f" style="float:left">aaaa aaaa aaaa <b>bb</b></div>'
 $tiny = render('<table id="tt" border="1"><tr><td>c</td><td>c</td></tr></table>');
 $tt = findById($tiny->getLayoutTree(), 'tt');
 check('a tiny auto-width table is not shrunk (no per-column minimum width)', $tt !== null && \IvoPdf\Layout\TableShrink::appliedScale($tt) === 1.0 && $tt->width < 40.0, $tt ? sprintf('w=%.1f scale=%.3f', $tt->width, \IvoPdf\Layout\TableShrink::appliedScale($tt)) : 'missing');
-check('<br> ends the line run for max-content',findById($br->getLayoutTree(), 'f')->width < findById($brNoBr->getLayoutTree(), 'f')->width - 5.0);
+$narrow = render('<table id="nt" style="width:1px" border="1"><tr><td>Hello</td><td>World</td></tr></table>');
+$nt = findById($narrow->getLayoutTree(), 'nt');
+check('a too-narrow explicit table width grows to the content minimum', $nt !== null && $nt->width > 50.0, $nt ? sprintf('w=%.1f', $nt->width) : 'missing');
+$exm = render('<style>#em{margin:2ex; margin-left:5px; font-family:Inter}</style><div id="em">t</div>');
+$em = findById($exm->getLayoutTree(), 'em');
+check('a longhand after an ex shorthand still wins when the font changes later', $em !== null && abs($em->marginLeft - 3.75) < 0.01 && $em->marginTop > 5.0, $em ? sprintf('left=%.2f top=%.2f', $em->marginLeft, $em->marginTop) : 'missing');
+check('<br> ends the line run for max-content', findById($br->getLayoutTree(), 'f')->width < findById($brNoBr->getLayoutTree(), 'f')->width - 5.0);
 
 // ---------------------------------------------------------------------------
 echo "\n";

@@ -12,7 +12,19 @@ namespace IvoPdf\Compat\Dompdf;
  *  - page_text() / page_line(): drawn on every page, `{PAGE_NUM}` / `{PAGE_COUNT}` substituted
  *  - page_script(callable): called once per page with ($pageNumber, $pageCount, $canvas, $fontMetrics); the drawing
  *    calls it makes (text(), line(), rect(), image() ...) land on that page. Strings of PHP code are NOT executed.
- *  - text() / line() / rect() / image() ... outside page_script draw on the current page (the last one after render()).
+ *  - text() / line() / rect() / image() ... outside page_script draw on the current page. "Current" is the page number
+ *    returned by get_page_number(): 1 before render(), the last page after render() (as in dompdf, whose canvas stays on
+ *    the last page), or whatever set_page_number() chose.
+ *  - set_opacity($alpha, $mode) / save() / restore(): the opacity (and blend mode, for text and images) applies to the
+ *    drawing calls that follow, until restore() returns to the saved state. The state starts fresh (opaque) for every
+ *    page_script() call. Colors with an 'alpha' entry are multiplied with it.
+ *  - open_object() / close_object() / add_object($id, $where): the drawing calls between open and close are recorded and
+ *    replayed on the pages chosen by $where ('add' = current page only, 'all' = current and following pages, 'next' =
+ *    following pages, 'even' / 'odd' = current and following pages of that parity, 'nexteven' / 'nextodd').
+ *    page_text() is not recorded into objects (it already repeats on every page).
+ *
+ * page_text(): like dompdf, `$y` is the top of the text and the baseline lies one font height (ascent + descent of the
+ * font at that size) below it; the text rotates around its baseline origin.
  */
 final class Canvas
 {
@@ -33,6 +45,21 @@ final class Canvas
     private array $buffer = [];
     /** @var list<string> */
     private array $warnings = [];
+    /** @var array{opacity: float, mode: string} graphics state applied to the drawing calls that follow */
+    private array $gs = ['opacity' => 1.0, 'mode' => 'Normal'];
+    /** @var list<array{opacity: float, mode: string}> */
+    private array $gsStack = [];
+    /** @var array<int, list<array<string, mixed>>> object id => recorded operations */
+    private array $objects = [];
+    private int $nextObject = 1;
+    private ?int $objectTarget = null;
+    /** @var list<array{id: int, where: string, page: int}> add_object() calls made by the application */
+    private array $placements = [];
+    /** @var list<array{id: int, where: string, page: int}> add_object() calls made by page_script() callbacks (this pass) */
+    private array $scriptPlacements = [];
+    /** @var list<int> ids of objects created by page_script() callbacks (this pass) */
+    private array $scriptObjects = [];
+    private int $lastRendered = 0;
 
     public function __construct(private FontMetrics $metrics, float $width = 612.0, float $height = 792.0)
     {
@@ -192,29 +219,82 @@ final class Canvas
         $this->image($img, $x, $y, $w, $h);
     }
 
+    /** Starts recording drawing calls into a reusable object; returns its id. */
     public function open_object(): int
     {
-        return 0;
+        $id = $this->nextObject++;
+        $this->objects[$id] = [];
+        if ($this->rendering) {
+            $this->scriptObjects[] = $id;
+        }
+        $this->objectTarget = $id;
+        return $id;
     }
 
     public function close_object(): void
     {
+        $this->objectTarget = null;
+        if (!$this->rendering) {
+            $this->version++;
+        }
     }
 
+    /** @param int|mixed $object id returned by open_object() */
     public function add_object($object, $where = 'all'): void
     {
+        $id = (int) $object;
+        if (!isset($this->objects[$id])) {
+            return;
+        }
+        $where = strtolower((string) $where);
+        if (!in_array($where, ['all', 'add', 'next', 'even', 'odd', 'nexteven', 'nextodd'], true)) {
+            $where = 'add';
+        }
+        $placement = ['id' => $id, 'where' => $where, 'page' => $this->current];
+        if ($this->rendering) {
+            $this->scriptPlacements[] = $placement;
+            if (self::placed($placement, $this->current)) {
+                array_push($this->buffer, ...$this->objects[$id]);
+            }
+            return;
+        }
+        $this->version++;
+        $this->placements[] = $placement;
     }
 
+    /** @param string $mode PDF blend mode name (Normal, Multiply, Screen, ...), applied to text and images */
     public function set_opacity($opacity, $mode = 'Normal'): void
     {
+        $this->gs['opacity'] = max(0.0, min(1.0, (float) $opacity));
+        $this->gs['mode'] = (string) $mode;
     }
 
     public function save(): void
     {
+        $this->gsStack[] = $this->gs;
     }
 
     public function restore(): void
     {
+        if ($this->gsStack !== []) {
+            $this->gs = array_pop($this->gsStack);
+        }
+    }
+
+    /** @param array{id: int, where: string, page: int} $p */
+    private static function placed(array $p, int $page): bool
+    {
+        $from = $p['page'];
+        return match ($p['where']) {
+            'add' => $page === $from,
+            'all' => $page >= $from,
+            'next' => $page > $from,
+            'even' => $page >= $from && $page % 2 === 0,
+            'odd' => $page >= $from && $page % 2 === 1,
+            'nexteven' => $page > $from && $page % 2 === 0,
+            'nextodd' => $page > $from && $page % 2 === 1,
+            default => false,
+        };
     }
 
     public function get_text_width($text, $font, $size, $wordSpacing = 0.0, $charSpacing = 0.0): float
@@ -239,16 +319,41 @@ final class Canvas
         $this->width = $w;
         $this->height = $h;
         $this->pageCount = $pageCount;
-        $saved = [$this->current, $this->version];
+        $saved = [$this->current, $this->version, $this->gs, $this->gsStack, $this->objectTarget];
         $this->current = $pageNumber;
         $this->rendering = true;
         $this->buffer = [];
+        $this->gs = ['opacity' => 1.0, 'mode' => 'Normal'];
+        $this->gsStack = [];
+        $this->objectTarget = null;
+        if ($pageNumber <= $this->lastRendered) {
+            // a new overlay pass: forget the objects the callbacks created during the previous one
+            foreach ($this->scriptObjects as $id) {
+                unset($this->objects[$id]);
+            }
+            $this->scriptObjects = [];
+            $this->scriptPlacements = [];
+        }
+        $this->lastRendered = $pageNumber;
         try {
             foreach ($this->everyPage as $op) {
                 $this->buffer[] = $op;
             }
+            foreach ($this->placements as $p) {
+                if (self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
+                    array_push($this->buffer, ...$this->objects[$p['id']]);
+                }
+            }
+            foreach ($this->scriptPlacements as $p) {
+                if ($p['page'] < $pageNumber && self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
+                    array_push($this->buffer, ...$this->objects[$p['id']]);
+                }
+            }
             foreach ($this->scripts as $cb) {
+                $this->gs = ['opacity' => 1.0, 'mode' => 'Normal'];
+                $this->gsStack = [];
                 $cb($pageNumber, $pageCount, $this, $this->metrics);
+                $this->objectTarget = null;
             }
             foreach ($this->perPage[$pageNumber] ?? [] as $op) {
                 $this->buffer[] = $op;
@@ -257,7 +362,7 @@ final class Canvas
         } finally {
             $this->rendering = false;
             $this->buffer = [];
-            [$this->current, $this->version] = $saved; // drawing done by callbacks is not an application change
+            [$this->current, $this->version, $this->gs, $this->gsStack, $this->objectTarget] = $saved; // drawing done by callbacks is not an application change
         }
         return $ops === [] ? '' : $this->toHtml($ops, $pageNumber, $pageCount, $w, $h);
     }
@@ -265,6 +370,16 @@ final class Canvas
     /** @param array<string, mixed> $op */
     private function add(array $op): void
     {
+        if ($this->gs['opacity'] < 1.0) {
+            $op['opacity'] = $this->gs['opacity'];
+        }
+        if ($this->gs['mode'] !== 'Normal') {
+            $op['mode'] = $this->gs['mode'];
+        }
+        if ($this->objectTarget !== null) {
+            $this->objects[$this->objectTarget][] = $op;
+            return;
+        }
         if ($this->rendering) {
             $this->buffer[] = $op;
             return;
@@ -284,13 +399,21 @@ final class Canvas
     {
         $html = '';
         $svg = '';
-        $flush = function () use (&$svg, &$html, $w, $h): void {
+        $svgMode = 'Normal';
+        $flush = function () use (&$svg, &$svgMode, &$html, $w, $h): void {
             if ($svg !== '') {
-                $html .= sprintf('<svg xmlns="http://www.w3.org/2000/svg" width="%1$.2F" height="%2$.2F" viewBox="0 0 %1$.2F %2$.2F" style="position:absolute;left:0;top:0">%3$s</svg>', $w, $h, $svg);
+                $html .= sprintf('<svg xmlns="http://www.w3.org/2000/svg" width="%1$.2Fpt" height="%2$.2Fpt" viewBox="0 0 %1$.2F %2$.2F" style="position:absolute;left:0;top:0%4$s">%3$s</svg>', $w, $h, $svg, self::blend($svgMode));
                 $svg = '';
             }
         };
         foreach ($ops as $op) {
+            if (in_array($op['op'], ['line', 'rect', 'circle', 'poly'], true)) {
+                $mode = (string) ($op['mode'] ?? 'Normal');
+                if ($svg !== '' && $mode !== $svgMode) {
+                    $flush();
+                }
+                $svgMode = $mode;
+            }
             switch ($op['op']) {
                 case 'text':
                     $flush();
@@ -299,16 +422,18 @@ final class Canvas
                 case 'image':
                     $flush();
                     $html .= sprintf(
-                        '<img src="%s" style="position:absolute;left:%.2Fpt;top:%.2Fpt;width:%.2Fpt;height:%.2Fpt">',
+                        '<img src="%s" style="position:absolute;left:%.2Fpt;top:%.2Fpt;width:%.2Fpt;height:%.2Fpt%s">',
                         htmlspecialchars($op['src'], ENT_QUOTES, 'UTF-8'),
                         $op['x'],
                         $op['y'],
                         $op['w'],
-                        $op['h']
+                        $op['h'],
+                        (isset($op['opacity']) ? sprintf(';opacity:%.3F', $op['opacity']) : '') . self::blend((string) ($op['mode'] ?? 'Normal'))
                     );
                     break;
                 case 'line':
                     [$rgb, $alpha] = self::color($op['color']);
+                    $alpha *= (float) ($op['opacity'] ?? 1.0);
                     $svg .= sprintf('<line x1="%.2F" y1="%.2F" x2="%.2F" y2="%.2F" stroke="%s" stroke-opacity="%.3F" stroke-width="%.2F"%s/>', $op['x1'], $op['y1'], $op['x2'], $op['y2'], $rgb, $alpha, $op['w'], self::dash($op['dash']));
                     break;
                 case 'rect':
@@ -336,10 +461,15 @@ final class Canvas
         $text = strtr($op['text'], ['{PAGE_NUM}' => (string) $pageNumber, '{PAGE_COUNT}' => (string) $pageCount]);
         [$family, $weight, $style] = FontMetrics::parse($op['font']);
         [$rgb, $alpha] = self::color($op['color']);
+        $alpha *= (float) ($op['opacity'] ?? 1.0);
+        // dompdf puts the baseline one font height (ascent + descent) below y. A line box as tall as the font's content
+        // area has its baseline `ascent` below its top, so the box starts at y + descent.
+        [$asc, $desc] = $this->metrics->ascentDescent($op['font'], $op['size']);
         $css = sprintf(
-            'position:absolute;left:%.2Fpt;top:%.2Fpt;margin:0;padding:0;white-space:pre;line-height:normal;font-family:\'%s\',sans-serif;font-size:%.2Fpt;font-weight:%s;font-style:%s;color:%s',
+            'position:absolute;left:%.2Fpt;top:%.2Fpt;margin:0;padding:0;white-space:pre;line-height:%.3Fpt;font-family:\'%s\',sans-serif;font-size:%.2Fpt;font-weight:%s;font-style:%s;color:%s',
             $op['x'],
-            $op['y'] + 0.23 * $op['size'], // dompdf's y is the top of the text line; a CSS line box starts above the baseline
+            $op['y'] + $desc,
+            $asc + $desc,
             str_replace(["'", '"', '\\', ';'], '', $family),
             $op['size'],
             $weight,
@@ -356,15 +486,25 @@ final class Canvas
             $css .= sprintf(';opacity:%.3F', $alpha);
         }
         if ($op['angle'] != 0.0) {
-            $css .= sprintf(';transform-origin:0 0;transform:rotate(%.3Fdeg)', $op['angle']);
+            $css .= sprintf(';transform-origin:0 %.3Fpt;transform:rotate(%.3Fdeg)', $asc, -$op['angle']);
         }
+        $css .= self::blend((string) ($op['mode'] ?? 'Normal'));
         return '<div style="' . $css . '">' . htmlspecialchars($text, ENT_QUOTES, 'UTF-8') . '</div>';
+    }
+
+    /** CSS for a PDF blend mode name ("Multiply" -> mix-blend-mode), empty for Normal / unknown. */
+    private static function blend(string $mode): string
+    {
+        $m = strtolower(preg_replace('~(?<!^)(?=[A-Z])~', '-', $mode) ?? '');
+        $known = ['multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'];
+        return in_array($m, $known, true) ? ';mix-blend-mode:' . $m : '';
     }
 
     /** @param array<string, mixed> $op */
     private static function paint(array $op): string
     {
         [$rgb, $alpha] = self::color($op['color']);
+        $alpha *= (float) ($op['opacity'] ?? 1.0);
         if ($op['fill']) {
             return sprintf(' fill="%s" fill-opacity="%.3F" stroke="none"', $rgb, $alpha);
         }

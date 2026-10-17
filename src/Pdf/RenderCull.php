@@ -20,10 +20,13 @@ final class RenderCull
     /** Safety margin for borders, collapsed table borders and anti-aliasing (pt) */
     public const SLACK = 30.0;
 
+    /** Boxes without painted children and with at most this many lines are measured on demand instead of cached (a weak-map entry is far larger than the box's extent) */
+    private const CACHE_MIN_LINES = 16;
+
     /** @var WeakMap<LayoutBox, array{0: float, 1: float}> */
     private WeakMap $extents;
 
-    /** @var WeakMap<LayoutBox, array{n: int, lo: list<float>, idx: list<int>, maxHi: list<float>}> children of a box ordered by top edge (long child lists) */
+    /** @var WeakMap<LayoutBox, array{n: int, lo: list<float>, idx: list<int>, maxHi: list<float>, bot: array<int, float>}> children of a box ordered by top edge (long child lists) */
     private WeakMap $childIndex;
 
     /** @var WeakMap<LayoutBox, array{0: bool, 1: int, 2: float}> per box: line y values ascending?, first line not above the last visible window, that window's top */
@@ -81,7 +84,7 @@ final class RenderCull
                 $run = max($run, $bottoms[$i]);
                 $maxHi[$pos] = $run;
             }
-            $ix = ['n' => $n, 'lo' => $sortedLo, 'idx' => $order, 'maxHi' => $maxHi];
+            $ix = ['n' => $n, 'lo' => $sortedLo, 'idx' => $order, 'maxHi' => $maxHi, 'bot' => $bottoms];
             $this->childIndex[$parent] = $ix;
         }
 
@@ -99,7 +102,7 @@ final class RenderCull
         $picked = [];
         for ($pos = $a - 1; $pos >= 0 && $ix['maxHi'][$pos] >= $lo; $pos--) {
             $i = $ix['idx'][$pos];
-            if ($this->extents[$children[$i]][1] >= $lo) {
+            if ($ix['bot'][$i] >= $lo) {
                 $picked[] = $i;
             }
         }
@@ -122,7 +125,8 @@ final class RenderCull
     {
         $lines = $box->lines;
         $n = count($lines);
-        $st = $this->lineWindow[$box] ?? null;
+        $cached = $n > self::CACHE_MIN_LINES; // a cache entry costs more than rescanning a few lines
+        $st = $cached ? ($this->lineWindow[$box] ?? null) : null;
         if ($st === null) {
             $ordered = true;
             $prev = -INF;
@@ -142,7 +146,9 @@ final class RenderCull
         while ($start < $n && $lines[$start]->y + $lines[$start]->height < $top - 0.5) {
             $start++;
         }
-        $this->lineWindow[$box] = [$ordered, $start, $top];
+        if ($cached) {
+            $this->lineWindow[$box] = [$ordered, $start, $top];
+        }
         return [$start, $ordered];
     }
 
@@ -154,6 +160,9 @@ final class RenderCull
         if (isset($this->extents[$box])) {
             return $this->extents[$box];
         }
+        if (!$this->worthCaching($box)) {
+            return $this->compute($box);
+        }
         // Iterative post-order walk (deep trees must not exhaust the PHP stack)
         $stack = [[$box, false]];
         while ($stack !== []) {
@@ -164,7 +173,7 @@ final class RenderCull
             if (!$expanded) {
                 $stack[] = [$b, true];
                 foreach ($this->painted($b) as $c) {
-                    if (!isset($this->extents[$c])) {
+                    if (!isset($this->extents[$c]) && $this->worthCaching($c)) {
                         $stack[] = [$c, false];
                     }
                 }
@@ -173,6 +182,18 @@ final class RenderCull
             $this->extents[$b] = $this->compute($b);
         }
         return $this->extents[$box];
+    }
+
+    /** Leaf-like boxes (nothing painted through them, few lines) are cheap to measure again and not worth a cache entry. */
+    private function worthCaching(LayoutBox $b): bool
+    {
+        if (count($b->lines) > self::CACHE_MIN_LINES) {
+            return true;
+        }
+        if ($b->children === [] && $b->lines === []) {
+            return false;
+        }
+        return $this->painted($b) !== [];
     }
 
     /**
@@ -269,7 +290,7 @@ final class RenderCull
             }
         }
         foreach ($this->painted($b) as $c) {
-            [$clo, $chi] = $this->extents[$c] ?? [-INF, INF];
+            [$clo, $chi] = $this->extents[$c] ?? $this->compute($c); // leaf-like children are not cached
             if ($clo < $lo) {
                 $lo = $clo;
             }

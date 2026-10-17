@@ -71,6 +71,38 @@ function findNode(?LayoutBox $box, callable $pred): ?LayoutBox
     return null;
 }
 
+/** Runs PHP code in a separate process; returns [peak MB, seconds, last output line]. */
+function runIsolated(string $code, string $memoryLimit = '1G'): array
+{
+    $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-dos-run-' . md5(uniqid('', true)) . '.php';
+    $autoload = var_export(realpath(__DIR__ . '/../autoload.php'), true);
+    file_put_contents($file, "<?php\nrequire {$autoload};\n\$t0 = microtime(true);\n{$code}\nfwrite(STDOUT, round(memory_get_peak_usage(true) / 1048576, 1) . ' ' . round(microtime(true) - \$t0, 2) . ' ' . (\$result ?? '') . \"\\n\");\n");
+    $cmd = escapeshellarg(PHP_BINARY);
+    if (php_ini_loaded_file() === false || php_ini_loaded_file() === '') {
+        $cmd .= ' -n -d extension_dir=' . escapeshellarg((string) ini_get('extension_dir'));
+        foreach (['mbstring', 'openssl', 'gd', 'intl'] as $ext) {
+            if (extension_loaded($ext)) {
+                $cmd .= ' -d extension=' . $ext;
+            }
+        }
+    }
+    $out = @shell_exec($cmd . ' -d memory_limit=' . $memoryLimit . ' ' . escapeshellarg($file) . ' 2>&1');
+    @unlink($file);
+    $lines = array_values(array_filter(array_map('trim', explode("\n", (string) $out)), static fn(string $l): bool => $l !== ''));
+    $last = $lines === [] ? '' : $lines[count($lines) - 1];
+    $parts = explode(' ', $last, 3);
+    return [(float) ($parts[0] ?? 9999), (float) ($parts[1] ?? 9999), $parts[2] ?? $last];
+}
+
+/** PHP code (for runIsolated) that renders a rows x 10 table and leaves the retained bytes per cell in $result. */
+function tableMemoryCode(int $rows, string $options): string
+{
+    return '$pdf = new IvoPdf\IvoPdf(' . $options . ');'
+        . '$pdf->loadHtml(\'<table border="1">\' . str_repeat(\'<tr>\' . str_repeat(\'<td>cell</td>\', 10) . \'</tr>\', ' . $rows . ') . \'</table>\');'
+        . '$before = memory_get_usage(); $out = $pdf->output();'
+        . '$result = (string) (int) round((memory_get_usage() - $before) / ' . ($rows * 10) . ');';
+}
+
 function colorOf(IvoPdf $pdf, string $id): string
 {
     $box = findNode($pdf->getLayoutTree(), static fn(LayoutBox $b): bool => $b->domElement !== null && $b->domElement->getAttribute('id') === $id);
@@ -191,10 +223,113 @@ $perCell = (memory_get_usage() - $before) / 4000;
 check('a table cell retains well under 14 KB', $perCell < 14000, sprintf('%.1f KB per cell', $perCell / 1000));
 unset($tablePdf);
 
+// A table of 10 000 / 50 000 cells in its own process (peak of the whole render, bytes retained per cell afterwards)
+[$mb10, , $perCell10] = runIsolated(tableMemoryCode(1000, "['compress' => true]"));
+check('10 000-cell table: peak memory below 56 MB (was 72 MB)', $mb10 < 56.0, "{$mb10} MB");
+check('10 000-cell table: well under 5 KB retained per cell (was 6.8 KB)', (int) $perCell10 > 0 && (int) $perCell10 < 5000, "{$perCell10} B");
+[$mb10off, , ] = runIsolated(tableMemoryCode(1000, "['shrinkTablesToFit' => 0]"));
+check('10 000-cell table with shrinkTablesToFit 0: peak memory below 56 MB', $mb10off < 56.0, "{$mb10off} MB");
+[$mb50, $secs50, $perCell50] = runIsolated(tableMemoryCode(5000, '[]'), '1G');
+check('50 000-cell table: peak memory below 220 MB (was 326 MB)', $mb50 < 220.0, "{$mb50} MB");
+check('50 000-cell table: below 4.2 KB retained per cell (was 6.2 KB)', (int) $perCell50 > 0 && (int) $perCell50 < 4200, "{$perCell50} B");
+check('50 000-cell table renders in time', $secs50 < 120.0, "{$secs50} s");
+
+// Identical cells share one style object (and one text style); a shared style is read-only
+[$sharedPdf] = timed('<table border="1">' . str_repeat('<tr>' . str_repeat('<td>c</td>', 10) . '</tr>', 50) . '</table>');
+$cellStyles = [];
+$textStyles = [];
+$walk = static function (LayoutBox $b) use (&$walk, &$cellStyles, &$textStyles): void {
+    if ($b->tagName === 'td') {
+        $cellStyles[spl_object_id($b->style)] = $b->style;
+    }
+    if ($b->isTextNode()) {
+        $textStyles[spl_object_id($b->style)] = $b->style;
+    }
+    foreach ($b->children as $c) {
+        $walk($c);
+    }
+};
+$walk($sharedPdf->getLayoutTree());
+check('500 identical cells share one style object', count($cellStyles) === 1, (string) count($cellStyles));
+check('and their text nodes share one text style', count($textStyles) === 1, (string) count($textStyles));
+$sharedStyle = reset($cellStyles);
+$threw = false;
+try {
+    $sharedStyle->set('color', '#ff0000');
+} catch (\LogicException) {
+    $threw = true;
+}
+check('a shared style cannot be modified', $threw && $sharedStyle->isShared());
+$copy = $sharedStyle->unshared();
+$copy->set('color', '#ff0000');
+check('a clone of a shared style is private and leaves the original alone', !$copy->isShared() && strtolower($sharedStyle->get('color')) !== '#ff0000' && strtolower($copy->get('color')) === '#ff0000');
+
+// Shrinking one table must not scale the cells of an identical table next to it (their styles are shared)
+$narrowHtml = '<table border="1" id="n">' . str_repeat('<tr><td>alpha</td><td>beta</td><td>gamma</td></tr>', 5) . '</table>';
+$wideHtml = '<table border="1" id="w">' . str_repeat('<tr>' . str_repeat('<td>Wonderfulword</td>', 16) . '</tr>', 5) . '</table>';
+$tableById = static fn(IvoPdf $pdf, string $id): ?LayoutBox => findNode($pdf->getLayoutTree(), static fn(LayoutBox $b): bool => $b->domElement !== null && $b->domElement->getAttribute('id') === $id);
+$cellBoxes = static function (IvoPdf $pdf, string $tableId) use ($tableById): array {
+    $out = [];
+    $stack = [$tableById($pdf, $tableId)];
+    while ($stack !== []) {
+        $b = array_pop($stack);
+        if ($b === null) {
+            continue;
+        }
+        if ($b->tagName === 'td') {
+            $out[] = [round($b->x, 2), round($b->width, 2), round($b->height, 2), $b->style->get('padding-left'), $b->style->get('font-size')];
+        }
+        foreach ($b->children as $c) {
+            $stack[] = $c;
+        }
+    }
+    sort($out);
+    return $out;
+};
+[$aloneN] = timed($narrowHtml);
+[$comboN] = timed($narrowHtml . $wideHtml . $narrowHtml);
+[$aloneW] = timed($wideHtml);
+check('the wide table is scaled down (shrink to fit)', \IvoPdf\Layout\TableShrink::appliedScale($tableById($comboN, 'w')) < 0.9);
+$nAlone = $cellBoxes($aloneN, 'n');
+$nCombo = $cellBoxes($comboN, 'n');
+check('the narrow table next to it keeps its size (cell boxes and styles unchanged)', $nAlone !== [] && array_slice($nCombo, 0, count($nAlone)) === $nAlone, json_encode([$nAlone[0] ?? null, $nCombo[0] ?? null]));
+check('the wide table shrinks the same way alone and next to a narrow one', $cellBoxes($aloneW, 'w') === $cellBoxes($comboN, 'w'));
+
+// Rarely used box / run properties live in a side object but behave like plain properties
+$box = new LayoutBox('div', new \IvoPdf\Css\ComputedStyle());
+check('LayoutBox side properties have their defaults', $box->colspan === 1 && $box->rowspan === 1 && $box->listMarker === null && $box->columnRects === [] && $box->firstLineProps === [] && $box->collapsedMarginTop === 0.0 && $box->href === null);
+$box->colspan = 3;
+$box->href = '#x';
+$box->columnRects = [['x' => 1.0, 'y' => 2.0, 'w' => 3.0, 'h' => 4.0, 'chunk' => 0, 'col' => 0]];
+$box->collapsedMarginTop = 5;
+$box->translate(10.0, 20.0);
+check('LayoutBox side properties read back what was set', $box->colspan === 3 && $box->href === '#x' && $box->collapsedMarginTop === 5.0 && isset($box->href) && !isset($box->imageSrc) && !empty($box->columnRects));
+check('translate() moves the column rects', $box->columnRects[0]['x'] === 11.0 && $box->columnRects[0]['y'] === 22.0);
+$boxCopy = clone $box;
+$boxCopy->colspan = 7;
+$boxCopy->columnRects = [];
+check('a cloned box owns its side properties', $box->colspan === 3 && $boxCopy->colspan === 7 && count($box->columnRects) === 1);
+$box->colspan = 1;
+$box->href = null;
+check('a property set back to its default reads as the default', $box->colspan === 1 && $box->href === null);
+$run = new \IvoPdf\Layout\TextRun('word', new \IvoPdf\Css\ComputedStyle(), 10.0);
+check('TextRun side properties have their defaults', $run->bidiLevel === 0 && $run->bidiPre === [] && $run->softBreak === null && $run->paddingLeft === 0.0 && $run->wide === false && $run->lineStart === false);
+$run->paddingLeft = 2;
+$run->paddingLeft += 1.5;
+$run->bidiPre = [8294];
+$run->softBreak = '-';
+$runCopy = clone $run;
+$runCopy->bidiPre = [];
+$runCopy->paddingLeft = 0.0;
+check('TextRun side properties read, add and clone like plain properties', $run->paddingLeft === 3.5 && $run->bidiPre === [8294] && $run->softBreak === '-' && $runCopy->bidiPre === [] && $runCopy->paddingLeft === 0.0 && $runCopy->softBreak === '-');
+
 // ---------------------------------------------------------------------------
 echo "\n--- 10. maxRenderTime / maxMemory ---\n";
 $defaults = new Options();
-check('defaults: 120 s time budget, memory limit off, barcode limit 5000', $defaults->maxRenderTime === 120.0 && $defaults->maxMemory === 0 && $defaults->getMaxMemoryBytes() === 0 && $defaults->maxBarcodeLength === 5000);
+$phpLimit = \IvoPdf\RenderLimits::phpMemoryLimit();
+check('defaults: 120 s time budget, memory budget auto (90 % of memory_limit), barcode limit 5000', $defaults->maxRenderTime === 120.0 && $defaults->maxMemory === 'auto' && $defaults->getMaxMemoryBytes() === ($phpLimit > 0 ? (int) ($phpLimit * 0.9) : 0) && $defaults->maxBarcodeLength === 5000);
+$tiny = new Options(['maxMemory' => 64]);
+check('maxMemory below 1 MB is ignored with a warning (unit mistake)', $tiny->getMaxMemoryBytes() === ($phpLimit > 0 ? (int) ($phpLimit * 0.9) : 0) && str_contains(implode(' ', $tiny->getWarnings()), "'256M'"));
 check('LimitExceededException is a RuntimeException', is_subclass_of(LimitExceededException::class, \RuntimeException::class));
 
 $big = str_repeat('<p>Paragraph with <b>bold</b> text and more words to wrap around the line.</p>', 15000);
@@ -245,7 +380,9 @@ if (@ini_set('memory_limit', $limitMb . 'M') === false) {
     $o = new Options(['maxMemory' => '50M']);
     check('a budget below the ceiling is kept', $o->getMaxMemoryBytes() === 52428800);
     $o = new Options([]);
-    check('memory limit off by default even with a PHP memory_limit', $o->getMaxMemoryBytes() === 0);
+    check('default budget is 90 % of PHP memory_limit', $o->getMaxMemoryBytes() === (int) ($limitBytes * 0.9));
+    $o = new Options(['maxMemory' => 0]);
+    check('maxMemory 0 turns the budget off', $o->getMaxMemoryBytes() === 0);
 }
 ini_set('memory_limit', $oldLimit === false ? '-1' : $oldLimit);
 

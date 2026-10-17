@@ -284,7 +284,15 @@ if ($info !== null) {
 // ---------------------------------------------------------------------------
 echo "\n6. Engine hygiene\n";
 // ---------------------------------------------------------------------------
-check('no PHP warnings/notices/deprecations', empty($phpIssues), count($phpIssues) . ' issues; first: ' . ($phpIssues[0] ?? ''));
+echo "\n--- <pagebreak orientation> followed by a heading ---\n";
+$orient = new \Mpdf\Mpdf();
+$orient->WriteHTML('<p>a</p><pagebreak orientation="L" /><h1>b</h1><p>t</p><pagebreak orientation="P" /><h1>c</h1>');
+$orientPdf = $orient->Output('', 'S');
+preg_match_all('~/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)~', $orientPdf, $mb);
+$sides = implode('', array_map(static fn($w, $h) => (float) $w > (float) $h ? 'L' : 'P', $mb[1], $mb[2]));
+check('orientation switch + heading: P, L, P without an empty extra page', $sides === 'PLP', $sides);
+
+check('no PHP warnings/notices/deprecations',empty($phpIssues), count($phpIssues) . ' issues; first: ' . ($phpIssues[0] ?? ''));
 
 echo "\n=== Summary: {$passed} passed, {$failed} failed ===\n";
 exit($failed > 0 ? 1 : 0);

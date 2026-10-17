@@ -8,7 +8,7 @@ namespace IvoPdf\Compat;
  * mPDF's inline layout objects, translated to plain HTML/CSS:
  *
  *  - `<dottab outdent="2em" />`: a dotted leader up to the right edge of the line (the text that follows it is pushed
- *    to the right edge), `outdent` keeps that much free space before the tail
+ *    to the right edge); with `outdent` the tab stop sits that far left of the right edge and the tail text ends there
  *  - `<textcircle r="30mm" top-text=".." bottom-text=".." space-width="120" char-width="100" divider=".." style="..">`:
  *    text set along a circle, one rotated element per glyph (glyph widths come from the engine's font manager)
  */
@@ -18,11 +18,20 @@ final class MpdfExtraTags
     public const DOTTAB_CSS = '.ivo-dottab::after{content:leader(\'.\')}';
 
     /** @param array<string, string> $a lower-cased tag attributes */
-    public static function dotTab(array $a): string
+    public static function dotTab(array $a, ?MpdfState $s = null): string
     {
         $style = self::styleMap($a['style'] ?? '');
         $outdent = self::length($a['outdent'] ?? ($style['outdent'] ?? ''), 12.0);
-        return '<span class="ivo-dottab"' . ($outdent > 0 ? ' style="margin-right:' . self::n($outdent) . 'pt"' : '') . '></span>';
+        if ($outdent <= 0 || $s === null) {
+            return '<span class="ivo-dottab"></span>';
+        }
+        // The tab stop is the right edge minus the outdent: PageRefResolver reads `ivo-leader-outdent` from the leader run
+        $cls = 'ivo-dottab-o' . (int) round($outdent * 100);
+        $rule = '.' . $cls . '::after{content:leader('.');ivo-leader-outdent:' . self::n($outdent) . 'pt}';
+        if (!str_contains($s->pageCss, $rule)) {
+            $s->pageCss .= $rule;
+        }
+        return '<span class="ivo-dottab ' . $cls . '"></span>';
     }
 
     /**

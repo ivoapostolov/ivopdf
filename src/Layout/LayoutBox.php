@@ -24,23 +24,20 @@ class LayoutBox
     public array $lines = [];
 
     public ?string $textContent = null;
-    public ?string $imageSrc = null;
     public ?DOMElement $domElement = null;
-    public ?string $href = null;
-    public ?string $listMarker = null;
-    /** list-style-image source (outside markers are drawn by the renderer) */
-    public ?string $listMarkerImage = null;
-    /** Computed ::marker style (color / font-size) when the stylesheet defines one */
-    public ?ComputedStyle $markerStyle = null;
-    /** Computed ::first-line style of a block container (applied to its first line box by InlineLayout) */
-    public ?ComputedStyle $firstLineStyle = null;
-    /** @var list<string> properties declared by the ::first-line rules (only those override the run style) */
-    public array $firstLineProps = [];
 
-    /** Set for <input>/<textarea>/<select>/<button>: the parsed control (replaced box, no child boxes). */
-    public ?FormControl $formControl = null;
-    /** Baseline offset from the box top for form controls (null = bottom edge). */
-    public ?float $formBaseline = null;
+    /**
+     * Rarely used properties live in a BoxExtra that exists only while one of them holds a non-default value:
+     * href, imageSrc, listMarker, listMarkerImage, markerStyle, firstLineStyle, firstLineProps, formControl, formBaseline,
+     * collapsedMarginTop, collapsedMarginBottom, colspan, rowspan, columnFlow and columnRects. They read and write like
+     * ordinary properties (through __get / __set), but an array one is replaced as a whole: no `$box->columnRects[] = x`.
+     */
+    private ?BoxExtra $extra = null;
+
+    // Border-box width / height set explicitly by the parent layout (Flex / Grid / Table); every table cell has them
+    public ?float $forcedBorderBoxWidth = null;
+    public ?float $forcedBorderBoxHeight = null;
+    private static ?BoxExtra $defaults = null;
 
     // Border-box coordinates in pt (top-left origin)
     public float $x = 0.0;
@@ -64,29 +61,11 @@ class LayoutBox
     public float $paddingBottom = 0.0;
     public float $paddingLeft = 0.0;
 
-    /** Margins of the first/last in-flow children that collapsed through this box's edges (see LayoutEngine::layoutBlockChildren) */
-    public float $collapsedMarginTop = 0.0;
-    public float $collapsedMarginBottom = 0.0;
-
     /** Paginator bookkeeping: vertical shift owed to this box's whole subtree, applied lazily (see Paginator::sync) */
     public float $pendingDy = 0.0;
 
-    // Table cell attributes
-    public int $colspan = 1;
-    public int $rowspan = 1;
-
     // Resolved font size in pt
     public float $fontSizePt = 10.5;
-
-    // Flag indicating if width/height was explicitly set by parent layout (Flex/Grid/Table)
-    public ?float $forcedBorderBoxWidth = null;
-    public ?float $forcedBorderBoxHeight = null;
-
-    /** Multi-column flow state (set on column containers by ColumnLayout) */
-    public ?ColumnFlow $columnFlow = null;
-
-    /** @var list<array{x: float, y: float, w: float, h: float, chunk: int, col: int}> Used column rects of a multicol container */
-    public array $columnRects = [];
 
     public function __construct(string $tagName, ComputedStyle $style, ?DOMElement $domElement = null)
     {
@@ -94,6 +73,40 @@ class LayoutBox
         // Text nodes never carry the parent's positioning/float/transform (they would be laid out as out-of-flow)
         $this->style = $this->tagName === '#text' ? $style->forTextNode() : $style;
         $this->domElement = $domElement;
+    }
+
+    public function __clone()
+    {
+        if ($this->extra !== null) {
+            $this->extra = clone $this->extra;
+        }
+    }
+
+    public function __get(string $name): mixed
+    {
+        return ($this->extra ?? self::$defaults ??= new BoxExtra())->$name;
+    }
+
+    public function __set(string $name, mixed $value): void
+    {
+        if ($this->extra === null) {
+            $default = (self::$defaults ??= new BoxExtra())->$name;
+            if ($value === $default || (is_int($value) && is_float($default) && (float) $value === $default)) {
+                return; // still the default: nothing to allocate
+            }
+            $this->extra = new BoxExtra();
+        }
+        $this->extra->$name = $value;
+    }
+
+    public function __isset(string $name): bool
+    {
+        return property_exists(BoxExtra::class, $name) && ($this->extra ?? self::$defaults ??= new BoxExtra())->$name !== null;
+    }
+
+    public function __unset(string $name): void
+    {
+        $this->__set($name, (self::$defaults ??= new BoxExtra())->$name);
     }
 
     public function addChild(LayoutBox $child): void
@@ -184,9 +197,13 @@ class LayoutBox
         $this->x += $dx;
         $this->y += $dy;
 
-        foreach ($this->columnRects as $i => $r) {
-            $this->columnRects[$i]['x'] = $r['x'] + $dx;
-            $this->columnRects[$i]['y'] = $r['y'] + $dy;
+        if ($this->extra !== null && $this->extra->columnRects !== []) {
+            $rects = $this->extra->columnRects;
+            foreach ($rects as $i => $r) {
+                $rects[$i]['x'] = $r['x'] + $dx;
+                $rects[$i]['y'] = $r['y'] + $dy;
+            }
+            $this->extra->columnRects = $rects;
         }
 
         foreach ($this->lines as $line) {

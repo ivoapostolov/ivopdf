@@ -9,13 +9,15 @@ use IvoPdf\Font\FontManager;
 
 /**
  * User-agent styling and intrinsic sizing of form controls (replaced inline-block boxes).
- * Browser-like defaults: 1px #767676 border, white background, 10pt font; checkbox/radio 10pt;
- * text input ~150pt wide; buttons shrink-to-fit their caption.
+ * Browser-like defaults (Chrome / Edge): 1px #767676 border, white background, 10pt Arial-metric font (Liberation
+ * Sans; DejaVu Sans Mono in a textarea), no margins;
+ * checkbox/radio 9.75pt; text input 132.75pt wide (20 characters); textarea in a monospace font, 20 columns x
+ * 2 rows, sitting on the baseline with its bottom edge; buttons shrink-to-fit their caption.
  */
 final class FormControls
 {
-    public const DEFAULT_INPUT_WIDTH = 150.0;
-    public const CHECK_SIZE = 10.0;
+    public const DEFAULT_INPUT_WIDTH = 132.75;
+    public const CHECK_SIZE = 9.75;
     /** Width reserved on the right of a combo box for the drop-down arrow. */
     public const ARROW_WIDTH = 14.0;
 
@@ -41,8 +43,8 @@ final class FormControls
         $s->set('letter-spacing', '0');
         $s->set('text-decoration', 'none');
         $s->set('vertical-align', 'baseline');
-        $s->set('margin-left', '1pt');
-        $s->set('margin-right', '1pt');
+        $s->set('margin-left', '0');
+        $s->set('margin-right', '0');
 
         if ($tag === 'input' && $type === 'hidden') {
             $s->set('display', 'none');
@@ -55,10 +57,11 @@ final class FormControls
             $s->set('border-radius', '0');
             $s->set('width', self::CHECK_SIZE . 'pt');
             $s->set('height', self::CHECK_SIZE . 'pt');
+            // Chrome: margin 3px 3px 3px 4px
             $s->set('margin-left', '3pt');
-            $s->set('margin-right', '3pt');
-            $s->set('margin-top', '2pt');
-            $s->set('margin-bottom', '2pt');
+            $s->set('margin-right', '2.25pt');
+            $s->set('margin-top', '2.25pt');
+            $s->set('margin-bottom', '2.25pt');
             return;
         }
 
@@ -69,12 +72,17 @@ final class FormControls
         $isButton = $tag === 'button' || ($tag === 'input' && in_array($type, ['submit', 'reset', 'button', 'image'], true));
         if ($isButton) {
             $s->set('background-color', '#efefef');
-            $s->set('padding', '2pt 7pt');
+            $s->set('padding', '1.5pt 5.25pt');
             $s->set('text-align', 'center');
             $s->set('border-radius', '3pt');
+        } elseif ($tag === 'select') {
+            $s->set('padding', '0.75pt 1.5pt');
         } else {
-            $s->set('padding', '2pt 3pt');
+            $s->set('padding', '1.5pt 2.25pt');
         }
+        // Controls do not inherit the page font: browsers use Arial (Liberation Sans has its metrics) 13.33px, and a
+        // monospace font for <textarea>
+        $s->set('font-family', $tag === 'textarea' ? 'DejaVu Sans Mono' : 'Liberation Sans');
     }
 
     /**
@@ -132,7 +140,7 @@ final class FormControls
         }
         if ($c->kind === FormControl::TEXTAREA) {
             return [
-                'w' => $c->cols * 0.55 * $fs + $hs,
+                'w' => $c->cols * $this->textWidth($box, '0') + $hs,
                 'h' => $c->rows * $lineH + $vs,
                 'baseline' => $box->borderTop + $box->paddingTop + $asc,
             ];

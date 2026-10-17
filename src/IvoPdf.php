@@ -141,6 +141,7 @@ class IvoPdf
     public function loadHtml(string $html, ?string $basePath = null): self
     {
         $this->html = $html;
+        $this->mpdfWritten = false;
         $this->overrideBasePath = $basePath;
         $effectiveBase = $basePath ?? $this->options->basePath;
         $this->imageLoader = new ImageLoader($effectiveBase, $this->options->isRemoteEnabled, $this->options);
@@ -276,8 +277,13 @@ class IvoPdf
         try {
             $cssParser = new CssParser();
             $domBuilder = new DomBuilder($this->options, $cssParser);
+            // @font-face families must exist before styles are computed (ex / ch units use the real font metrics)
+            $this->fontFacesRegistered = 0;
+            $domBuilder->afterStylesheets = fn() => $this->registerCssFontFaces($cssParser->getFontFaces());
             $rootBox = $domBuilder->build(TocGenerator::process($this->mpdfTransform($this->compatScan($this->html)), $this->tocEnabled, $this->tocTitle, $this->tocMaxLevel));
             $this->registerCssFontFaces($cssParser->getFontFaces());
+            $firstPageLeft = $domBuilder->getDocumentDirection() === 'rtl';
+            $cssParser->getPageRules()->firstPageLeft = $firstPageLeft;
             $running = RunningElements::extract($rootBox); // position: running(name) elements leave the flow
             $this->footnoteExtract($rootBox); // float: footnote elements become calls + notes at the page bottom
 
@@ -347,16 +353,21 @@ class IvoPdf
             $printableHeight = $first['ph'];
             $layoutX = $first['m']['left'];
             $printableWidth = $plan->layoutWidth();
+            $bodyMarginX = $layoutEngine->bodyHorizontalMargins($rootBox, $printableWidth);
             if ($plan->names() !== []) {
-                $this->applyNamedPageWidths($rootBox, $plan, $printableWidth);
+                $this->applyNamedPageWidths($rootBox, $plan, $printableWidth, $bodyMarginX);
             }
             $layoutEngine->setPageGeometry($effectiveTopMargin, $printableHeight);
+            $layoutEngine->setFixedContainingBlock($this->mpdfWritten ? null : [$layoutX, $effectiveTopMargin, $printableWidth, $printableHeight]);
 
             // Layout main document tree inside the effective printable area
-            $layoutEngine->layoutDocument($rootBox, $layoutX, $effectiveTopMargin, $printableWidth);
+            $layoutEngine->layoutDocument($rootBox, $layoutX, $effectiveTopMargin, $printableWidth, true);
+
+            $this->footnotePrepare($rootBox); // footnote-policy: calls whose note must move start a page
 
             // Paginate (including repeating <thead> on multi-page tables)
             $paginator = new Paginator($effectiveTopMargin, $printableHeight);
+            $paginator->setFirstPageLeft($firstPageLeft);
             if (!$plan->isUniform()) {
                 $paginator->setPageGeometry(static fn(int $i, ?string $n): float => $plan->box($i, $n)['ph'], $firstName);
             }
@@ -529,7 +540,7 @@ class IvoPdf
      * Elements on a named page whose @page content width differs from the document layout width get that width,
      * so landscape sections are laid out at their own width.
      */
-    private function applyNamedPageWidths(LayoutBox $box, PageLayoutPlan $plan, float $layoutWidth): void
+    private function applyNamedPageWidths(LayoutBox $box, PageLayoutPlan $plan, float $layoutWidth, float $bodyMarginX = 0.0): void
     {
         foreach ($box->children as $child) {
             if ($child->isTextNode() || $child->isPositionedOutOfFlow()) {
@@ -537,15 +548,16 @@ class IvoPdf
             }
             $decl = strtolower(trim($child->style->get('page', 'auto')));
             if ($decl !== '' && $decl !== 'auto') {
-                $w = $plan->namedWidth($decl);
+                $w = $plan->namedWidth($decl) - $bodyMarginX;
                 $cw = strtolower(trim($child->style->get('width', 'auto')));
-                if (abs($w - $layoutWidth) > 1.0 && ($cw === '' || $cw === 'auto')) {
+                if (abs($w - ($layoutWidth - $bodyMarginX)) > 1.0 && ($cw === '' || $cw === 'auto')) {
+                    $child->style = $child->style->unshared();
                     $child->style->set('box-sizing', 'border-box');
                     $child->style->set('width', sprintf('%.2Fpt', $w));
                 }
                 continue;
             }
-            $this->applyNamedPageWidths($child, $plan, $layoutWidth);
+            $this->applyNamedPageWidths($child, $plan, $layoutWidth, $bodyMarginX);
         }
     }
 
@@ -597,6 +609,9 @@ class IvoPdf
         return $box;
     }
 
+    /** Number of parsed @font-face rules already registered in the current render */
+    private int $fontFacesRegistered = 0;
+
     /**
      * Registers @font-face rules (TrueType sources from data: URIs, allowed local files or safe remote URLs).
      *
@@ -604,6 +619,8 @@ class IvoPdf
      */
     private function registerCssFontFaces(array $faces): void
     {
+        $faces = array_slice($faces, $this->fontFacesRegistered); // already handled when the stylesheets were parsed
+        $this->fontFacesRegistered += count($faces);
         foreach ($faces as $face) {
             $family = trim($face['font-family'] ?? '', " \t\n\r\0\x0B'\"");
             $src = $face['src'] ?? '';

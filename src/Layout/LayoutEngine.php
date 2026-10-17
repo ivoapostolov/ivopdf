@@ -84,11 +84,61 @@ class LayoutEngine
     /**
      * Lays out the root document tree inside the printable page area.
      */
-    public function layoutDocument(LayoutBox $root, float $startX, float $startY, float $printableWidth): void
+    public function layoutDocument(LayoutBox $root, float $startX, float $startY, float $printableWidth, bool $bodyMargins = false): void
     {
         $this->rootFontSizePt = $this->resolveFontSize($root->style, $this->options->defaultFontSize);
-        $root->forcedBorderBoxWidth = $printableWidth;
-        $this->layoutElement($root, $startX, $startY, $printableWidth);
+        if (!$bodyMargins) {
+            $root->forcedBorderBoxWidth = $printableWidth;
+            $this->layoutElement($root, $startX, $startY, $printableWidth);
+            return;
+        }
+        // The document body keeps its margins (UA default 8px, like browsers and dompdf). Its top margin collapses
+        // with the first child's top margin, as the body is not a block formatting context root in a browser.
+        $this->resolveBoxMetrics($root, $printableWidth);
+        $ml = $root->marginLeft;
+        $mr = $root->marginRight;
+        $root->forcedBorderBoxWidth = max(0.0, $printableWidth - $ml - $mr);
+        $this->collapseRoot = $root;
+        $this->mainRoot = $root;
+        $this->pageAreaBoxes = [];
+        try {
+            $this->layoutElement($root, $startX + $ml, $startY, $printableWidth);
+        } finally {
+            $this->collapseRoot = null;
+        }
+        $top = self::collapseMargins($root->marginTop, $root->collapsedMarginTop);
+        if (abs($top) > 0.0001) {
+            $root->translate(0.0, $top);
+            foreach ($this->pageAreaBoxes as $anchored) {
+                $anchored->translate(0.0, -$top); // placed in the page area, not in the body: they keep their place
+            }
+        }
+        $this->pageAreaBoxes = [];
+    }
+
+    /** @var list<LayoutBox> boxes positioned in the page area (fixed, or absolute without a positioned ancestor) */
+    private array $pageAreaBoxes = [];
+
+    /** @var array{0: float, 1: float, 2: float, 3: float}|null containing block of position: fixed [x, y, width, height] */
+    private ?array $fixedArea = null;
+
+    /** Positions `position: fixed` boxes in this area (the page area of the first page) instead of the whole sheet. */
+    public function setFixedContainingBlock(?array $area): void
+    {
+        $this->fixedArea = $area;
+    }
+
+    /** The document body of the main layout: without a positioned ancestor, absolute boxes use the page area. */
+    private ?LayoutBox $mainRoot = null;
+
+    /** The document body while layoutDocument() lays it out with its margins (its first child's top margin escapes). */
+    private ?LayoutBox $collapseRoot = null;
+
+    /** Horizontal margins of the document body, as layoutDocument(..., true) applies them. */
+    public function bodyHorizontalMargins(LayoutBox $root, float $printableWidth): float
+    {
+        $this->resolveBoxMetrics($root, $printableWidth);
+        return $root->marginLeft + $root->marginRight;
     }
 
     /**
@@ -143,6 +193,8 @@ class LayoutEngine
             $contentHeight = $this->gridLayout->layout($box);
         } elseif ($display === 'table' || $display === 'inline-table') {
             $contentHeight = $this->tableLayout->layout($box);
+        } elseif ($box->tagName === 'fieldset' && ($legend = $this->renderedLegend($box)) !== null) {
+            $contentHeight = $this->layoutFieldset($box, $legend);
         } else {
             $contentHeight = ($this->columnLayout->isMulticol($box) ? $this->columnLayout->layout($box) : null)
                 ?? $this->layoutBlockChildren($box);
@@ -168,6 +220,59 @@ class LayoutEngine
 
         // Apply position: relative offset if present
         $this->applyRelativeOffset($box, $containingWidth);
+    }
+
+    /** The first child <legend> of a fieldset (in flow, not floated): it is drawn in the fieldset's top border. */
+    private function renderedLegend(LayoutBox $fieldset): ?LayoutBox
+    {
+        foreach ($fieldset->children as $child) {
+            if ($child->isTextNode()) {
+                if (trim((string) $child->textContent) === '') {
+                    continue;
+                }
+                return null;
+            }
+            if ($child->tagName === 'legend' && !$child->isPositionedOutOfFlow()
+                && strtolower(trim($child->style->get('float', 'none'))) === 'none') {
+                return $child;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * Fieldset with a legend (as browsers draw it): the legend sits at the start of the top border, the border runs
+     * through the legend's middle with a gap behind it, and the content starts below the legend.
+     */
+    private function layoutFieldset(LayoutBox $box, LayoutBox $legend): float
+    {
+        $contentX = $box->getContentX();
+        $contentW = $box->getContentWidth();
+        $this->resolveBoxMetrics($legend, $contentW);
+        $legend->forcedBorderBoxHeight = null;
+        $legend->forcedBorderBoxWidth = $this->clampToMinMaxWidth(
+            $legend,
+            min(max(0.0, $contentW - $legend->marginLeft - $legend->marginRight), $this->measureIntrinsicWidth($legend, $contentW)['max']),
+            $contentW
+        );
+        $this->layoutElement($legend, $contentX + $legend->marginLeft, $box->y + $legend->marginTop, $contentW);
+        $legendH = $legend->getOuterHeight();
+
+        // The top border is drawn through the middle of the legend; the content starts below it
+        $extra = max(0.0, $legendH - $box->borderTop);
+        $box->captionTop = $extra / 2.0;
+        $box->legendGap = [$legend->x - $box->x, $legend->x + $legend->width - $box->x, 0.0, $legendH];
+
+        $children = $box->children;
+        $box->children = array_values(array_filter($children, static fn(LayoutBox $c): bool => $c !== $legend));
+        $box->paddingTop += $extra;
+        try {
+            $h = $this->layoutBlockChildren($box);
+        } finally {
+            $box->children = $children;
+        }
+        return $h;
     }
 
     private function applyMaxHeight(LayoutBox $box, float $containingWidth): void
@@ -206,7 +311,8 @@ class LayoutEngine
 
         // Parent / first-child and parent / last-child margin collapsing (CSS 2.1 8.3.1)
         $canCollapse = $this->createsNoBlockContext($container);
-        $topOpen = $canCollapse && $container->borderTop <= 0.0 && $container->paddingTop <= 0.0;
+        $topOpen = ($canCollapse || ($container === $this->collapseRoot && $container->getDisplay() === 'block'))
+            && $container->borderTop <= 0.0 && $container->paddingTop <= 0.0;
         $bottomOpen = $canCollapse && $container->borderBottom <= 0.0 && $container->paddingBottom <= 0.0
             && $container->forcedBorderBoxHeight === null && $this->hasAutoHeight($container);
 
@@ -236,11 +342,81 @@ class LayoutEngine
             return [$leftEdge, max($leftEdge, $rightEdge)];
         };
 
+        // Places a laid-out float at the first position at or below $placeY where it fits beside earlier floats and
+        // registers it for the line bands; returns a handle for $moveFloat: [side, index, y]
+        $placeFloat = static function (LayoutBox $child, float $placeY) use (&$leftFloats, &$rightFloats, &$maxFloatBottom, $getBandAtY, $contentX, $contentWidth): array {
+            $outerW = $child->getOuterWidth();
+            $outerH = $child->getOuterHeight();
+            $isLeft = strtolower(trim($child->style->get('float', 'none'))) === 'left';
+            // Step down if the current horizontal band between floats is narrower than the float
+            for ($attempt = 0; $attempt < 20; $attempt++) {
+                [$bLeft, $bRight] = $getBandAtY($placeY, max(1.0, $outerH));
+                if (($bRight - $bLeft) >= $outerW - 0.1 || ($bLeft <= $contentX + 0.01 && $bRight >= $contentX + $contentWidth - 0.01)) {
+                    break;
+                }
+                $nextY = null;
+                foreach (array_merge($leftFloats, $rightFloats) as $fl) {
+                    if ($fl['bottom'] > $placeY + 0.01 && ($nextY === null || $fl['bottom'] < $nextY)) {
+                        $nextY = $fl['bottom'];
+                    }
+                }
+                if ($nextY === null) {
+                    break;
+                }
+                $placeY = $nextY;
+            }
+
+            [$bLeft, $bRight] = $getBandAtY($placeY, max(1.0, $outerH));
+            $targetY = $placeY + $child->marginTop;
+            if ($isLeft) {
+                $targetX = $bLeft + $child->marginLeft;
+                $leftFloats[] = ['left' => $bLeft, 'right' => $bLeft + $outerW, 'top' => $placeY, 'bottom' => $placeY + $outerH, 'box' => $child];
+                $handle = ['left', count($leftFloats) - 1, $placeY];
+            } else {
+                $targetX = max($bLeft, $bRight - $child->marginRight - $child->width);
+                $rightFloats[] = ['left' => max($bLeft, $bRight - $outerW), 'right' => $bRight, 'top' => $placeY, 'bottom' => $placeY + $outerH, 'box' => $child];
+                $handle = ['right', count($rightFloats) - 1, $placeY];
+            }
+            $child->translate($targetX - $child->x, $targetY - $child->y);
+            if ($placeY + $outerH > $maxFloatBottom) {
+                $maxFloatBottom = $placeY + $outerH;
+            }
+            return $handle;
+        };
+        // Moves a float placed by the inline layout to the final top of its line
+        $moveFloat = static function (array $handle, float $dy) use (&$leftFloats, &$rightFloats, &$maxFloatBottom): void {
+            [$side, $i] = $handle;
+            if ($side === 'left') {
+                $leftFloats[$i]['top'] += $dy;
+                $leftFloats[$i]['bottom'] += $dy;
+                $leftFloats[$i]['box']->translate(0.0, $dy);
+                $maxFloatBottom = max($maxFloatBottom, $leftFloats[$i]['bottom']);
+            } else {
+                $rightFloats[$i]['top'] += $dy;
+                $rightFloats[$i]['bottom'] += $dy;
+                $rightFloats[$i]['box']->translate(0.0, $dy);
+                $maxFloatBottom = max($maxFloatBottom, $rightFloats[$i]['bottom']);
+            }
+        };
+
         /** @var list<LayoutBox> $inlineBuffer */
         $inlineBuffer = [];
 
-        $flushInlineBuffer = function () use (&$inlineBuffer, $container, &$cursorY, &$prevMarginBottom, $getBandAtY, &$topOpen, &$leftFloats, &$rightFloats): void {
+        $flushInlineBuffer = function () use (&$inlineBuffer, $container, &$cursorY, &$prevMarginBottom, $getBandAtY, &$topOpen, &$leftFloats, &$rightFloats, &$maxFloatBottom, $placeFloat, $moveFloat): void {
             if (empty($inlineBuffer)) {
+                return;
+            }
+            // Collapsible white space between blocks generates no line box: it must not separate their margins
+            $onlySpace = true;
+            foreach ($inlineBuffer as $n) {
+                if (!$n->isTextNode() || trim((string) $n->textContent, " \t\n\r\f") !== ''
+                    || in_array(strtolower(trim($n->style->get('white-space', 'normal'))), ['pre', 'pre-wrap', 'break-spaces'], true)) {
+                    $onlySpace = false;
+                    break;
+                }
+            }
+            if ($onlySpace) {
+                $inlineBuffer = [];
                 return;
             }
             $topOpen = false;
@@ -250,7 +426,24 @@ class LayoutEngine
             }
             [$bandLeft, $bandRight] = $getBandAtY($cursorY, 14.0);
             $bandWidth = max(10.0, $bandRight - $bandLeft);
-            if ($leftFloats !== [] || $rightFloats !== []) {
+            $hasFloat = false;
+            foreach ($inlineBuffer as $n) {
+                if (!$n->isTextNode() && in_array(strtolower(trim($n->style->get('float', 'none'))), ['left', 'right'], true)) {
+                    $hasFloat = true;
+                    break;
+                }
+            }
+            if ($hasFloat) {
+                $snapshot = [$leftFloats, $rightFloats, $maxFloatBottom];
+                $this->inlineLayout->floatHooks = [
+                    'place' => $placeFloat,
+                    'move' => $moveFloat,
+                    'reset' => static function () use (&$leftFloats, &$rightFloats, &$maxFloatBottom, $snapshot): void {
+                        [$leftFloats, $rightFloats, $maxFloatBottom] = $snapshot;
+                    },
+                ];
+            }
+            if ($hasFloat || $leftFloats !== [] || $rightFloats !== []) {
                 // Lines below the end of a float widen again (per-line wrapping around floats)
                 $this->inlineLayout->bandProvider = static fn(float $y, float $h): array => $getBandAtY($y, $h);
             }
@@ -287,8 +480,8 @@ class LayoutEngine
             }
 
             if ($floatCss === 'left' || $floatCss === 'right') {
-                $flushInlineBuffer();
-                $topOpen = false;
+                // A float does not separate the container's top margin from its first in-flow child's: when that
+                // margin escapes, the whole container (float included) moves down with it, as in browsers
                 $this->resolveBoxMetrics($child, $contentWidth);
 
                 $wCss = strtolower(trim($child->style->get('width', 'auto')));
@@ -301,52 +494,14 @@ class LayoutEngine
                 $child->forcedBorderBoxHeight = null;
                 $this->layoutElement($child, 0.0, 0.0, $contentWidth);
 
-                $outerW = $child->getOuterWidth();
-                $outerH = $child->getOuterHeight();
-                $placeY = $cursorY;
-
-                // Step down if current horizontal band between floats is narrower than $outerW
-                for ($attempt = 0; $attempt < 20; $attempt++) {
-                    [$bLeft, $bRight] = $getBandAtY($placeY, max(1.0, $outerH));
-                    if (($bRight - $bLeft) >= $outerW - 0.1 || ($bLeft <= $contentX + 0.01 && $bRight >= $contentX + $contentWidth - 0.01)) {
-                        break;
-                    }
-                    $nextY = null;
-                    foreach (array_merge($leftFloats, $rightFloats) as $fl) {
-                        if ($fl['bottom'] > $placeY + 0.01 && ($nextY === null || $fl['bottom'] < $nextY)) {
-                            $nextY = $fl['bottom'];
-                        }
-                    }
-                    if ($nextY === null) {
-                        break;
-                    }
-                    $placeY = $nextY;
+                if ($inlineBuffer !== []) {
+                    // A float met in the middle of inline content is placed by the inline layout at the line where it
+                    // occurs (CSS 2.1 9.5.1): at the top of that line when it fits beside the line's content so far,
+                    // otherwise at the top of the next line; the lines are wrapped around it
+                    $inlineBuffer[] = $child;
+                    continue;
                 }
-
-                [$bLeft, $bRight] = $getBandAtY($placeY, max(1.0, $outerH));
-                $targetY = $placeY + $child->marginTop;
-                if ($floatCss === 'left') {
-                    $targetX = $bLeft + $child->marginLeft;
-                    $leftFloats[] = [
-                        'left' => $bLeft,
-                        'right' => $bLeft + $outerW,
-                        'top' => $placeY,
-                        'bottom' => $placeY + $outerH,
-                    ];
-                } else {
-                    $targetX = max($bLeft, $bRight - $child->marginRight - $child->width);
-                    $rightFloats[] = [
-                        'left' => max($bLeft, $bRight - $outerW),
-                        'right' => $bRight,
-                        'top' => $placeY,
-                        'bottom' => $placeY + $outerH,
-                    ];
-                }
-
-                $child->translate($targetX - $child->x, $targetY - $child->y);
-                if ($placeY + $outerH > $maxFloatBottom) {
-                    $maxFloatBottom = $placeY + $outerH;
-                }
+                $placeFloat($child, $cursorY);
                 continue;
             }
 
@@ -519,16 +674,44 @@ class LayoutEngine
      */
     private function layoutPositionedChildren(LayoutBox $container): void
     {
+        $jobs = [];
         foreach ($container->children as $child) {
-            if (!$child->isPositionedOutOfFlow()) {
-                continue;
+            if ($child->isPositionedOutOfFlow() && strtolower(trim($child->style->get('position', 'absolute'))) === 'fixed') {
+                $jobs[] = $child;
             }
-
+        }
+        // position: absolute boxes belong to the nearest positioned ancestor (CSS 2.1 10.1): a positioned box lays
+        // out the absolute descendants that no nearer positioned box claims, once its own size is known
+        if ($this->establishesAbsoluteContainingBlock($container)) {
+            $this->collectAbsoluteDescendants($container, $jobs);
+        }
+        foreach ($jobs as $child) {
             $pos = strtolower($child->style->get('position', 'absolute'));
-            $refWidth = ($pos === 'fixed') ? $this->viewportWidthPt : $container->width;
-            $refHeight = ($pos === 'fixed') ? $this->viewportHeightPt : $container->height;
-            $refX = ($pos === 'fixed') ? 0.0 : $container->x;
-            $refY = ($pos === 'fixed') ? 0.0 : $container->y;
+            if ($pos === 'fixed') {
+                // Browsers and dompdf: the page area (inside the page margins), so `bottom: -20pt` reaches into the
+                // bottom margin; mPDF documents: the whole sheet
+                [$refX, $refY, $refWidth, $refHeight] = $this->fixedArea ?? [0.0, 0.0, $this->viewportWidthPt, $this->viewportHeightPt];
+                if ($this->collapseRoot !== null) {
+                    $this->pageAreaBoxes[] = $child; // placed on the page / sheet: the body's collapsed margin does not move it
+                }
+            } elseif ($container === $this->mainRoot && $this->fixedArea !== null) {
+                // No positioned ancestor: the initial containing block, i.e. the page area of the first page
+                [$refX, $refY, $refWidth, $refHeight] = $this->fixedArea;
+                if ($this->collapseRoot !== null) {
+                    $this->pageAreaBoxes[] = $child;
+                }
+            } else {
+                // The padding box of the positioned ancestor
+                $refX = $container->x + $container->borderLeft;
+                $refY = $container->y + $container->borderTop;
+                $refWidth = max(0.0, $container->width - $container->borderLeft - $container->borderRight);
+                $refHeight = max(0.0, $container->height - $container->borderTop - $container->borderBottom);
+            }
+            // Static position (left / top auto): where the box would be in the flow, the content box of its block parent
+            $staticBox = $child->parent ?? $container;
+            while ($staticBox->parent !== null && $staticBox->isInlineLevel() && !$staticBox->isPositionedOutOfFlow()) {
+                $staticBox = $staticBox->parent;
+            }
 
             $this->resolveBoxMetrics($child, $refWidth);
 
@@ -560,7 +743,7 @@ class LayoutEngine
                 $rPt = $this->resolveLength($rightCss, $refWidth, $child->fontSizePt);
                 $targetX = $refX + $refWidth - $rPt - $child->marginRight - $child->width;
             } else {
-                $targetX = $container->getContentX() + $child->marginLeft;
+                $targetX = $staticBox->getContentX() + $child->marginLeft;
             }
 
             // Calculate Y
@@ -570,10 +753,46 @@ class LayoutEngine
                 $bPt = $this->resolveLength($bottomCss, $refHeight, $child->fontSizePt);
                 $targetY = $refY + $refHeight - $bPt - $child->marginBottom - $child->height;
             } else {
-                $targetY = $container->getContentY() + $child->marginTop;
+                $targetY = $staticBox->getContentY() + $child->marginTop;
             }
 
             $child->translate($targetX - $child->x, $targetY - $child->y);
+        }
+    }
+
+    private function establishesAbsoluteContainingBlock(LayoutBox $box): bool
+    {
+        if ($box->parent === null) {
+            return true;
+        }
+        $pos = strtolower(trim($box->style->get('position', 'static')));
+        if ($pos !== 'static' && $pos !== '') {
+            return true;
+        }
+        $t = strtolower(trim($box->style->get('transform', 'none')));
+        return $t !== 'none' && $t !== '';
+    }
+
+    /**
+     * Absolute descendants of $box that are not claimed by a nearer positioned box (nor fixed).
+     *
+     * @param list<LayoutBox> $out
+     */
+    private function collectAbsoluteDescendants(LayoutBox $box, array &$out): void
+    {
+        foreach ($box->children as $child) {
+            if ($child->isTextNode()) {
+                continue;
+            }
+            if ($child->isPositionedOutOfFlow()) {
+                if (strtolower(trim($child->style->get('position', 'absolute'))) !== 'fixed') {
+                    $out[] = $child;
+                }
+                continue;
+            }
+            if (!$this->establishesAbsoluteContainingBlock($child)) {
+                $this->collectAbsoluteDescendants($child, $out);
+            }
         }
     }
 
@@ -705,7 +924,10 @@ class LayoutEngine
             [$lineH, $asc] = $fc->lineMetrics($box);
             $contentH = max(0.0, $box->height - $box->getVerticalSpacing());
             $multi = $c->kind === FormControl::TEXTAREA || $c->isListBox();
-            $baseline = $box->borderTop + $box->paddingTop + ($multi ? 0.0 : max(0.0, ($contentH - $lineH) / 2.0)) + $asc;
+            // A textarea (a scroll container) sits on the baseline with its bottom edge, as in browsers
+            $baseline = $c->kind === FormControl::TEXTAREA
+                ? $box->height
+                : $box->borderTop + $box->paddingTop + ($multi ? 0.0 : max(0.0, ($contentH - $lineH) / 2.0)) + $asc;
         } else {
             $baseline = $box->height;
         }
@@ -717,6 +939,7 @@ class LayoutEngine
         $svgEl = $box->domElement;
         $intrinsicW = 120.0;
         $intrinsicH = 80.0;
+        $pctW = null; // width="100%": a percentage of the containing block, like the CSS width it maps to
 
         if ($svgEl !== null) {
             if ($svgEl->hasAttribute('viewBox')) {
@@ -730,6 +953,8 @@ class LayoutEngine
                 $wAttr = trim($svgEl->getAttribute('width'));
                 if (!str_ends_with($wAttr, '%')) {
                     $intrinsicW = $this->resolveLength($wAttr, $containingWidth, $box->fontSizePt);
+                } elseif (is_numeric(substr($wAttr, 0, -1))) {
+                    $pctW = max(0.0, (float) substr($wAttr, 0, -1)) / 100.0 * $containingWidth;
                 }
             }
             if ($svgEl->hasAttribute('height')) {
@@ -744,14 +969,19 @@ class LayoutEngine
         $wCss = strtolower(trim($box->style->get('width', 'auto')));
         $hCss = strtolower(trim($box->style->get('height', 'auto')));
 
+        $explicitH = $svgEl !== null && $svgEl->hasAttribute('height') && !str_ends_with(trim($svgEl->getAttribute('height')), '%');
         if ($wCss !== 'auto' && $wCss !== '') {
             $box->width = $this->resolveBoxHorizontalDimension($box, $wCss, $containingWidth);
+        } elseif ($pctW !== null) {
+            $box->width = $pctW + $box->getHorizontalSpacing();
         } else {
             $box->width = min($containingWidth, $intrinsicW + $box->getHorizontalSpacing());
         }
 
         if ($hCss !== 'auto' && $hCss !== '') {
             $box->height = $this->resolveBoxVerticalDimension($box, $hCss, $containingWidth);
+        } elseif ($pctW !== null && $explicitH) {
+            $box->height = $intrinsicH + $box->getVerticalSpacing(); // the viewBox is fitted into width x height
         } else {
             $contentW = max(0.0, $box->width - $box->getHorizontalSpacing());
             $box->height = ($contentW / $ratio) + $box->getVerticalSpacing();
@@ -822,6 +1052,10 @@ class LayoutEngine
             };
         } elseif ($wCss !== 'auto' && $wCss !== '') {
             $w = $this->resolveBoxHorizontalDimension($box, $wCss, $containingWidth);
+            if ($box->getDisplay() === 'table' && !TableMetrics::isFixed($box)) {
+                // An auto-layout table is never narrower than its content's minimum width (as in browsers)
+                $w = max($w, TableMetrics::intrinsicWidth($this, $box, $containingWidth)['min']);
+            }
         } elseif ($box->getDisplay() === 'table') {
             // An auto-width table is shrink-to-fit: its max-content width, but never wider than the available space
             $avail = max(0.0, $containingWidth - $box->marginLeft - $box->marginRight);
@@ -921,6 +1155,11 @@ class LayoutEngine
             return ['min' => 0.0, 'max' => 0.0, 'lead' => 0.0, 'trail' => 0.0];
         }
 
+        if ($box->tagName === 'wbr') {
+            // <wbr> is a break opportunity: it ends the unbreakable run before it and starts a new one after it
+            return ['min' => 0.0, 'max' => 0.0, 'minLead' => 0.0, 'minTrail' => 0.0, 'hasBreak' => false, 'startsBreak' => true, 'endsBreak' => true];
+        }
+
         if ($box->tagName === 'img') {
             $img = $box->imageSrc !== null ? $this->imageLoader->load($box->imageSrc) : null;
             $w = ($img !== null ? $img['width'] * CssUnit::PX_TO_PT : 80.0) + $hSpace;
@@ -944,9 +1183,16 @@ class LayoutEngine
         }
 
         if ($box->isTextNode()) {
-            $text = trim($box->textContent ?? '');
+            $rawText = $box->textContent ?? '';
+            $text = trim($rawText);
+            if (str_contains($text, '{')) {
+                $text = (string) preg_replace('/\{(?:PAGE_NUM|PAGE_COUNT|PAGENO|nbpg)\}/', '0', $text); // see InlineLayout::shapeRun()
+            }
             if ($text === '') {
-                return ['min' => 0.0, 'max' => 0.0];
+                // collapsible white space between inline boxes is a break opportunity
+                return ['min' => 0.0, 'max' => 0.0, 'minLead' => 0.0, 'minTrail' => 0.0, 'hasBreak' => false,
+                    'startsBreak' => $rawText !== '', 'endsBreak' => $rawText !== '',
+                    'spW' => $rawText === '' ? 0.0 : $this->fontManager->measureText(' ', $box->style->get('font-family', 'DejaVu Sans'), $box->style->get('font-weight', 'normal'), $box->style->get('font-style', 'normal'), $box->fontSizePt)];
             }
             $ff = $box->style->get('font-family', 'DejaVu Sans');
             $fw = $box->style->get('font-weight', 'normal');
@@ -955,17 +1201,33 @@ class LayoutEngine
 
             $maxW = $this->fontManager->measureText($text, $ff, $fw, $fs, $box->fontSizePt, $ls);
             $words = preg_split('/[ \t\n\r\f]+|(?<=[\p{L}\p{N}][\-\/])(?=[\p{L}\p{N}])/u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: [$text];
-            if (in_array(strtolower($box->style->get('white-space', 'normal')), ['nowrap', 'pre'], true)) {
+            $noWrap = in_array(strtolower($box->style->get('white-space', 'normal')), ['nowrap', 'pre'], true);
+            if ($noWrap) {
                 $words = [$text];
             }
             $minW = 0.0;
-            foreach ($words as $word) {
+            $leadW = 0.0;
+            $trailW = 0.0;
+            $lastIdx = count($words) - 1;
+            foreach ($words as $wi => $word) {
                 $ww = $this->fontManager->measureText($word, $ff, $fw, $fs, $box->fontSizePt, $ls);
                 if ($ww > $minW) {
                     $minW = $ww;
                 }
+                if ($wi === 0) {
+                    $leadW = $ww;
+                }
+                if ($wi === $lastIdx) {
+                    $trailW = $ww;
+                }
             }
-            return ['min' => $minW, 'max' => $maxW];
+            return [
+                'min' => $minW, 'max' => $maxW, 'minLead' => $leadW, 'minTrail' => $trailW, 'hasBreak' => $lastIdx > 0,
+                'startsBreak' => !$noWrap && strspn($rawText, " \t\n\r\f") > 0,
+                'endsBreak' => !$noWrap && strspn(strrev($rawText), " \t\n\r\f") > 0,
+                // collapsible white space at the edges: one space between this text and its inline neighbours
+                'spW' => $this->fontManager->measureText(' ', $ff, $fw, $fs, $box->fontSizePt, $ls),
+            ];
         }
 
         $display = $box->getDisplay();
@@ -979,38 +1241,104 @@ class LayoutEngine
         $maxContent = 0.0;
         $inlineRunMax = 0.0;
         $lead = null; // width of the first line piece, once a forced break was seen
+        // min-content of inline children: widths of the unbreakable runs, split at spaces, hyphens, <wbr> and atomic boxes
+        $minRun = 0.0;
+        $minRunLead = null; // first unbreakable run of this box (reported to an enclosing inline box)
+        $hasInnerBreak = false;
+        $startsBreakOut = null;
+        $endsBreakOut = false;
+        $pendingSpace = 0.0; // collapsed white space between inline pieces of the current line (dropped at line edges)
+        $lastSpW = 0.0;
+        $flushMin = function () use (&$minRun, &$minContent, &$minRunLead, &$hasInnerBreak): void {
+            $minContent = max($minContent, $minRun);
+            $minRunLead ??= $minRun;
+            $hasInnerBreak = true;
+            $minRun = 0.0;
+        };
 
         foreach ($box->children as $child) {
             if ($child->isPositionedOutOfFlow()) {
                 continue;
             }
             $childIntr = $this->measureIntrinsicWidth($child, $referenceWidth, $ignoreExplicitWidth);
-            $childMin = $childIntr['min'] + $child->marginLeft + $child->marginRight;
-            $childMax = $childIntr['max'] + $child->marginLeft + $child->marginRight;
+            // A text node shares its parent's style object: the parent's margins are not the text's
+            $mL = $child->isTextNode() ? 0.0 : $child->marginLeft;
+            $mR = $child->isTextNode() ? 0.0 : $child->marginRight;
+            $childMargins = $mL + $mR;
+            $childMin = $childIntr['min'] + $childMargins;
+            $childMax = $childIntr['max'] + $childMargins;
 
             if ($isFlexRow) {
                 $minContent += $childMin;
                 $maxContent += $childMax;
+            } elseif (in_array(strtolower(trim($child->style->get('float', 'none'))), ['left', 'right'], true)) {
+                // A float sits on the line of the surrounding inline content: its width adds to that line
+                $minContent = max($minContent, $childMin);
+                $inlineRunMax += $childMax + ($inlineRunMax > 0.0 ? $pendingSpace : 0.0); // the text before it keeps its space
+                $pendingSpace = 0.0;
+                $maxContent = max($maxContent, $inlineRunMax);
             } elseif ($child->isInlineLevel() && isset($childIntr['lead'], $childIntr['trail'])) {
                 // Forced break inside: its first piece ends the current line, its last piece starts the next one
-                if ($childMin > $minContent) {
-                    $minContent = $childMin;
-                }
-                $inlineRunMax += $childIntr['lead'] + $child->marginLeft;
+                $minRun += $childIntr['lead'] + $mL;
+                $flushMin();
+                $minContent = max($minContent, $childMin);
+                $minRun = $childIntr['trail'] + $mR;
+                $startsBreakOut ??= false;
+                $endsBreakOut = false;
+                $inlineRunMax += $childIntr['lead'] + $mL;
                 $lead ??= $inlineRunMax;
                 $maxContent = max($maxContent, $inlineRunMax, $childMax);
-                $inlineRunMax = $childIntr['trail'] + $child->marginRight;
+                $inlineRunMax = $childIntr['trail'] + $mR;
                 $maxContent = max($maxContent, $inlineRunMax);
             } elseif ($child->isInlineLevel()) {
-                if ($childMin > $minContent) {
-                    $minContent = $childMin;
+                if (isset($childIntr['minLead'])) {
+                    // text / inline element: break opportunities at its edges and inside
+                    $startsBreakOut ??= $childIntr['startsBreak'];
+                    if ($childIntr['startsBreak']) {
+                        $flushMin();
+                    }
+                    if ($childIntr['hasBreak']) {
+                        $minRun += $childIntr['minLead'] + $mL;
+                        $flushMin();
+                        $minContent = max($minContent, $childMin);
+                        $minRun = $childIntr['minTrail'] + $mR;
+                    } else {
+                        $minRun += $childMin;
+                    }
+                    $endsBreakOut = $childIntr['endsBreak'];
+                    if ($endsBreakOut) {
+                        $flushMin();
+                    }
+                } else {
+                    // atomic inline (image, inline-block, ...): may break on either side
+                    $startsBreakOut ??= true;
+                    $flushMin();
+                    $minContent = max($minContent, $childMin);
+                    $endsBreakOut = true;
                 }
-                $inlineRunMax += $childMax + ($child->isTextNode() ? 3.0 : 0.0);
+                $spW = (float) ($childIntr['spW'] ?? 0.0);
+                if ($spW > 0.0) {
+                    $lastSpW = $spW;
+                }
+                if (isset($childIntr['minLead']) && $childIntr['startsBreak']) {
+                    $pendingSpace = max($pendingSpace, $spW > 0.0 ? $spW : $lastSpW);
+                }
+                if ($childMax > 0.0) {
+                    if ($inlineRunMax > 0.0) {
+                        $inlineRunMax += $pendingSpace;
+                    }
+                    $inlineRunMax += $childMax;
+                    $pendingSpace = isset($childIntr['minLead']) && $childIntr['endsBreak'] ? ($spW > 0.0 ? $spW : $lastSpW) : 0.0;
+                }
                 if ($inlineRunMax > $maxContent) {
                     $maxContent = $inlineRunMax;
                 }
             } else {
                 $inlineRunMax = 0.0;
+                $minContent = max($minContent, $minRun);
+                $minRun = 0.0;
+                $startsBreakOut ??= true;
+                $endsBreakOut = true;
                 if ($childMin > $minContent) {
                     $minContent = $childMin;
                 }
@@ -1019,6 +1347,8 @@ class LayoutEngine
                 }
             }
         }
+
+        $minContent = max($minContent, $minRun);
 
         if ($isFlexRow && count($box->children) > 1) {
             $colGap = $this->resolveLength($box->style->get('column-gap', '0'), $referenceWidth, $box->fontSizePt);
@@ -1036,6 +1366,15 @@ class LayoutEngine
             'min' => $minContent + $hSpace,
             'max' => max($minContent, $maxContent) + $hSpace,
         ];
+        if ($display === 'inline' && !$isFlexRow) {
+            $result['spW'] = $lastSpW;
+            // the first / last unbreakable runs let an enclosing inline box join them to its neighbouring text
+            $result['minLead'] = ($minRunLead ?? $minRun) + $hSpace / 2;
+            $result['minTrail'] = $minRun + $hSpace / 2;
+            $result['hasBreak'] = $hasInnerBreak;
+            $result['startsBreak'] = $startsBreakOut ?? false;
+            $result['endsBreak'] = $endsBreakOut;
+        }
         if ($lead !== null && $display === 'inline' && !$isFlexRow) {
             $result['lead'] = $lead + $hSpace / 2;
             $result['trail'] = $inlineRunMax + $hSpace / 2;

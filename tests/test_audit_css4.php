@@ -116,7 +116,7 @@ function mediaBox(IvoPdf $pdf): ?array
     return null;
 }
 
-const LEFT = 36.0; // default page margin
+const LEFT = 42.0; // default page margin 36pt + body margin 8px (6pt), as in browsers
 $cell = '<tr><td>x</td></tr>';
 
 // ---------------------------------------------------------------------------

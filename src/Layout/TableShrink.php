@@ -103,7 +103,7 @@ final class TableShrink
     }
 
     /**
-     * @param array<int, true> $seen
+     * @param array<int, ComputedStyle> $seen scaled style by the id of the style it replaces
      */
     private static function scaleBox(LayoutBox $box, float $s, array &$seen): void
     {
@@ -112,9 +112,12 @@ final class TableShrink
             $b = array_pop($stack);
             $id = spl_object_id($b->style);
             if (!isset($seen[$id])) {
-                $seen[$id] = true;
-                self::scaleStyle($b->style, $s);
+                // A shared style (the cascade hands identical table cells one object) also serves boxes outside this
+                // table, which must keep their size: scale a private copy and give it to the boxes of this table
+                $seen[$id] = $b->style->isShared() ? clone $b->style : $b->style;
+                self::scaleStyle($seen[$id], $s);
             }
+            $b->style = $seen[$id];
             foreach ($b->children as $c) {
                 $stack[] = $c;
             }

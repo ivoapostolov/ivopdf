@@ -26,6 +26,24 @@ class ComputedStyle
      */
     private array $over = [];
 
+    /** @var array<string, array<string, string>> Interned text-node overlays (see forTextNode()) */
+    private static array $overPool = [];
+
+    /** @see shareToken() */
+    private ?StyleToken $shareToken = null;
+
+    /** @see share() */
+    private bool $shared = false;
+
+    /** Number of ancestor dir/menu/ol/ul elements (UA list defaults: nested margins and bullet styles) */
+    private int $listDepth = 0;
+
+    /** Whether an ancestor is a list (dir, dl, menu, ol, ul) */
+    private bool $inList = false;
+
+    /** The tag the user-agent defaults were applied for */
+    private string $uaTag = '';
+
     private float $parentFontSizePt = 12.0;
     private float $rootFontSizePt = 12.0;
     private float $computedFontSizePt = 12.0;
@@ -74,6 +92,7 @@ class ComputedStyle
         'hyphenate-limit-chars',
         '-ivopdf-lang',
         'tab-size',
+        'caption-side',
         'font-feature-settings',
         'font-kerning',
         'font-variant',
@@ -169,7 +188,7 @@ class ComputedStyle
             'font-size' => $fsStr,
             'font-weight' => 'normal',
             'font-style' => 'normal',
-            'line-height' => '1.4',
+            'line-height' => 'normal',
             'letter-spacing' => '0',
             'text-align' => 'start',
             'text-decoration' => 'none',
@@ -216,7 +235,7 @@ class ComputedStyle
             'grid-row-end' => 'auto',
 
             // Table properties
-            'border-collapse' => 'collapse',
+            'border-collapse' => 'separate',
             'border-spacing' => '0',
             'table-layout' => 'auto',
 
@@ -268,6 +287,9 @@ class ComputedStyle
         }
         $child->computedFontSizePt = $this->computedFontSizePt;
         $child->props['font-size'] = round($this->computedFontSizePt, 4) . 'pt';
+        $isList = in_array($this->uaTag, ['ul', 'ol', 'menu', 'dir'], true);
+        $child->listDepth = $this->listDepth + ($isList ? 1 : 0);
+        $child->inList = $this->inList || $isList || $this->uaTag === 'dl';
 
         $child->applyUserAgentDefaults(strtolower($tagName));
         return $child;
@@ -275,11 +297,20 @@ class ComputedStyle
 
     public function applyUserAgentDefaults(string $tag): void
     {
+        $this->assertNotShared();
+        $this->shareToken = null;
         $this->materialize();
+        $this->uaTag = $tag;
         switch ($tag) {
             case 'html':
+                $this->set('display', 'block');
+                break;
             case 'body':
                 $this->set('display', 'block');
+                // Browsers and dompdf: body { margin: 8px } (the mPDF API, WriteHTML(), resets it to mPDF's 0)
+                foreach (['margin-top', 'margin-right', 'margin-bottom', 'margin-left'] as $side) {
+                    $this->set($side, '6pt');
+                }
                 break;
             case 'center':
                 $this->set('display', 'block');
@@ -342,21 +373,18 @@ class ComputedStyle
                 $this->set('font-weight', 'bold');
                 $this->set('margin-top', '0.67em');
                 $this->set('margin-bottom', '0.67em');
-                $this->set('line-height', '1.25');
                 break;
             case 'h2':
                 $this->set('font-size', '1.5em');
                 $this->set('font-weight', 'bold');
                 $this->set('margin-top', '0.83em');
                 $this->set('margin-bottom', '0.83em');
-                $this->set('line-height', '1.3');
                 break;
             case 'h3':
                 $this->set('font-size', '1.17em');
                 $this->set('font-weight', 'bold');
                 $this->set('margin-top', '1em');
                 $this->set('margin-bottom', '1em');
-                $this->set('line-height', '1.3');
                 break;
             case 'h4':
                 $this->set('font-size', '1em');
@@ -383,52 +411,65 @@ class ComputedStyle
             case 'ul':
             case 'ol':
             case 'menu':
-                $this->set('margin-top', '3pt');
-                $this->set('margin-bottom', '6pt');
-                $this->set('padding-left', '16pt');
-                $this->set('list-style-type', $tag === 'ol' ? 'decimal' : 'disc');
+            case 'dir':
+                // Browser defaults: margin-block 1em, padding-inline-start 40px; a list nested in another list has no
+                // vertical margins (html.css `:is(dir, dl, menu, ol, ul) :is(dir, menu, ol, ul)`)
+                $this->set('display', 'block');
+                $nested = $this->inList;
+                $this->set('margin-top', $nested ? '0' : '1em');
+                $this->set('margin-bottom', $nested ? '0' : '1em');
+                $this->set('padding-left', '30pt');
+                $this->set('list-style-type', $tag === 'ol' ? 'decimal' : ($this->listDepth >= 2 ? 'square' : ($this->listDepth === 1 ? 'circle' : 'disc')));
+                break;
+            case 'dl':
+                $this->set('display', 'block');
+                $this->set('margin-top', $this->inList ? '0' : '1em');
+                $this->set('margin-bottom', $this->inList ? '0' : '1em');
                 break;
             case 'li':
                 $this->set('display', 'list-item');
-                $this->set('margin-bottom', '2pt');
+                break;
+            case 'summary':
+                $this->set('display', 'list-item');
+                $this->set('list-style-type', 'disclosure-closed');
+                $this->set('list-style-position', 'inside');
                 break;
             case 'dd':
-                $this->set('margin-left', '16pt');
-                $this->set('margin-bottom', '4pt');
+                $this->set('display', 'block');
+                $this->set('margin-left', '30pt');
                 break;
             case 'dt':
                 $this->set('font-weight', 'bold');
                 break;
             case 'blockquote':
-                $this->set('margin-top', '6pt');
-                $this->set('margin-bottom', '6pt');
-                $this->set('padding-left', '10pt');
-                $this->set('border-left-width', '3pt');
-                $this->set('border-left-style', 'solid');
-                $this->set('border-left-color', '#cbd5e1');
+                // Browser default: margin 1em 40px
+                $this->set('margin-top', '1em');
+                $this->set('margin-bottom', '1em');
+                $this->set('margin-left', '30pt');
+                $this->set('margin-right', '30pt');
                 break;
             case 'pre':
+            case 'listing':
+            case 'xmp':
+                // Browser default: monospace, white-space: pre, margin 1em 0
                 $this->set('font-family', 'DejaVu Sans Mono');
-                $this->set('white-space', 'pre-wrap');
-                $this->set('padding', '8pt');
-                $this->set('background-color', '#f8fafc');
-                $this->set('border', '1px solid #e2e8f0');
-                $this->set('border-radius', '4pt');
-                $this->set('margin-bottom', '6pt');
+                $this->set('white-space', 'pre');
+                $this->set('margin-top', '1em');
+                $this->set('margin-bottom', '1em');
                 break;
             case 'hr':
+                // Browser default: 1px inset gray border on every side (2px tall), margin 0.5em auto
                 $this->set('display', 'block');
                 $this->set('height', '0');
-                $this->set('border-top-width', '1px');
-                $this->set('border-top-style', 'solid');
-                $this->set('border-top-color', '#e2e8f0');
-                $this->set('margin-top', '8pt');
-                $this->set('margin-bottom', '8pt');
+                $this->set('border', '1px inset gray');
+                $this->set('margin-top', '0.5em');
+                $this->set('margin-bottom', '0.5em');
                 break;
             case 'table':
+                // Browsers, dompdf and mPDF: border-collapse: separate; border-spacing: 2px; no margins
                 $this->set('display', 'table');
-                $this->set('border-collapse', 'collapse');
-                $this->set('margin-bottom', '8pt');
+                $this->set('border-collapse', 'separate');
+                $this->set('border-spacing', '1.5pt');
                 break;
             case 'thead':
                 $this->set('display', 'table-header-group');
@@ -445,7 +486,7 @@ class ComputedStyle
             case 'th':
                 $this->set('display', 'table-cell');
                 $this->set('font-weight', 'bold');
-                $this->set('text-align', 'start');
+                $this->set('text-align', 'center'); // browsers and dompdf: th { text-align: -internal-center }
                 $this->set('vertical-align', 'middle');
                 $this->set('padding', '1px'); // browser and dompdf default
                 break;
@@ -466,12 +507,28 @@ class ComputedStyle
                 $this->set('display', 'table-column');
                 break;
             case 'figure':
-                $this->set('margin-top', '6pt');
-                $this->set('margin-bottom', '6pt');
+                // Browser default: margin 1em 40px
+                $this->set('display', 'block');
+                $this->set('margin-top', '1em');
+                $this->set('margin-bottom', '1em');
+                $this->set('margin-left', '30pt');
+                $this->set('margin-right', '30pt');
                 break;
-            case 'figcaption':
-                $this->set('font-size', '0.9em');
-                $this->set('color', '#475569');
+            case 'fieldset':
+                // Browser default: margin 0 2px; padding 0.35em 0.75em 0.625em; border 2px groove
+                $this->set('display', 'block');
+                $this->set('margin-left', '1.5pt');
+                $this->set('margin-right', '1.5pt');
+                $this->set('padding-top', '0.35em');
+                $this->set('padding-right', '0.75em');
+                $this->set('padding-bottom', '0.625em');
+                $this->set('padding-left', '0.75em');
+                $this->set('border', '1.5pt groove #c0c0c0');
+                break;
+            case 'legend':
+                $this->set('display', 'block');
+                $this->set('padding-left', '1.5pt');
+                $this->set('padding-right', '1.5pt');
                 break;
             case 'nav':
             case 'address':
@@ -578,25 +635,126 @@ class ComputedStyle
 
     /**
      * Returns a copy suitable for an anonymous text node: inherited text properties are kept, while box-level
-     * properties of the parent (position, float, clear, transform…) are reset so the text is never treated as
+     * properties of the parent (position, float, clear, transformРІР‚В¦) are reset so the text is never treated as
      * positioned, floated or transformed on its own.
      */
     public function forTextNode(): self
     {
+        if ($this->shared && $this->shareToken?->textStyle !== null) {
+            return $this->shareToken->textStyle; // every text node of the cells that share this style shares one text style
+        }
         $copy = clone $this; // shares the property arrays; only the differing values are layered on top
+        $copy->shareToken = null;
+        $over = $this->over;
         foreach ([
             'position' => 'static', 'float' => 'none', 'clear' => 'none', 'display' => 'inline',
             'transform' => 'none', 'z-index' => 'auto', 'top' => 'auto', 'right' => 'auto',
             'bottom' => 'auto', 'left' => 'auto', 'column-count' => 'auto', 'column-width' => 'auto',
         ] as $prop => $initial) {
-            if (array_key_exists($prop, $this->props) && ($this->over[$prop] ?? $this->props[$prop]) !== $initial) {
-                $copy->over[$prop] = $initial;
+            if (array_key_exists($prop, $this->props) && ($over[$prop] ?? $this->props[$prop]) !== $initial) {
+                $over[$prop] = $initial;
             }
         }
-        return $copy;
+        if ($over === []) {
+            return $this->shareText($copy);
+        }
+        // The overlay of thousands of text styles is nearly always the same few arrays: keep one instance of each
+        $poolKey = '';
+        foreach ($over as $k => $v) {
+            $poolKey .= $k . ':' . $v . ';';
+        }
+        $copy->over = self::$overPool[$poolKey] ??= $over;
+        if (count(self::$overPool) > 256) {
+            self::$overPool = [];
+        }
+        return $this->shareText($copy);
     }
 
+    /** Remembers the text style derived from a shared style (see forTextNode()). */
+    private function shareText(self $text): self
+    {
+        if ($this->shared) {
+            $text->shared = true;
+            $this->shareToken()->textStyle = $text;
+        }
+        return $text;
+    }
+
+    /**
+     * An object shared by this style and its clones for as long as none of them is modified: two styles with the same
+     * token have identical property arrays (the cascade cache of CssParser keys its entries by it).
+     */
+    private function assertNotShared(): void
+    {
+        if ($this->shared) {
+            throw new \LogicException('A shared ComputedStyle cannot be modified; clone it first.');
+        }
+    }
+
+    public function shareToken(): StyleToken
+    {
+        return $this->shareToken ??= new StyleToken();
+    }
+
+    /**
+     * Marks this style as shared by many boxes (the cascade cache hands the same object to every identical table
+     * cell). A shared style must never change: set() throws; take a clone() (which is not shared) to modify a copy.
+     */
+    public function share(): self
+    {
+        $this->shared = true;
+        return $this;
+    }
+
+    public function isShared(): bool
+    {
+        return $this->shared;
+    }
+
+    /** This style when it is private to its box, otherwise a private copy. */
+    public function unshared(): self
+    {
+        return $this->shared ? clone $this : $this;
+    }
+
+    public function __clone()
+    {
+        $this->shared = false;
+    }
+
+    /**
+     * `ex` / `ch` bookkeeping, [] when the style declares none: 'p' = properties declared with `ex` / `ch` lengths
+     * (key => value), re-resolved when the font changes; 'a' = longhands declared after a pending shorthand
+     * (margin-left after `margin: 2ex`), replayed after it.
+     *
+     * @var array{p?: array<string, string>, a?: array<string, string>}
+     */
+    private array $exCh = [];
+
     public function set(string $prop, string $value): void
+    {
+        $this->assertNotShared();
+        $this->shareToken = null;
+        $this->setProperty($prop, $value);
+        if (($this->exCh['p'] ?? []) !== []) {
+            $key = strtolower(trim($prop));
+            if ($key === 'font-family' || $key === 'font-weight' || $key === 'font-style' || $key === 'font') {
+                // `width: 2ex; font-family: X` -> the unit depends on the element's final font, not the one at declaration time
+                $pending = $this->exCh['p'];
+                $after = $this->exCh['a'] ?? [];
+                $this->exCh = [];
+                foreach ($pending as $pk => $pv) {
+                    $this->setProperty($pk, $pv);
+                }
+                // A longhand declared after the shorthand must still win over the re-applied shorthand
+                foreach ($after as $ak => $av) {
+                    $this->setProperty($ak, $av);
+                }
+            }
+        }
+    }
+
+    private function setProperty(string $prop, string $value): void
     {
         $this->materialize();
         $key = strtolower(trim($prop));
@@ -610,7 +768,17 @@ class ComputedStyle
 
         $val = $this->resolveVariables($val);
         if (self::$fontUnitResolver !== null && $val !== '' && preg_match('/[\d.](?:ex|ch)(?![a-z0-9_-])/i', $val) === 1) {
+            if ($key !== 'font-size' && $key !== 'font') {
+                $this->exCh['p'][$key] = $val;
+            }
             $val = $this->resolveFontRelativeUnits($key, $val);
+        } elseif (($this->exCh['p'] ?? []) !== []) {
+            unset($this->exCh['p'][$key]);
+            foreach ($this->exCh['p'] as $pk => $_) {
+                if (str_starts_with($key, $pk . '-')) {
+                    $this->exCh['a'][$key] = $val;
+                }
+            }
         }
         $lowerVal = strtolower($val);
 

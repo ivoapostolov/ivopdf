@@ -442,7 +442,7 @@ check('CSS var() fallback used', findBoxById($tv, 'v2')->style->get('color') ===
 
 // @page rules (actual page geometry is verified via MediaBox in section 17)
 $atpage = renderDoc('atpage-size', '<html><head><style>@page { size: A5 landscape; margin: 30pt; }</style></head><body><div id="start">x</div></body></html>');
-approx('@page margin 30pt applied to content x', findBoxById($atpage->getLayoutTree(), 'start')->x, 30.0, 1.5);
+approx('@page margin 30pt applied to content x (+ body margin 8px = 6pt)', findBoxById($atpage->getLayoutTree(), 'start')->x, 36.0, 1.5);
 $GENERATED[count($GENERATED) - 1]['w'] = 595.28; // A5 landscape via @page
 $GENERATED[count($GENERATED) - 1]['h'] = 419.53;
 
@@ -481,21 +481,21 @@ $fx = new IvoPdf();
 $fx->loadHtml(sprintf($flexBase, '<div class="f" style="gap:15pt"><div id="a" style="flex:1">A</div><div id="b" style="flex:1">B</div><div id="c" style="flex:1">C</div></div>'))->render();
 $t = $fx->getLayoutTree();
 approx('flex gap: 3 equal items of 480-30 = 150pt', findBoxById($t, 'a')->width, 150.0);
-approx('flex gap: second item x = 36+150+15 = 201pt', findBoxById($t, 'b')->x, 201.0, 1.5);
+approx('flex gap: second item x = 42+150+15 = 207pt', findBoxById($t, 'b')->x, 207.0, 1.5); // page margin 36 + body margin 6
 
 // justify-content variants (3 items x 80pt => leftover 240pt)
 foreach (['flex-start' => 0.0, 'flex-end' => 240.0, 'center' => 120.0, 'space-between' => 0.0, 'space-around' => 40.0, 'space-evenly' => 60.0] as $j => $expX) {
     $fx = new IvoPdf();
     $fx->loadHtml(sprintf($flexBase, '<div class="f" style="justify-content:' . $j . '"><div id="a" style="width:80pt">A</div><div id="b" style="width:80pt">B</div><div id="c" style="width:80pt">C</div></div>'))->render();
     $bx = findBoxById($fx->getLayoutTree(), 'a');
-    approx("justify-content: {$j} first item x", $bx->x - 36.0, $expX, 1.5); // minus page margin 36pt
+    approx("justify-content: {$j} first item x", $bx->x - 42.0, $expX, 1.5); // minus page margin 36pt + body margin 6pt
 }
 
 // justify-content: space-between puts last item flush right
 $fx = new IvoPdf();
 $fx->loadHtml(sprintf($flexBase, '<div class="f" style="justify-content:space-between"><div id="a" style="width:80pt">A</div><div id="b" style="width:80pt">B</div><div id="c" style="width:80pt">C</div></div>'))->render();
 $t = $fx->getLayoutTree();
-approx('justify-content: space-between last flush right', findBoxById($t, 'c')->x + findBoxById($t, 'c')->width, 36.0 + 480.0, 1.5);
+approx('justify-content: space-between last flush right', findBoxById($t, 'c')->x + findBoxById($t, 'c')->width, 42.0 + 480.0, 1.5);
 
 // align-items
 foreach (['flex-start' => 'top', 'center' => 'mid', 'flex-end' => 'bot'] as $ai => $id) {
@@ -530,13 +530,13 @@ $fx = new IvoPdf();
 $fx->loadHtml(sprintf($flexBase, '<div class="f"><div id="a" style="width:300pt">A</div><div id="b" style="width:300pt">B</div></div>'))->render();
 $t = $fx->getLayoutTree();
 check('flex-shrink: 2x300pt shrunk to fit 480pt (240 each)', abs(findBoxById($t, 'a')->width - 240.0) < 2.0 && abs(findBoxById($t, 'b')->width - 240.0) < 2.0, 'a=' . round(findBoxById($t, 'a')->width, 1) . ' b=' . round(findBoxById($t, 'b')->width, 1));
-check('flex-shrink: items stay inside container (x+w <= 516)', findBoxById($t, 'b')->x + findBoxById($t, 'b')->width <= 36.0 + 481.0);
+check('flex-shrink: items stay inside container (x+w <= 522)', findBoxById($t, 'b')->x + findBoxById($t, 'b')->width <= 42.0 + 481.0);
 
 // margin auto
 $fx = new IvoPdf();
 $fx->loadHtml(sprintf($flexBase, '<div class="f"><div id="a" style="width:80pt">A</div><div id="cta" style="width:80pt; margin-left:auto">CTA</div></div>'))->render();
 $t = $fx->getLayoutTree();
-approx('margin-left:auto pushes item to right edge', findBoxById($t, 'cta')->x, 36.0 + 480.0 - 80.0, 1.5);
+approx('margin-left:auto pushes item to right edge', findBoxById($t, 'cta')->x, 42.0 + 480.0 - 80.0, 1.5);
 
 // nested flex
 $fx = new IvoPdf();
@@ -554,7 +554,7 @@ $grid->loadHtml('<html><head><style>.g { display: grid; width: 480pt; grid-templ
 </body></html>')->render();
 $t = $grid->getLayoutTree();
 approx('grid 1fr of (480-30)/3 = 150pt', findBoxById($t, 'c1')->width, 150.0);
-approx('grid second column x = 165pt', findBoxById($t, 'c2')->x - 36.0, 165.0, 1.5);
+approx('grid second column x = 165pt', findBoxById($t, 'c2')->x - 42.0, 165.0, 1.5);
 check('grid auto-placement: 4th item on row 2', findBoxById($t, 'r2')->y > findBoxById($t, 'c1')->y && abs(findBoxById($t, 'r2')->x - findBoxById($t, 'c1')->x) < 1.0);
 
 $grid = new IvoPdf();
@@ -743,7 +743,7 @@ $t = $doc->getLayoutTree();
 check('ul renders list items', findBoxById($t, 'li1') !== null && findBoxById($t, 'li1')->listMarker !== null);
 check('nested list renders', findBoxById($t, 'lin') !== null);
 check('ol item has a marker', findBoxById($t, 'ol1') !== null && findBoxById($t, 'ol1')->listMarker !== null);
-approx('position: absolute left = 150pt', findBoxById($t, 'absbox')->x, 36.0 + 150.0, 2.0);
+approx('position: absolute left = 150pt', findBoxById($t, 'absbox')->x, 42.0 + 150.0, 2.0);
 approx('position: absolute top = 100pt (relative to positioned parent)', findBoxById($t, 'absbox')->y, findBoxById($t, 'absbox')->parent->y + 100.0 - 10.0, 12.0);
 $bytes = $doc->output();
 check('link emitted as /URI annotation', strpos($bytes, '/URI') !== false && strpos($bytes, 'example.com') !== false);

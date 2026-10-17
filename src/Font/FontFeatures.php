@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace IvoPdf\Font;
 
 use IvoPdf\Css\ComputedStyle;
-use WeakMap;
 
 /**
  * Derives the OpenType feature set (tag => value) from CSS font-feature-settings, font-kerning,
@@ -30,24 +29,35 @@ final class FontFeatures
         'he' => 'IWR ', 'hi' => 'HIN ', 'mr' => 'MAR ', 'ne' => 'NEP ', 'sa' => 'SAN ',
     ];
 
-    /** @var WeakMap<ComputedStyle, array<string, int>>|null */
-    private static ?WeakMap $cache = null;
+    /**
+     * Feature sets by the style values they derive from. Keyed by value (not by style object): a document with
+     * hundreds of thousands of text styles then keeps a handful of entries instead of one weak-map slot per style.
+     *
+     * @var array<string, array<string, int>>
+     */
+    private static array $cache = [];
 
     /**
      * @return array<string, int>
      */
     public static function fromStyle(ComputedStyle $style, float $letterSpacingPt = 0.0): array
     {
-        self::$cache ??= new WeakMap();
-        if (!isset(self::$cache[$style])) {
-            $computed = self::compute($style);
+        $key = $style->get('font-kerning', 'auto') . "\0" . $style->get('font-variant', 'normal') . "\0"
+            . $style->get('font-variant-ligatures', 'normal') . "\0" . $style->get('font-variant-caps', 'normal') . "\0"
+            . $style->get('font-variant-numeric', 'normal') . "\0" . $style->get('font-feature-settings', 'normal') . "\0"
+            . $style->get('-ivopdf-lang', '');
+        $features = self::$cache[$key] ?? null;
+        if ($features === null) {
+            $features = self::compute($style);
             $lang = self::otLanguage($style->get('-ivopdf-lang', ''));
             if ($lang !== null) {
-                $computed[self::LANG_KEY] = (int) unpack('N', $lang)[1];
+                $features[self::LANG_KEY] = (int) unpack('N', $lang)[1];
             }
-            self::$cache[$style] = $computed;
+            if (count(self::$cache) >= 512) {
+                self::$cache = [];
+            }
+            self::$cache[$key] = $features;
         }
-        $features = self::$cache[$style];
         if (abs($letterSpacingPt) > 0.001) {
             // CSS: optional ligatures are disabled when letter-spacing is non-zero
             $features += ['liga' => 0, 'clig' => 0];

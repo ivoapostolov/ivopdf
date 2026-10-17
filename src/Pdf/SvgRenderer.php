@@ -94,7 +94,21 @@ class SvgRenderer
     /**
      * Generates PDF content stream commands to draw an <svg> element inside ($boxX, $boxY, $boxW, $boxH)
      * where $boxY is in top-left document coordinates and $pageHeight is the PDF page height.
+     *
+     * @param array{size?: float, family?: string, weight?: string, style?: string}|null $inheritedFont font of the
+     *        HTML context (size in pt) that inline SVG text inherits
      */
+    /**
+     * Link areas of the last renderSvg() call (<a href> elements): [x0, y0, x1, y1, href] in top-left document
+     * coordinates, read by the page renderer to add /Link annotations.
+     *
+     * @var list<array{0: float, 1: float, 2: float, 3: float, 4: string}>
+     */
+    public array $links = [];
+
+    /** @var array{0: float, 1: float, 2: float, 3: float}|null bounding box of what an open <a> draws */
+    private ?array $linkBox = null;
+
     public function renderSvg(
         DOMElement $svg,
         float $boxX,
@@ -102,13 +116,16 @@ class SvgRenderer
         float $boxW,
         float $boxH,
         float $pageHeight,
-        string $inheritedColorHex = '#111827'
+        string $inheritedColorHex = '#111827',
+        ?array $inheritedFont = null
     ): string {
         if ($boxW <= 0.1 || $boxH <= 0.1) {
             return '';
         }
 
         $this->rootSvg = $svg;
+        $this->links = [];
+        $this->linkBox = null;
         $this->useBudget = self::MAX_USE_INSTANCES;
         $this->idMap = [];
         $this->indexIds($svg);
@@ -160,10 +177,11 @@ class SvgRenderer
             'lineJoin' => 0,
             'miterLimit' => 4.0,
             'fillRule' => 'nonzero',
-            'fontSize' => 12.0,
-            'fontFamily' => 'DejaVu Sans',
-            'fontWeight' => 'normal',
-            'fontStyle' => 'normal',
+            // Inline <svg> text inherits the font of the HTML context (CSS px = SVG user units), as in browsers
+            'fontSize' => isset($inheritedFont['size']) ? (float) $inheritedFont['size'] / 0.75 : 12.0,
+            'fontFamily' => $inheritedFont['family'] ?? 'DejaVu Sans',
+            'fontWeight' => $inheritedFont['weight'] ?? 'normal',
+            'fontStyle' => $inheritedFont['style'] ?? 'normal',
             'textAnchor' => 'start',
             'visible' => true,
             'ctm' => [$sx, 0.0, 0.0, $sy, $boxX + $tx - $vbX * $sx, $boxY + $ty - $vbY * $sy],
@@ -372,8 +390,27 @@ class SvgRenderer
         $fxOpen = $this->openEffects($el, $s, $out);
         $this->lastPath = null;
         switch ($tag) {
-            case 'g':
             case 'a':
+                $href = trim((string) ($el->getAttribute('href') !== '' ? $el->getAttribute('href') : $el->getAttributeNS('http://www.w3.org/1999/xlink', 'href')));
+                if ($href === '' && $el->hasAttribute('xlink:href')) {
+                    $href = trim($el->getAttribute('xlink:href'));
+                }
+                $outer = $this->linkBox;
+                $this->linkBox = [INF, INF, -INF, -INF];
+                $this->renderChildren($el, $s, $out);
+                $box = $this->linkBox;
+                $this->linkBox = $outer;
+                if ($box[0] < $box[2] && $box[1] < $box[3]) {
+                    if ($href !== '') {
+                        $this->links[] = [$box[0], $box[1], $box[2], $box[3], $href];
+                    }
+                    if ($outer !== null) {
+                        $this->extendLinkBox($box[0], $box[1]);
+                        $this->extendLinkBox($box[2], $box[3]);
+                    }
+                }
+                break;
+            case 'g':
             case 'switch':
                 $this->renderChildren($el, $s, $out);
                 break;
@@ -510,7 +547,35 @@ class SvgRenderer
         $m = $s['ctm'];
         $docX = $m[0] * $sx + $m[2] * $sy + $m[4];
         $docY = $m[1] * $sx + $m[3] * $sy + $m[5];
+        if ($this->linkBox !== null) {
+            $this->extendLinkBox($docX, $docY);
+        }
         return [$docX, (float) $s['pageHeight'] - $docY];
+    }
+
+    private function extendLinkBox(float $x, float $y): void
+    {
+        if ($this->linkBox !== null) {
+            $this->linkBox = [min($this->linkBox[0], $x), min($this->linkBox[1], $y), max($this->linkBox[2], $x), max($this->linkBox[3], $y)];
+        }
+    }
+
+    /**
+     * Adds the box of a text run (baseline at user-space x, y) to the open <a> area.
+     *
+     * @param array<string, mixed> $s
+     */
+    private function linkTextBox(string $text, array $s, float $x, float $y): void
+    {
+        if ($this->linkBox === null) {
+            return;
+        }
+        $fs = (float) $s['fontSize'];
+        $w = $this->fontManager->measureText($text, (string) $s['fontFamily'], (string) $s['fontWeight'], (string) $s['fontStyle'], $fs);
+        $m = $s['ctm'];
+        foreach ([[$x, $y - 0.8 * $fs], [$x + $w, $y - 0.8 * $fs], [$x, $y + 0.25 * $fs], [$x + $w, $y + 0.25 * $fs]] as [$px, $py]) {
+            $this->extendLinkBox($m[0] * $px + $m[2] * $py + $m[4], $m[1] * $px + $m[3] * $py + $m[5]);
+        }
     }
 
     /**
@@ -1544,6 +1609,12 @@ class SvgRenderer
                 if (!$this->applyElementAttributes($child, $cs)) {
                     continue;
                 }
+                if ($tag === 'a') {
+                    $href = trim($child->getAttribute('href') !== '' ? $child->getAttribute('href') : $child->getAttribute('xlink:href'));
+                    if ($href !== '') {
+                        $cs['href'] = $href;
+                    }
+                }
                 $pending = $this->collectTextRuns($child, $cs, $runs, $pending);
             }
         }
@@ -1562,6 +1633,16 @@ class SvgRenderer
         if (!$s['visible'] || $fs <= 0) {
             return;
         }
+        if (isset($s['href']) && $s['href'] !== '') {
+            // <a> inside <text>: a link area of its own
+            $outer = $this->linkBox;
+            $this->linkBox = [INF, INF, -INF, -INF];
+            $this->linkTextBox($text, $s, $x, $y);
+            $box = $this->linkBox;
+            $this->linkBox = $outer;
+            $this->links[] = [$box[0], $box[1], $box[2], $box[3], (string) $s['href']];
+        }
+        $this->linkTextBox($text, $s, $x, $y);
         if ($this->textExtras($text, $s, $x, $y, $out)) { // bbox probing / gradient & pattern fills
             return;
         }

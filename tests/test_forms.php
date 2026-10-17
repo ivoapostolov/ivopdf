@@ -234,7 +234,7 @@ $controls = array_values($controls);
 check('Three form control boxes in layout', count($controls) === 3, (string) count($controls));
 check('Controls have no child boxes (option/textarea text not rendered as text)', count(array_filter($controls, static fn($b): bool => $b->children !== [])) === 0);
 $styled = $controls[2] ?? null;
-check('CSS width/height apply to controls', $styled !== null && abs($styled->width - 157.5) < 0.5 && abs($styled->height - 28.0) < 0.5, $styled ? "{$styled->width}x{$styled->height}" : 'none');
+check('CSS width/height apply to controls', $styled !== null && abs($styled->width - 156.0) < 0.5 && abs($styled->height - 27.0) < 0.5, $styled ? "{$styled->width}x{$styled->height}" : 'none');
 $plainInput = (new IvoPdf());
 $plainInput->loadHtml('<input type="text"><input type="checkbox"><button>Go</button>');
 $plainInput->render();
@@ -256,8 +256,8 @@ $walk2 = static function ($box) use (&$walk2, &$ctrls): void {
 };
 $walk2($plainInput->getLayoutTree());
 $ctrls = array_values($ctrls);
-check('Default text input ~150pt wide', isset($ctrls[0]) && abs($ctrls[0]->width - 150.0) < 1.0 && $ctrls[0]->height > 14.0 && $ctrls[0]->height < 22.0);
-check('Default checkbox is 10pt square', isset($ctrls[1]) && abs($ctrls[1]->width - 10.0) < 0.1 && abs($ctrls[1]->height - 10.0) < 0.1);
+check('Default text input 132.75pt wide (Chrome: 20 characters of 13.33px Arial)', isset($ctrls[0]) && abs($ctrls[0]->width - 132.75) < 1.0 && $ctrls[0]->height > 14.0 && $ctrls[0]->height < 22.0);
+check('Default checkbox is 9.75pt (13px) square', isset($ctrls[1]) && abs($ctrls[1]->width - 9.75) < 0.1 && abs($ctrls[1]->height - 9.75) < 0.1);
 check('Button shrinks to its caption', isset($ctrls[2]) && $ctrls[2]->width > 15.0 && $ctrls[2]->width < 60.0);
 
 echo "\n== formFields=false (print view) ==\n";

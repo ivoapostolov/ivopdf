@@ -50,6 +50,10 @@ class PdfDocument
 
     /** @var array<string, array{page: int, y: float}> Named destinations (element ids) */
     private array $destinations = [];
+    /** @var array<int, true> spl_object_id of every FormControl that already has a widget */
+    private array $widgetControls = [];
+    /** @var array<string, true> internal link targets already reported as missing */
+    private array $unresolvedLinks = [];
 
     /** @var list<array{level: int, title: string, page: int, y: float}> Document outline (bookmarks) */
     private array $outlines = [];
@@ -139,7 +143,10 @@ class PdfDocument
      */
     public function addFormWidget(int $pageIndex, array $rect, FormWidget $widget): void
     {
-        if (isset($this->pages[$pageIndex])) {
+        // A control has exactly one widget: painting it again for a neighbouring page must never add a twin
+        $oid = spl_object_id($widget->control);
+        if (isset($this->pages[$pageIndex]) && !isset($this->widgetControls[$oid])) {
+            $this->widgetControls[$oid] = true;
             $widget->page = $pageIndex;
             $widget->rect = $rect;
             $this->formWidgets[] = $widget;
@@ -155,10 +162,12 @@ class PdfDocument
 
     public function addPage(float $widthPt, float $heightPt): int
     {
+        $this->packPage(count($this->pages) - 1); // pages are painted in order: the previous one is finished
         $this->pages[] = [
             'width' => $widthPt,
             'height' => $heightPt,
             'content' => '',
+            'packed' => '',
             'links' => [],
         ];
         return count($this->pages) - 1;
@@ -169,6 +178,32 @@ class PdfDocument
         if (isset($this->pages[$pageIndex])) {
             $this->pages[$pageIndex]['content'] .= $commands;
         }
+    }
+
+    /**
+     * Keeps the content of a finished page deflated (fast level) instead of as the raw operator text, which is
+     * several times larger: a 100-page table would otherwise hold tens of MB of drawing operators until compile().
+     */
+    private function packPage(int $pageIndex): void
+    {
+        if (!isset($this->pages[$pageIndex]) || $this->pages[$pageIndex]['content'] === '' || !function_exists('gzcompress')) {
+            return;
+        }
+        $page = &$this->pages[$pageIndex];
+        $packed = (string) gzcompress($this->pageContent($pageIndex), 1);
+        if ($packed !== '') {
+            $page['packed'] = $packed;
+            $page['content'] = '';
+        }
+    }
+
+    private function pageContent(int $pageIndex): string
+    {
+        $page = $this->pages[$pageIndex];
+        if ($page['packed'] === '') {
+            return $page['content'];
+        }
+        return (string) gzuncompress($page['packed']) . $page['content'];
     }
 
     /**
@@ -246,15 +281,59 @@ class PdfDocument
 
     public function addLinkAnnotation(int $pageIndex, float $pdfX, float $pdfY, float $width, float $height, string $uri): void
     {
-        if (isset($this->pages[$pageIndex]) && $uri !== '') {
-            $this->pages[$pageIndex]['links'][] = [
-                'x' => $pdfX,
-                'y' => $pdfY,
-                'w' => $width,
-                'h' => $height,
-                'uri' => $uri,
-            ];
+        if (!isset($this->pages[$pageIndex]) || $uri === '') {
+            return;
         }
+        // One /Link per link: a rectangle that lies inside, or sits on the same line right next to, a fragment of a
+        // recent link with the same target is folded into that fragment (a link of 6 words is one rectangle, not 11)
+        $x1 = $pdfX + $width;
+        $y1 = $pdfY + $height;
+        $links = &$this->pages[$pageIndex]['links'];
+        for ($i = count($links) - 1, $stop = max(0, $i - 5); $i >= $stop; $i--) {
+            if ($links[$i]['uri'] !== $uri) {
+                continue;
+            }
+            foreach ($links[$i]['quads'] as $qi => [$qx, $qy, $qw, $qh]) {
+                $qx1 = $qx + $qw;
+                $qy1 = $qy + $qh;
+                if ($pdfX >= $qx - 0.5 && $x1 <= $qx1 + 0.5 && $pdfY >= $qy - 0.5 && $y1 <= $qy1 + 0.5) {
+                    return; // already covered
+                }
+                $overlapV = min($y1, $qy1) - max($pdfY, $qy);
+                $minH = min($height, $qh);
+                $gap = max($pdfX - $qx1, $qx - $x1);
+                if ($minH > 0.0 && $overlapV >= 0.6 * $minH && $gap <= max(1.0, 0.45 * $minH)) {
+                    $nx = min($pdfX, $qx);
+                    $ny = min($pdfY, $qy);
+                    $links[$i]['quads'][$qi] = [$nx, $ny, max($x1, $qx1) - $nx, max($y1, $qy1) - $ny];
+                    $this->unionLinkRect($links[$i]);
+                    return;
+                }
+            }
+            // Each line of a wrapped link stays its own /Link (as browsers write it): a single annotation with
+            // /QuadPoints would make the whole union rectangle clickable in viewers that ignore QuadPoints (PDFium)
+            break;
+        }
+        $links[] = ['x' => $pdfX, 'y' => $pdfY, 'w' => $width, 'h' => $height, 'uri' => $uri, 'quads' => [[$pdfX, $pdfY, $width, $height]]];
+    }
+
+    /** @param array{x: float, y: float, w: float, h: float, uri: string, quads: list<array{0: float, 1: float, 2: float, 3: float}>} $link */
+    private function unionLinkRect(array &$link): void
+    {
+        $x0 = INF;
+        $y0 = INF;
+        $x1 = -INF;
+        $y1 = -INF;
+        foreach ($link['quads'] as [$qx, $qy, $qw, $qh]) {
+            $x0 = min($x0, $qx);
+            $y0 = min($y0, $qy);
+            $x1 = max($x1, $qx + $qw);
+            $y1 = max($y1, $qy + $qh);
+        }
+        $link['x'] = $x0;
+        $link['y'] = $y0;
+        $link['w'] = $x1 - $x0;
+        $link['h'] = $y1 - $y0;
     }
 
     /**
@@ -420,7 +499,9 @@ class PdfDocument
             $resourcesParts[] = '/Pattern << ' . implode(' ', $patEntries) . ' >>';
         }
 
-        $spotEntries = SpotColors::resourceEntries(array_merge(array_column($this->pages, 'content'), $this->groups()->contents()));
+        $spotEntries = SpotColors::active()
+            ? SpotColors::resourceEntries(array_merge(array_map(fn(int $i): string => $this->pageContent($i), array_keys($this->pages)), $this->groups()->contents()))
+            : '';
         if ($spotEntries !== '') {
             $resourcesParts[] = '/ColorSpace << ' . $spotEntries . ' >>';
         }
@@ -445,7 +526,7 @@ class PdfDocument
             $pageObjId = $pageObjIds[$pageIdx];
             $contentObjId = $this->allocObj();
 
-            $streamData = $this->imports()->backgroundContent($pageIdx, $page['width'], $page['height']) . $page['content'];
+            $streamData = $this->imports()->backgroundContent($pageIdx, $page['width'], $page['height']) . $this->pageContent($pageIdx);
             $streamData = ColorOps::rewriteRgb($streamData . PdfX::cropMarks($page['width'], $page['height'], $this->options));
             $this->objects[$contentObjId] = $this->createStreamObject($streamData, $this->options->compress);
 
@@ -454,21 +535,39 @@ class PdfDocument
             if (!empty($page['links'])) {
                 foreach ($page['links'] as $lnk) {
                     if (str_starts_with($lnk['uri'], '#')) {
-                        $dest = $this->destinations[rawurldecode(substr($lnk['uri'], 1))] ?? null;
+                        $target = rawurldecode(substr($lnk['uri'], 1));
+                        $dest = $this->destinations[$target] ?? null;
+                        if ($dest === null && ($target === '' || strtolower($target) === 'top') && isset($pageObjIds[0])) {
+                            $dest = ['page' => 0, 'y' => $this->pages[0]['height']]; // HTML: "#" and "#top" mean the document top
+                        }
                         if ($dest === null || !isset($pageObjIds[$dest['page']])) {
+                            if (!isset($this->unresolvedLinks[$target])) {
+                                $this->unresolvedLinks[$target] = true;
+                                $this->options->addWarning("Internal link '#{$target}' has no target (no element with that id or <a name>); the link was omitted.");
+                            }
                             continue;
                         }
                         $action = sprintf('/Dest [%d 0 R /XYZ 0 %.2F 0]', $pageObjIds[$dest['page']], $dest['y']);
                     } else {
                         $action = '/A << /Type /Action /S /URI /URI (' . $this->escapePdfString($this->encodeUri($lnk['uri'])) . ') >>';
                     }
+                    $quads = '';
+                    if (count($lnk['quads'] ?? []) > 1) {
+                        // A link wrapped over several lines: one annotation, one quadrilateral per line (viewers
+                        // without /QuadPoints support use the /Rect around all of them)
+                        foreach ($lnk['quads'] as [$qx, $qy, $qw, $qh]) {
+                            $quads .= sprintf(' %.2F %.2F %.2F %.2F %.2F %.2F %.2F %.2F', $qx, $qy + $qh, $qx + $qw, $qy + $qh, $qx, $qy, $qx + $qw, $qy);
+                        }
+                        $quads = ' /QuadPoints [' . ltrim($quads) . ']';
+                    }
                     $annotObjId = $this->allocObj();
                     $this->objects[$annotObjId] = sprintf(
-                        "<< /Type /Annot /Subtype /Link /Rect [%.2F %.2F %.2F %.2F] /Border [0 0 0] %s >>",
+                        "<< /Type /Annot /Subtype /Link /Rect [%.2F %.2F %.2F %.2F]%s /Border [0 0 0] %s >>",
                         $lnk['x'],
                         $lnk['y'],
                         $lnk['x'] + $lnk['w'],
                         $lnk['y'] + $lnk['h'],
+                        $quads,
                         $action
                     );
                     $annotRefs[] = "{$annotObjId} 0 R";

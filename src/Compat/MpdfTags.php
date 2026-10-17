@@ -204,7 +204,7 @@ final class MpdfTags
                         if (!str_contains($s->pageCss, MpdfExtraTags::DOTTAB_CSS)) {
                             $s->pageCss .= MpdfExtraTags::DOTTAB_CSS;
                         }
-                        return MpdfExtraTags::dotTab($a);
+                        return MpdfExtraTags::dotTab($a, $s);
 
                     case 'textcircle':
                         return $closing ? '' : MpdfExtraTags::textCircle($a, $s);
@@ -453,7 +453,7 @@ final class MpdfTags
         if (!str_ends_with($before, '>')) {
             return !in_array(substr($before, -1), ["", ""], true);
         }
-        if (preg_match('~<(/?)([a-z][a-z0-9]*)[^<>]*>$~i', $before, $tm) !== 1) {
+        if (preg_match('~<(/?)([a-z][a-z0-9]*)\b[^<>]*>$~i', $before, $tm) !== 1) {
             return false;
         }
         return in_array(strtolower($tm[2]), self::INLINE_TAGS, true);

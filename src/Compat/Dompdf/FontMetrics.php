@@ -81,6 +81,22 @@ final class FontMetrics
         return $size * 1.15;
     }
 
+    /**
+     * Ascent and descent (pt, both positive) of a font descriptor at a size, from the font the engine actually uses.
+     *
+     * @return array{0: float, 1: float}
+     */
+    public function ascentDescent($font, float $size): array
+    {
+        [$family, $weight, $style] = self::parse((string) $font, $this->options);
+        try {
+            $ttf = $this->manager()->resolveFont($family, $weight, $style);
+            return [$ttf->ascent / 1000.0 * $size, abs($ttf->descent) / 1000.0 * $size];
+        } catch (\Throwable) {
+            return [$size * 0.9, $size * 0.25];
+        }
+    }
+
     public function getFontBaseline($font, float $size): float
     {
         return $size * 0.9;

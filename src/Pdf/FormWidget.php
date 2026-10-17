@@ -32,6 +32,8 @@ final class FormWidget
     public string $colorOps = '0 g';
     /** Quadding: 0 left, 1 centre, 2 right. */
     public int $align = 0;
+    /** Background colour operands ("1 1 1") for /MK /BG: an appearance the viewer regenerates covers the page below */
+    public string $background = '';
 
     public function __construct(public FormControl $control)
     {

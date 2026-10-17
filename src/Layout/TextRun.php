@@ -23,10 +23,6 @@ class TextRun
     public float $letterSpacingPt = 0.0;
     public bool $isWhitespace = false;
     public bool $isLineBreak = false;
-    /** `<wbr>`: an empty, zero-width run that only offers a line break opportunity */
-    public bool $isWbr = false;
-    /** Forces a (soft) line break before this run: set by InlineLayout for the end of the ::first-line */
-    public bool $lineStart = false;
     public ?string $href = null;
 
     /**
@@ -38,38 +34,13 @@ class TextRun
      */
     public ?array $glyphs = null;
 
-    /** Resolved Unicode bidi embedding level (odd = right-to-left) */
-    public int $bidiLevel = 0;
 
-    /** @var list<int> Bidi control codepoints (embeddings/isolates/overrides) opened before this run's text */
-    public array $bidiPre = [];
-
-    /** @var list<int> Bidi control codepoints closed after this run's text */
-    public array $bidiPost = [];
-
-    // Optional inline box decorations (for <span style="background:...; padding:...; border-radius:...">, <code>, <mark>)
-    public float $paddingTop = 0.0;
-    public float $paddingRight = 0.0;
-    public float $paddingBottom = 0.0;
-    public float $paddingLeft = 0.0;
 
     // Optional inline-block child box (e.g. inline <img>, <svg>, or inline-block badge)
     public ?LayoutBox $inlineBox = null;
 
     /** Whether a line break is allowed immediately before this run (false = glued to the previous run) */
     public bool $breakBefore = true;
-
-    /** Fragment of a word in a script without word spaces (CJK, Thai, ...): break opportunities follow ScriptBreaker */
-    public bool $wide = false;
-
-    /** Set on the second half of a word split after a hyphen ("well-" | "known") */
-    public bool $afterHyphen = false;
-
-    /** Hyphenation character drawn at the end of the line when a break occurs before this run (soft hyphen / hyphens:auto split) */
-    public ?string $softBreak = null;
-
-    /** Width of {@see $softBreak} measured in the previous fragment's font */
-    public float $softBreakWidth = 0.0;
 
     /** @var list<LayoutBox> Decorated inline ancestors (background/border), outermost first */
     public array $decorations = [];
@@ -79,6 +50,49 @@ class TextRun
 
     /** @var array<int, float> spl_object_id(decoration) => distance from the text end to the decoration's right border edge */
     public array $decoRight = [];
+
+    /**
+     * Rarely used properties live in a RunExtra that exists only while one of them holds a non-default value:
+     * isWbr, lineStart, bidiLevel, bidiPre, bidiPost, wide, afterHyphen, softBreak, softBreakWidth and the inline box
+     * paddings (paddingTop / Right / Bottom / Left). They read and
+     * write like ordinary properties (through __get / __set), but an array one is replaced as a whole.
+     */
+    private ?RunExtra $extra = null;
+    private static ?RunExtra $defaults = null;
+
+    public function __clone()
+    {
+        if ($this->extra !== null) {
+            $this->extra = clone $this->extra;
+        }
+    }
+
+    public function __get(string $name): mixed
+    {
+        return ($this->extra ?? self::$defaults ??= new RunExtra())->$name;
+    }
+
+    public function __set(string $name, mixed $value): void
+    {
+        if ($this->extra === null) {
+            $default = (self::$defaults ??= new RunExtra())->$name;
+            if ($value === $default || (is_int($value) && is_float($default) && (float) $value === $default)) {
+                return; // still the default: nothing to allocate
+            }
+            $this->extra = new RunExtra();
+        }
+        $this->extra->$name = $value;
+    }
+
+    public function __isset(string $name): bool
+    {
+        return property_exists(RunExtra::class, $name) && ($this->extra ?? self::$defaults ??= new RunExtra())->$name !== null;
+    }
+
+    public function __unset(string $name): void
+    {
+        $this->__set($name, (self::$defaults ??= new RunExtra())->$name);
+    }
 
     public function __construct(
         string $text,

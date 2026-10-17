@@ -54,9 +54,10 @@ class Options
      * Memory budget of one rendering: bytes (int), a php.ini style string ('256M', '1G'), or 'auto' (90 % of PHP's
      * memory_limit). Exceeding it throws \IvoPdf\Exception\LimitExceededException while PHP still has room to unwind.
      * With a PHP memory_limit set, the budget never exceeds 90 % of it, so the exception always comes before PHP's own
-     * fatal "Allowed memory size exhausted". 0 = off (default).
+     * fatal "Allowed memory size exhausted". Default 'auto'; 0 = off. Budgets below 1 MB are almost certainly a unit
+     * mistake (64 meaning 64 MB) and are ignored with a warning.
      */
-    public int|string $maxMemory = 0;
+    public int|string $maxMemory = 'auto';
     /** Parse HTML with the WHATWG HTML5 algorithm (PHP >= 8.4, \Dom\HTMLDocument); false = libxml's HTML4 parser */
     public bool $html5Parser = true;
     /** Charset of the HTML input: 'auto' (BOM, then valid UTF-8, then <meta charset>, else Windows-1252) or a charset name such as 'windows-1251'. */
@@ -344,6 +345,10 @@ class Options
         $bytes = RenderLimits::parseBytes($this->maxMemory);
         if ($bytes <= 0) {
             return 0;
+        }
+        if ($bytes < 1048576) {
+            $this->addWarning("maxMemory of {$bytes} bytes ignored: write the budget with a unit, e.g. '256M'.");
+            return $ceiling;
         }
         return $ceiling > 0 ? min($bytes, $ceiling) : $bytes;
     }

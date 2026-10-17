@@ -18,7 +18,8 @@ final class InputGuards
     public static function breakLongWords(string $text, int $max, ?Options $options = null): string
     {
         $max = max(16, min($max, 60000));
-        $out = preg_replace('/(\S{' . $max . '})(?=\S)/u', '$1 ', $text);
+        // Only ASCII whitespace ends a word for the line breaker (U+00A0 &nbsp; stays inside it), so \S would miss nbsp runs
+        $out = preg_replace('/([^ \t\n\r\f]{' . $max . '})(?=[^ \t\n\r\f])/u', '$1 ', $text);
         if ($out === null) {
             // Not valid UTF-8: byte-wise split restricted to ASCII so no multibyte sequence is cut in half
             $out = preg_replace('/([\x21-\x7E]{' . $max . '})(?=[\x21-\x7E])/', '$1 ', $text) ?? $text;

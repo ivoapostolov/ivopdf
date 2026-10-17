@@ -22,9 +22,19 @@ class DomBuilder
     private CssParser $cssParser;
     private string $documentTitle = '';
     private string $documentLang = '';
+    private string $documentDirection = 'ltr';
 
     /** @var array<string, int> CSS counters (counter-reset / counter-increment / counter()) */
     private array $counters = [];
+
+    /** Table parts whose DOM element is dropped from the box when it has no attributes */
+    private const PLAIN_TABLE_PARTS = ['td' => true, 'th' => true, 'tr' => true, 'thead' => true, 'tbody' => true, 'tfoot' => true];
+
+    /** @var array<string, string> lower-cased tag names by their source spelling (shared by all boxes of that tag) */
+    private array $tagNames = [];
+
+    /** Called once the document's stylesheets are parsed and before any element style is computed (@font-face registration) */
+    public ?\Closure $afterStylesheets = null;
 
     public function __construct(Options $options, CssParser $cssParser)
     {
@@ -35,6 +45,12 @@ class DomBuilder
     public function getDocumentTitle(): string
     {
         return $this->documentTitle;
+    }
+
+    /** Resolved `direction` of the root element (ltr / rtl): rtl documents start on a left page */
+    public function getDocumentDirection(): string
+    {
+        return $this->documentDirection;
     }
 
     public function getDocumentLang(): string
@@ -62,6 +78,9 @@ class DomBuilder
 
         // Extract <title>, <style>, and <link rel="stylesheet">
         $this->extractHeadMetadataAndStyles($dom);
+        if ($this->afterStylesheets !== null) {
+            ($this->afterStylesheets)();
+        }
 
         // Root style
         $rootVars = $this->cssParser->getRootVariables();
@@ -85,6 +104,7 @@ class DomBuilder
             $this->documentLang = trim($htmlEl->getAttribute('lang'));
             $rootStyle = $this->cssParser->computeStyleForElement($htmlEl, $rootStyle);
         }
+        $this->documentDirection = strtolower(trim($rootStyle->get('direction', 'ltr'))) === 'rtl' ? 'rtl' : 'ltr';
 
         $bodyNodes = $dom->getElementsByTagName('body');
         if ($bodyNodes->length > 0) {
@@ -181,7 +201,7 @@ class DomBuilder
         if ($parentNode instanceof DOMElement && $parentTag === 'ol') {
             $listReversed = $parentNode->hasAttribute('reversed');
             if ($parentNode->hasAttribute('start') && is_numeric($parentNode->getAttribute('start'))) {
-                $listCounter = (int) $parentNode->getAttribute('start');
+                $listCounter = self::clampCounter($parentNode->getAttribute('start'));
             } elseif ($listReversed) {
                 $liCount = 0;
                 foreach ($parentNode->childNodes as $cn) {
@@ -193,8 +213,31 @@ class DomBuilder
             }
         }
 
+        // <details> without `open` shows only its first <summary> (a default "Details" one when there is none), like browsers
+        $closedSummary = null;
+        $closedDetails = $parentNode instanceof DOMElement && $parentTag === 'details' && !$parentNode->hasAttribute('open');
+        if ($closedDetails) {
+            foreach ($parentNode->childNodes as $cn) {
+                if ($cn instanceof DOMElement && strtolower($cn->tagName) === 'summary') {
+                    $closedSummary = $cn;
+                    break;
+                }
+            }
+            if ($closedSummary === null) {
+                $defSummary = new LayoutBox('summary', $parentBox->style->inheritForElement('summary'));
+                $defSummary->style->set('display', 'block');
+                $defText = new LayoutBox('#text', $defSummary->style);
+                $defText->textContent = "\u{25B8} Details";
+                $defSummary->addChild($defText);
+                $parentBox->addChild($defSummary);
+            }
+        }
+
         foreach ($parentNode->childNodes as $child) {
             \IvoPdf\RenderLimits::tick();
+            if ($closedDetails && $child !== $closedSummary) {
+                continue;
+            }
             if ($child instanceof DOMText) {
                 $text = $child->data; // not wholeText: adjacent text nodes (around a dropped comment) would be duplicated
                 // Preserve whitespace inside <pre>, otherwise collapse runs of whitespace
@@ -209,14 +252,20 @@ class DomBuilder
                 if ($this->options->maxWordLength > 0 && strlen($text) > $this->options->maxWordLength) {
                     $text = InputGuards::breakLongWords($text, $this->options->maxWordLength, $this->options);
                 }
-                // Skip pure-whitespace text nodes between block/flex/grid/table elements
+                // Skip pure-whitespace text nodes between block/flex/grid/table elements (a space after inline content
+                // directly in <body>, <ul> or <ol> separates it from the next inline box, as in browsers)
                 if (trim($text) === '' && $this->isBlockOrStructuralContainer($parentBox)) {
-                    continue;
+                    $prev = $parentBox->children === [] ? null : $parentBox->children[count($parentBox->children) - 1];
+                    $keep = $prev !== null && in_array($parentBox->getDisplay(), ['block', 'list-item'], true)
+                        && ($prev->isTextNode() ? trim((string) $prev->textContent) !== '' : $prev->isInlineLevel())
+                        && !$prev->isPositionedOutOfFlow();
+                    if (!$keep) {
+                        continue;
+                    }
                 }
 
-                $textStyle = clone $parentBox->style;
-                $textBox = new LayoutBox('#text', $textStyle);
-                $textBox->textContent = $this->applyTextTransform($text, $textStyle->get('text-transform', 'none'));
+                $textBox = new LayoutBox('#text', $parentBox->style); // the box derives its own (possibly shared) text style
+                $textBox->textContent = $this->applyTextTransform($text, $textBox->style->get('text-transform', 'none'));
                 $textBox->href = $inheritedHref;
 
                 // Text directly inside a flex/grid container becomes an anonymous block item
@@ -235,7 +284,10 @@ class DomBuilder
                 continue;
             }
 
-            $tag = strtolower($child->tagName);
+            $tag = $this->tagNames[$child->tagName] ??= strtolower($child->tagName); // one string per tag name, not one per box
+            if (count($this->tagNames) > 512) {
+                $this->tagNames = [];
+            }
             if (in_array($tag, ['script', 'style', 'head', 'meta', 'link', 'title', 'noscript', 'template', 'iframe', 'object', 'embed', 'video', 'audio', 'canvas', 'map', 'param', 'source', 'track', 'col', 'colgroup'], true)) {
                 continue;
             }
@@ -243,6 +295,7 @@ class DomBuilder
             $childStyle = $this->cssParser->computeStyleForElement($child, $parentBox->style);
             if ($tag === 'pagebreak') {
                 // mPDF-compatible <pagebreak /> tag
+                $childStyle = $childStyle->unshared();
                 $childStyle->set('display', 'block');
                 $childStyle->set('page-break-before', 'always');
             }
@@ -251,14 +304,30 @@ class DomBuilder
             if ($tag === 'pagebreak') {
                 $mpdfSectionPage = $ownPage !== '' && $ownPage !== 'auto' ? $ownPage : null;
             } elseif ($mpdfSectionPage !== null && ($ownPage === '' || $ownPage === 'auto')) {
+                $childStyle = $childStyle->unshared();
                 $childStyle->set('page', $mpdfSectionPage);
             }
             if (strtolower($childStyle->get('display')) === 'none') {
                 continue;
             }
+            if ($tag === 'footnote' && strtolower(trim($childStyle->get('float', 'none'))) === 'none') {
+                // IvoPdf extension (mPDF has no <footnote> tag): <footnote>..</footnote> behaves like `float: footnote`
+                $childStyle = $childStyle->unshared();
+                $childStyle->set('float', 'footnote');
+            }
+            $childStyle = self::blockify($childStyle, $parentBox->style);
+            if ($tag === 'summary' && $parentTag === 'details' && $parentNode instanceof DOMElement && $parentNode->hasAttribute('open')
+                && strtolower($childStyle->get('list-style-type', '')) === 'disclosure-closed') {
+                $childStyle = $childStyle->unshared();
+                $childStyle->set('list-style-type', 'disclosure-open');
+            }
             $this->applyCounterProperties($childStyle);
 
-            $childBox = new LayoutBox($tag, $childStyle, $child);
+            // A table part without attributes has nothing a later pass could look up in the DOM (anchors, bookmarks,
+            // attr() values, spans are read here); not keeping the element lets 10 000 cells free their DOM nodes
+            $keepElement = !isset(self::PLAIN_TABLE_PARTS[$tag]) || $child->hasAttributes()
+                || strtolower(trim($childStyle->get('string-set', 'none'))) !== 'none';
+            $childBox = new LayoutBox($tag, $childStyle, $keepElement ? $child : null);
             $currentHref = $inheritedHref;
 
             if ($tag === 'a' && $child->hasAttribute('href')) {
@@ -302,22 +371,24 @@ class DomBuilder
 
             if ($tag === 'li' || $childBox->getDisplay() === 'list-item') {
                 if ($child->hasAttribute('value') && is_numeric($child->getAttribute('value'))) {
-                    $listCounter = (int) $child->getAttribute('value');
+                    $listCounter = self::clampCounter($child->getAttribute('value'));
                 }
                 $listStyleType = strtolower($childStyle->get('list-style-type', 'disc'));
                 if ($listStyleType !== 'none') {
-                    if (in_array($listStyleType, ['decimal', 'decimal-leading-zero', 'lower-alpha', 'upper-alpha', 'lower-latin', 'upper-latin', 'lower-roman', 'upper-roman', 'lower-greek', 'cyrillic', 'lower-cyrillic', 'upper-cyrillic'], true)) {
+                    if (in_array($listStyleType, ['decimal', 'decimal-leading-zero', 'lower-alpha', 'upper-alpha', 'lower-latin', 'upper-latin', 'lower-roman', 'upper-roman', 'lower-greek', 'cyrillic', 'lower-cyrillic', 'upper-cyrillic'], true) || \IvoPdf\Text\CounterStyles::supports($listStyleType)) {
                         $childBox->listMarker = $this->formatListNumber($listCounter, $listStyleType);
                     } else {
                         $childBox->listMarker = match ($listStyleType) {
                             'circle' => '◦',
                             'square' => '▪',
                             'dash' => '–',
+                            'disclosure-closed' => "\u{25B8}",
+                            'disclosure-open' => "\u{25BE}",
                             default => '•',
                         };
                     }
                 }
-                $listCounter += $listReversed ? -1 : 1;
+                $listCounter = self::clampCounter($listCounter + ($listReversed ? -1 : 1));
                 $this->applyListMarkerExtras($child, $childBox, $childStyle);
             }
 
@@ -348,6 +419,18 @@ class DomBuilder
                 continue;
             }
 
+            if ($childBox->children !== [] && $childBox->getDisplay() === 'inline') {
+                // A float inside an inline box belongs to the nearest block container: hoist it in front of the inline box
+                $kept = [];
+                foreach ($childBox->children as $inner) {
+                    if (!$inner->isTextNode() && in_array(strtolower(trim($inner->style->get('float', 'none'))), ['left', 'right'], true)) {
+                        $parentBox->addChild($inner);
+                    } else {
+                        $kept[] = $inner;
+                    }
+                }
+                $childBox->children = $kept;
+            }
             $parentBox->addChild($childBox);
         }
     }
@@ -382,6 +465,11 @@ class DomBuilder
             $img->imageSrc = $li->listMarkerImage;
             $li->addChild($img);
         } else {
+            if (in_array($li->listMarker, ['•', '◦', '▪'], true)) {
+                // Browsers pad an inside symbol marker by 7px after its "• " text
+                $spanStyle = clone $spanStyle;
+                $spanStyle->set('margin-right', '5.25pt');
+            }
             $span = new LayoutBox('span', $spanStyle);
             $text = new LayoutBox('#text', clone $spanStyle);
             $text->textContent = $li->listMarker . ' ';
@@ -390,6 +478,49 @@ class DomBuilder
         }
         $li->listMarker = null;
         $li->listMarkerImage = null;
+    }
+
+    /**
+     * CSS Display 3 section 2.7 blockification: a floated or absolutely positioned element, and a flex / grid item,
+     * has the block-level equivalent of its specified display (inline, inline-block, run-in -> block; inline-table ->
+     * table; inline-flex -> flex; inline-grid -> grid; internal table display types -> block). list-item stays.
+     * Without this a floated <span> was laid out as inline content and its text vanished.
+     */
+    private static function blockify(ComputedStyle $style, ComputedStyle $parentStyle): ComputedStyle
+    {
+        $display = strtolower(trim($style->get('display', 'inline')));
+        $block = match ($display) {
+            'inline', 'inline-block', 'run-in', 'table-cell', 'table-row', 'table-row-group', 'table-header-group',
+            'table-footer-group', 'table-column', 'table-column-group', 'table-caption' => 'block',
+            'inline-table' => 'table',
+            'inline-flex' => 'flex',
+            'inline-grid' => 'grid',
+            default => null,
+        };
+        if ($block === null) {
+            return $style;
+        }
+        $float = strtolower(trim($style->get('float', 'none')));
+        if ($float !== 'left' && $float !== 'right') {
+            $float = 'none'; // float: footnote and unknown values do not float the box
+        }
+        $position = strtolower(trim($style->get('position', 'static')));
+        $outOfFlow = ($float !== 'none' && $float !== '') || $position === 'absolute' || $position === 'fixed';
+        if (!$outOfFlow) {
+            // Flex and grid items are blockified too (internal table boxes stay what they are: they are not items)
+            $pd = strtolower(trim($parentStyle->get('display', 'block')));
+            if (!in_array($pd, ['flex', 'inline-flex', 'grid', 'inline-grid'], true) || str_starts_with($display, 'table-')) {
+                return $style;
+            }
+            if ($display === 'inline-table' || $display === 'inline-flex' || $display === 'inline-grid') {
+                return $style;
+            }
+        } elseif (str_starts_with($display, 'table-') && ($float === 'none' || $float === '') && $position !== 'absolute' && $position !== 'fixed') {
+            return $style;
+        }
+        $style = $style->unshared();
+        $style->set('display', $block);
+        return $style;
     }
 
     /**
@@ -406,6 +537,7 @@ class DomBuilder
         if ($pseudoStyle === null) {
             return;
         }
+        $pseudoStyle = self::blockify($pseudoStyle, $box->style);
         $this->applyCounterProperties($pseudoStyle);
         $rawContent = $pseudoStyle->get('content', '');
         if (\IvoPdf\Paged\PagedContent::isPaged($rawContent)) {
@@ -445,9 +577,9 @@ class DomBuilder
             preg_match_all('/([a-zA-Z_][\w-]*)(?:\s+(-?\d+))?/', $val, $mm, PREG_SET_ORDER);
             foreach ($mm as $m) {
                 $name = $m[1];
-                $num = isset($m[2]) && $m[2] !== '' ? (int) $m[2] : $default;
+                $num = isset($m[2]) && $m[2] !== '' ? self::clampCounter($m[2]) : $default;
                 if ($prop === 'counter-increment') {
-                    $this->counters[$name] = ($this->counters[$name] ?? 0) + $num;
+                    $this->counters[$name] = self::clampCounter(($this->counters[$name] ?? 0) + $num);
                 } else {
                     $this->counters[$name] = $num;
                 }
@@ -501,7 +633,9 @@ class DomBuilder
                     } else {
                         $styleArg = $fn === 'counters' ? ($args[2] ?? 'decimal') : ($args[1] ?? 'decimal');
                         $value = $this->counters[$name] ?? 0;
-                        $out .= $styleArg === 'decimal' ? (string) $value : rtrim($this->formatListNumber($value, $styleArg), '.)');
+                        $out .= $styleArg === 'decimal' ? (string) $value : (\IvoPdf\Text\CounterStyles::supports($styleArg)
+                            ? \IvoPdf\Text\CounterStyles::body(self::clampCounter($value), $styleArg)
+                            : rtrim($this->formatListNumber($value, $styleArg), '.)'));
                     }
                 }
                 $i += strlen($fm[0]);
@@ -636,8 +770,40 @@ class DomBuilder
         };
     }
 
+    /** Largest counter magnitude kept (browsers clamp counters to a 32-bit range; keeps all arithmetic overflow-safe). */
+    private const COUNTER_LIMIT = 2147483647;
+
+    /** Parses/clamps a counter value to [-COUNTER_LIMIT, COUNTER_LIMIT] without int overflow or float-to-int casts. */
+    private static function clampCounter(int|float|string $v): int
+    {
+        if (is_string($v)) {
+            $v = trim($v);
+            if (!is_numeric($v)) {
+                return 0;
+            }
+            $v = $v + 0;
+        }
+        if (is_float($v)) {
+            if (is_nan($v)) {
+                return 0;
+            }
+            if ($v >= self::COUNTER_LIMIT) {
+                return self::COUNTER_LIMIT;
+            }
+            if ($v <= -self::COUNTER_LIMIT) {
+                return -self::COUNTER_LIMIT;
+            }
+            return (int) $v;
+        }
+        return max(-self::COUNTER_LIMIT, min(self::COUNTER_LIMIT, $v));
+    }
+
     private function formatListNumber(int $num, string $type): string
     {
+        $num = self::clampCounter($num);
+        if (\IvoPdf\Text\CounterStyles::supports($type)) {
+            return \IvoPdf\Text\CounterStyles::marker($num, $type);
+        }
         if ($num <= 0) {
             return $num . '.';
         }
@@ -663,6 +829,7 @@ class DomBuilder
     {
         $base = count($alphabet);
         $out = '';
+        $num = self::clampCounter($num);
         while ($num > 0) {
             $num--;
             $out = $alphabet[$num % $base] . $out;
@@ -673,8 +840,8 @@ class DomBuilder
 
     private function toRoman(int $num): string
     {
-        if ($num <= 0) {
-            return (string) $num;
+        if ($num <= 0 || $num > 3999) {
+            return (string) $num; // outside 1..3999 browsers fall back to decimal
         }
         $map = [
             'M' => 1000, 'CM' => 900, 'D' => 500, 'CD' => 400,

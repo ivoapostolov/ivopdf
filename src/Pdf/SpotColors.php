@@ -78,6 +78,12 @@ final class SpotColors
         return (string) preg_replace_callback('~[^A-Za-z0-9_.+-]~', static fn(array $m): string => sprintf('#%02X', ord($m[0])), $name);
     }
 
+    /** Whether any spot color is defined (otherwise no content stream needs to be scanned for them). */
+    public static function active(): bool
+    {
+        return self::$spots !== [];
+    }
+
     /**
      * Resource dictionary body entries ("/Sp1 [/Separation ...]") for the spot colors referenced by the given content streams.
      *

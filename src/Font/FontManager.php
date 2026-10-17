@@ -163,6 +163,8 @@ class FontManager
      */
     public function registerFamily(string $familyName, array $variants): void
     {
+        $this->unitMetricsCache = []; // ex / ch of an earlier fallback must not outlive the registration
+        $this->lineMetricsCache = [];
         $key = strtolower(trim($familyName, " \t\n\r\0\x0B'\""));
         if (!isset($variants['regular'])) {
             $variants['regular'] = $variants['bold'] ?? $variants['italic'] ?? $variants['bold_italic'] ?? '';
@@ -185,6 +187,8 @@ class FontManager
      */
     public function registerFontData(string $familyName, string $variant, string $bytes): void
     {
+        $this->unitMetricsCache = [];
+        $this->lineMetricsCache = [];
         $key = 'memory:' . sha1($bytes);
         if (!isset($this->parsedFonts[$key])) {
             $this->parsedFonts[$key] = new TtfParser($key, $bytes); // validates the font before it is registered
@@ -195,6 +199,8 @@ class FontManager
 
     public function registerFontVariant(string $familyName, string $variant, string $filePath): void
     {
+        $this->unitMetricsCache = [];
+        $this->lineMetricsCache = [];
         $key = strtolower(trim($familyName, " \t\n\r\0\x0B'\""));
         $variants = $this->families[$key] ?? [];
         $variants[$variant] = $filePath;
@@ -426,6 +432,33 @@ class FontManager
 
     /** @var array<string, array{0: float, 1: float}> */
     private array $unitMetricsCache = [];
+
+    /** @var array<string, array{0: float, 1: float, 2: float}> */
+    private array $lineMetricsCache = [];
+
+    /**
+     * `line-height: normal` in pt, as browsers compute it: the font's ascent + descent + line gap (hhea, or the
+     * OS/2 typo values under USE_TYPO_METRICS), each rounded to whole CSS pixels like Blink does.
+     */
+    public function normalLineHeight(string $fontFamily, string|int $fontWeight, string $fontStyle, float $fontSizePt): float
+    {
+        $key = $fontFamily . '|' . $fontWeight . '|' . $fontStyle;
+        if (!isset($this->lineMetricsCache[$key])) {
+            $m = [0.928, 0.236, 0.0];
+            try {
+                $font = $this->resolveFont($fontFamily, $fontWeight, $fontStyle);
+                if ($font->ascent > 0) {
+                    $m = [$font->ascent / 1000.0, abs($font->descent) / 1000.0, max(0, $font->lineGap) / 1000.0];
+                }
+            } catch (\Throwable) {
+                // keep the DejaVu-like fallback
+            }
+            $this->lineMetricsCache[$key] = $m;
+        }
+        [$a, $d, $g] = $this->lineMetricsCache[$key];
+        $px = $fontSizePt * 4.0 / 3.0;
+        return (round($a * $px) + round($d * $px) + round($g * $px)) * 0.75;
+    }
 
     /**
      * The CSS `ex` and `ch` units of a font as fractions of its font size: the x-height (OS/2 sxHeight) and the
