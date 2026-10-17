@@ -12,6 +12,12 @@ namespace IvoPdf\Layout;
  */
 final class RunExtra
 {
+    /** Link target of the run (inside <a href>) */
+    public ?string $href = null;
+    /** Whether a line break is allowed immediately before this run (false = glued to the previous run) */
+    public bool $breakBefore = true;
+    /** letter-spacing in pt (added after every character) */
+    public float $letterSpacingPt = 0.0;
     /** `<wbr>`: an empty, zero-width run that only offers a line break opportunity */
     public bool $isWbr = false;
     /** Forces a (soft) line break before this run: set by InlineLayout for the end of the ::first-line */

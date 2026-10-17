@@ -46,6 +46,20 @@ final class FontMetrics
         if ($family === '' || \IvoPdf\Options::isNetworkPath($remoteFile) || !is_file($remoteFile)) {
             return false;
         }
+        // like dompdf (php-font-lib), a file that is not a TrueType / OpenType font (collection) is refused
+        set_error_handler(static fn(): bool => true); // an unreadable file is refused without a PHP warning
+        try {
+            $fh = fopen($remoteFile, 'rb');
+            $magic = $fh !== false ? (string) fread($fh, 4) : '';
+            if ($fh !== false) {
+                fclose($fh);
+            }
+        } finally {
+            restore_error_handler();
+        }
+        if (!in_array($magic, ["\x00\x01\x00\x00", 'true', 'OTTO', 'ttcf'], true)) {
+            return false;
+        }
         $bold = str_contains(strtolower((string) ($style['weight'] ?? 'normal')), 'bold') || (int) ($style['weight'] ?? 400) >= 600;
         $italic = in_array(strtolower((string) ($style['style'] ?? 'normal')), ['italic', 'oblique'], true);
         $variant = $bold ? ($italic ? 'bold_italic' : 'bold') : ($italic ? 'italic' : 'regular');

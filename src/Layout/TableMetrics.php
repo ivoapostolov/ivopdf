@@ -150,14 +150,17 @@ final class TableMetrics
     public static function intrinsicWidth(LayoutEngine $engine, LayoutBox $table, float $referenceWidth): array
     {
         $rows = [];
+        $groups = [];
         foreach ($table->children as $child) {
             $d = $child->getDisplay();
             if ($child->tagName === 'tr' || $d === 'table-row') {
                 $rows[] = $child;
+                $groups[] = null;
             } elseif (in_array($child->tagName, ['thead', 'tbody', 'tfoot'], true) || in_array($d, ['table-row-group', 'table-header-group', 'table-footer-group'], true)) {
                 foreach ($child->children as $r) {
                     if ($r->tagName === 'tr' || $r->getDisplay() === 'table-row') {
                         $rows[] = $r;
+                        $groups[] = $child;
                     }
                 }
             }
@@ -168,6 +171,8 @@ final class TableMetrics
         $spans = [];
         $collapse = strtolower($table->style->get('border-collapse', 'collapse')) === 'collapse';
         $placements = [];
+        $numRows = count($rows);
+        $numCols = 0;
         foreach ($rows as $ri => $row) {
             $col = 0;
             foreach ($row->children as $cell) {
@@ -184,21 +189,32 @@ final class TableMetrics
                         $occupied[$r][$c] = true;
                     }
                 }
-                $i = $engine->measureIntrinsicWidth($cell, $referenceWidth);
-                if ($collapse) {
-                    // a collapsed border is shared by the neighbouring columns: each holds half of it
-                    $engine->resolveBoxMetrics($cell, $referenceWidth);
-                    $half = ($cell->borderLeft + $cell->borderRight) / 2.0;
-                    $i = ['min' => max(0.0, $i['min'] - $half), 'max' => max(0.0, $i['max'] - $half)];
-                    $placements[] = new CellPlacement($cell, $ri, $col, $rs, $cs);
-                }
-                if ($cs === 1) {
-                    $colMin[$col] = max($colMin[$col] ?? 0.0, $i['min']);
-                    $colMax[$col] = max($colMax[$col] ?? 0.0, $i['max']);
-                } else {
-                    $spans[] = [$col, $cs, $i['min'], $i['max']];
-                }
+                $placements[] = new CellPlacement($cell, $ri, $col, $rs, $cs);
+                $numRows = max($numRows, $ri + $rs);
+                $numCols = max($numCols, $col + $cs);
                 $col += $cs;
+            }
+        }
+        if ($collapse && $placements !== []) {
+            // the cells are measured with the winning borders of their edges
+            CollapsedBorders::apply($engine, $table, $placements, $rows, $groups, $numRows, $numCols, $referenceWidth);
+        }
+        foreach ($placements as $cp) {
+            $cell = $cp->cell;
+            $col = $cp->colIdx;
+            $cs = $cp->colSpan;
+            $i = $engine->measureIntrinsicWidth($cell, $referenceWidth);
+            if ($collapse) {
+                // a collapsed border is shared by the neighbouring columns: each holds half of it
+                $engine->resolveBoxMetrics($cell, $referenceWidth);
+                $half = ($cell->borderLeft + $cell->borderRight) / 2.0;
+                $i = ['min' => max(0.0, $i['min'] - $half), 'max' => max(0.0, $i['max'] - $half)];
+            }
+            if ($cs === 1) {
+                $colMin[$col] = max($colMin[$col] ?? 0.0, $i['min']);
+                $colMax[$col] = max($colMax[$col] ?? 0.0, $i['max']);
+            } else {
+                $spans[] = [$col, $cs, $i['min'], $i['max']];
             }
         }
         foreach ($spans as [$col, $cs, $mn, $mx]) {
@@ -233,7 +249,7 @@ final class TableMetrics
         }
         $edge = $table->getHorizontalSpacing();
         if ($collapse && $n > 0) {
-            $outer = self::collapsedOuterBorders($engine, $table, $placements, count($rows), $n, $referenceWidth);
+            $outer = self::collapsedOuterBorders($engine, $table, $placements, $numRows, $numCols, $referenceWidth);
             $edge = ($outer['left'] + $outer['right']) / 2.0; // no padding, half of the outer borders on each side
         }
         $min = $sumMin + $edge + $sp;

@@ -590,9 +590,10 @@ class FontManager
 
     /**
      * The CSS `ex` and `ch` units of a font as fractions of its font size: the x-height (OS/2 sxHeight) and the
-     * advance width of the digit zero. Falls back to 0.5 em when the font does not provide the value.
+     * advance width of the digit zero. Falls back to 0.5 em when the font does not provide the value. The third value
+     * is the ascent (list markers are sized from it, as in browsers).
      *
-     * @return array{0: float, 1: float} [ex, ch]
+     * @return array{0: float, 1: float, 2: float} [ex, ch, ascent]
      */
     public function fontRelativeUnits(string $fontFamily, string|int $fontWeight = 'normal', string $fontStyle = 'normal'): array
     {
@@ -602,8 +603,12 @@ class FontManager
         }
         $ex = 0.5;
         $ch = 0.5;
+        $asc = 0.9;
         try {
             $font = $this->resolveFont($fontFamily, $fontWeight, $fontStyle);
+            if ($font->ascent > 100 && $font->ascent < 2000) {
+                $asc = $font->ascent / 1000.0;
+            }
             if ($font->xHeight > 50 && $font->xHeight < 1000) {
                 $ex = $font->xHeight / 1000.0;
             }
@@ -614,7 +619,7 @@ class FontManager
         } catch (\Throwable) {
             // keep the 0.5 em fallbacks
         }
-        return $this->unitMetricsCache[$key] = [$ex, $ch];
+        return $this->unitMetricsCache[$key] = [$ex, $ch, $asc];
     }
 
     /**

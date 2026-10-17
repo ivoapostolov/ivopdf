@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IvoPdf\Pdf;
 
 use IvoPdf\Options;
+use IvoPdf\RenderLimits;
 
 /**
  * Post-processing that turns the finished object table into PDF/A-1b (ISO 19005-1) content:
@@ -33,7 +34,7 @@ final class PdfA1Profile
             } else {
                 // ExtGState dictionaries (indirect or inline in /Resources), annotation /CA, groups: dictionary part only
                 [$d, $data] = self::split($new);
-                if (preg_match('~/(?:CA|ca)\s+-?[\d.]|/BM\s*/|/SMask~', $d) === 1) {
+                if (preg_match('~/(?:CA|ca)\s+-?[\d.]|/BM\s*/|/SMask\b~', $d) === 1) {
                     $d = self::flattenExtGState($d, $flat);
                 }
                 if (str_contains($d, '/Group')) {
@@ -157,6 +158,11 @@ final class PdfA1Profile
      * Composites an image onto white using its soft mask. Supports 8-bit DeviceRGB / DeviceGray images that are
      * Flate-compressed (with or without PNG predictors) or JPEG (via GD when available).
      *
+     * Image and mask are read row by row (ImageRowStream) and every composited row is deflated at once: a decompression
+     * bomb never exists decoded in memory. A JPEG is decoded by GD as a whole, so its bitmap is checked against the
+     * memory budget first (RenderLimits). When the result would not fit, null is returned and the caller drops the
+     * alpha channel instead (a warning tells).
+     *
      * @return ?array{0: string, 1: string} new dictionary text and stream data
      */
     private static function composite(string $dict, string $data, string $maskBody): ?array
@@ -176,123 +182,95 @@ final class PdfA1Profile
 
         [$maskDict, $maskData] = self::split($maskBody);
         if ($maskData === null || !str_contains($maskDict, '/FlateDecode')
-            || preg_match('~/Width\s+' . $w . '\b~', $maskDict) !== 1 || preg_match('~/Height\s+' . $h . '\b~', $maskDict) !== 1) {
+            || preg_match('~/Width\s+' . $w . '\b~', $maskDict) !== 1 || preg_match('~/Height\s+' . $h . '\b~', $maskDict) !== 1
+            || ImageRowStream::hasUnsupportedPredictor($maskDict)) {
             return null;
         }
-        $alpha = @gzuncompress($maskData);
-        if ($alpha === false) {
-            return null;
-        }
-        if (preg_match('~/Predictor\s+(\d+)~', $maskDict, $pm) === 1 && (int) $pm[1] >= 10) {
-            $alpha = self::undoPng($alpha, $w, 1);
-            if ($alpha === null) {
-                return null;
-            }
-        }
-        if (strlen($alpha) < $w * $h) {
+        $alpha = ImageRowStream::open($maskData, $w, 1, ImageRowStream::hasPngPredictor($maskDict));
+        if ($alpha === null) {
             return null;
         }
 
-        $isDct = str_contains($dict, '/DCTDecode');
-        if ($isDct) {
-            if (!function_exists('imagecreatefromstring')) {
+        $stride = $w * $channels;
+        $gd = null;
+        $rows = null;
+        if (str_contains($dict, '/DCTDecode')) {
+            if (!function_exists('imagecreatefromstring')
+                || !RenderLimits::fits($w * $h * 5 + 4 * $stride + 2 * strlen($data) + 4194304)) {
                 return null;
             }
-            $im = @imagecreatefromstring($data);
-            if ($im === false || imagesx($im) !== $w || imagesy($im) !== $h) {
+            $gd = ImageRowStream::quietly(static fn() => imagecreatefromstring($data));
+            if ($gd === false || imagesx($gd) !== $w || imagesy($gd) !== $h) {
                 return null;
             }
-            $raw = '';
-            for ($y = 0; $y < $h; $y++) {
+        } else {
+            if (!str_contains($dict, '/FlateDecode') || ImageRowStream::hasUnsupportedPredictor($dict)) {
+                return null;
+            }
+            $rows = ImageRowStream::open($data, $stride, $channels, ImageRowStream::hasPngPredictor($dict));
+            if ($rows === null) {
+                return null;
+            }
+        }
+
+        $z = deflate_init(ZLIB_ENCODING_DEFLATE, ['level' => 6]);
+        if ($z === false) {
+            return null;
+        }
+        $out = ''; // appended to: deflate_add() results keep the capacity of their input
+        $lastIn = null;
+        $lastOut = '';
+        for ($y = 0; $y < $h; $y++) {
+            RenderLimits::tick();
+            if ($gd !== null) {
+                $raw = '';
                 for ($x = 0; $x < $w; $x++) {
-                    $c = imagecolorat($im, $x, $y);
+                    $c = imagecolorat($gd, $x, $y);
                     $r = ($c >> 16) & 255;
                     $g = ($c >> 8) & 255;
                     $b = $c & 255;
                     $raw .= $channels === 3 ? chr($r) . chr($g) . chr($b) : chr(intdiv($r + $g + $b, 3));
                 }
-            }
-        } else {
-            if (!str_contains($dict, '/FlateDecode')) {
-                return null;
-            }
-            $raw = @gzuncompress($data);
-            if ($raw === false) {
-                return null;
-            }
-            if (preg_match('~/Predictor\s+(\d+)~', $dict, $pm) === 1 && (int) $pm[1] >= 10) {
-                $raw = self::undoPng($raw, $w, $channels);
+            } else {
+                $raw = $rows->next();
                 if ($raw === null) {
-                    return null;
+                    return null; // truncated / corrupt pixel data
                 }
-            } elseif (preg_match('~/Predictor\s+(\d+)~', $dict, $pm) === 1 && (int) $pm[1] > 1) {
+            }
+            $a = $alpha->next();
+            if ($a === null) {
+                return null; // truncated / corrupt mask
+            }
+            // Identical rows (flat areas, and every decompression bomb) are composited once
+            $sig = $raw . "\0" . $a;
+            if ($sig !== $lastIn) {
+                $lastIn = $sig;
+                if (trim($a, "\xFF") === '') {
+                    $lastOut = $raw;
+                } else {
+                    $lastOut = '';
+                    for ($i = 0; $i < $w; $i++) {
+                        $av = ord($a[$i]);
+                        for ($c = 0; $c < $channels; $c++) {
+                            $v = ord($raw[$i * $channels + $c]);
+                            $lastOut .= $av === 255 ? chr($v) : chr((int) round(($v * $av + 255 * (255 - $av)) / 255));
+                        }
+                    }
+                }
+            }
+            $out .= deflate_add($z, $lastOut, ZLIB_NO_FLUSH);
+            if (($y & 31) === 31 && !RenderLimits::fits(strlen($out) + 4 * $stride + 4194304)) {
                 return null;
             }
         }
-        if (strlen($raw) < $w * $h * $channels) {
-            return null;
-        }
-
-        $out = '';
-        $n = $w * $h;
-        for ($i = 0; $i < $n; $i++) {
-            $a = ord($alpha[$i]);
-            for ($c = 0; $c < $channels; $c++) {
-                $v = ord($raw[$i * $channels + $c]);
-                $out .= $a === 255 ? chr($v) : chr((int) round(($v * $a + 255 * (255 - $a)) / 255));
-            }
-        }
-        $z = (string) gzcompress($out, 6);
+        $gd = null;
+        $out .= deflate_add($z, '', ZLIB_FINISH);
 
         $dict = (string) preg_replace('~/Filter\s*(?:\[[^\]]*\]|/\w+)~', '', $dict);
         $dict = (string) preg_replace('~/DecodeParms\s*(?:<<.*?>>|\[[^\]]*\])~s', '', $dict);
         $dict = (string) preg_replace('~/Length\s+\d+~', '', $dict);
-        $dict = substr(rtrim($dict), 0, -2) . ' /Filter /FlateDecode /Length ' . strlen($z) . ' >>';
-        return [$dict, $z];
-    }
-
-    /** Reverses PNG row predictors (8-bit components); returns null on malformed data. */
-    private static function undoPng(string $data, int $width, int $colors): ?string
-    {
-        $rowLen = $width * $colors;
-        $stride = $rowLen + 1;
-        $rows = intdiv(strlen($data), $stride);
-        if ($rows < 1) {
-            return null;
-        }
-        $out = '';
-        $prev = array_fill(0, $rowLen, 0);
-        for ($r = 0; $r < $rows; $r++) {
-            $ft = ord($data[$r * $stride]);
-            $row = array_values(unpack('C*', substr($data, $r * $stride + 1, $rowLen)) ?: []);
-            if (count($row) < $rowLen) {
-                return null;
-            }
-            for ($i = 0; $i < $rowLen; $i++) {
-                $left = $i >= $colors ? $row[$i - $colors] : 0;
-                $up = $prev[$i];
-                $ul = $i >= $colors ? $prev[$i - $colors] : 0;
-                $row[$i] = match ($ft) {
-                    1 => ($row[$i] + $left) & 255,
-                    2 => ($row[$i] + $up) & 255,
-                    3 => ($row[$i] + intdiv($left + $up, 2)) & 255,
-                    4 => ($row[$i] + self::paeth($left, $up, $ul)) & 255,
-                    default => $row[$i],
-                };
-            }
-            $out .= pack('C*', ...$row);
-            $prev = $row;
-        }
-        return $out;
-    }
-
-    private static function paeth(int $a, int $b, int $c): int
-    {
-        $p = $a + $b - $c;
-        $pa = abs($p - $a);
-        $pb = abs($p - $b);
-        $pc = abs($p - $c);
-        return ($pa <= $pb && $pa <= $pc) ? $a : ($pb <= $pc ? $b : $c);
+        $dict = substr(rtrim($dict), 0, -2) . ' /Filter /FlateDecode /Length ' . strlen($out) . ' >>';
+        return [$dict, $out];
     }
 
     /** @param array<string, int> $flat */

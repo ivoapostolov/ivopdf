@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IvoPdf\Pdf;
 
 use IvoPdf\Options;
+use IvoPdf\RenderLimits;
 
 /**
  * Converts decoded RGB image XObject data (Flate/PNG-predictor or JPEG via GD) to DeviceCMYK at embed time and,
@@ -15,6 +16,9 @@ final class ImageCmykConverter
 {
     /** @var array<string, array<string, mixed>> */
     private static array $cache = [];
+
+    /** Why the last conversion failed (for the warning). */
+    private static string $failure = '';
 
     /**
      * @param array<string, mixed> $img image data as produced by ImageLoader
@@ -45,30 +49,13 @@ final class ImageCmykConverter
         $w = (int) $img['width'];
         $h = (int) $img['height'];
         $channels = $space === 'DeviceRGB' ? 3 : 1;
-        $raw = self::decodeRaw($img, $w, $h, $channels);
-        if ($raw === null) {
-            $opt->addWarning('Image could not be decoded for CMYK/transparency conversion; left as is.');
-            return $img;
-        }
-        $alpha = null;
-        if ($hasMask && $flatten) {
-            $a = @gzuncompress((string) $img['smask']);
-            if ($a !== false && strlen($a) >= $w * $h) {
-                $alpha = $a;
-            }
-            $opt->addWarning('PDF/X: an image alpha channel was composited onto white (transparency is not allowed).');
-        }
-
-        if ($space === 'DeviceRGB' && $toCmyk) {
-            $data = self::rgbToCmyk($raw, $w, $h, $alpha);
-            $res = ['colorSpace' => 'DeviceCMYK', 'data' => (string) gzcompress($data, 6), 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null];
-        } elseif ($space === 'DeviceRGB') {
-            $res = ['data' => (string) gzcompress(self::compositeOnWhite($raw, $w, $h, 3, (string) $alpha), 6), 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null];
-        } else {
-            $res = ['data' => (string) gzcompress(self::compositeOnWhite($raw, $w, $h, 1, (string) $alpha), 6), 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null];
+        $res = $w > 0 && $h > 0 ? self::convertRows($img, $w, $h, $channels, $toCmyk && $space === 'DeviceRGB', $hasMask && $flatten) : null;
+        if ($res === null) {
+            return self::unconverted($img, $opt, $flatten);
         }
         if ($hasMask && $flatten) {
             $res['smask'] = null;
+            $opt->addWarning('PDF/X: an image alpha channel was composited onto white (transparency is not allowed).');
         }
         if (count(self::$cache) >= 12) {
             self::$cache = [];
@@ -77,140 +64,172 @@ final class ImageCmykConverter
         return array_replace($img, $res);
     }
 
-    /** Raw 8-bit interleaved pixel bytes (w * h * channels) or null. */
-    private static function decodeRaw(array $img, int $w, int $h, int $channels): ?string
+    /**
+     * Converts the image row by row: the pixel data (and the soft mask) are inflated in small pieces and every converted
+     * row is deflated at once, so neither the decoded source nor the decoded result ever sits in memory as a whole.
+     * The memory budget (RenderLimits) is checked before GD decodes a JPEG and as the compressed result grows. Null
+     * when the image cannot be converted (corrupt / truncated data, unsupported encoding, not enough memory; the reason
+     * is kept in self::$failure).
+     *
+     * @param array<string, mixed> $img
+     * @return ?array<string, mixed>
+     */
+    private static function convertRows(array $img, int $w, int $h, int $channels, bool $toCmyk, bool $flatten): ?array
     {
+        self::$failure = 'its pixel data could not be decoded';
         $filter = (string) ($img['filter'] ?? '');
-        $data = (string) $img['data'];
-        $need = $w * $h * $channels;
+        $parms = isset($img['decodeParms']) ? (string) $img['decodeParms'] : null;
+        $stride = $w * $channels;
+        $gd = null;
+        $rows = null;
         if ($filter === 'FlateDecode') {
-            $z = @gzuncompress($data);
-            if ($z === false) {
+            if (ImageRowStream::hasUnsupportedPredictor($parms)) {
                 return null;
             }
-            if (!empty($img['decodeParms']) && str_contains((string) $img['decodeParms'], '/Predictor')) {
-                $z = self::unPredict($z, $w, $h, $channels);
-            }
-            return $z !== null && strlen($z) >= $need ? $z : null;
-        }
-        if ($filter === 'DCTDecode' && function_exists('imagecreatefromstring')) {
-            $im = @imagecreatefromstring($data);
-            if ($im === false) {
+            $rows = ImageRowStream::open((string) $img['data'], $stride, $channels, ImageRowStream::hasPngPredictor($parms));
+            if ($rows === null) {
                 return null;
             }
-            $out = [];
-            for ($y = 0; $y < $h; $y++) {
-                $row = '';
-                for ($x = 0; $x < $w; $x++) {
-                    $c = imagecolorat($im, $x, $y);
-                    $row .= $channels === 3 ? chr(($c >> 16) & 255) . chr(($c >> 8) & 255) . chr($c & 255) : chr($c & 255);
-                }
-                $out[] = $row;
+        } elseif ($filter === 'DCTDecode' && function_exists('imagecreatefromstring')) {
+            // GD decodes a JPEG as a whole: a truecolor bitmap (4 bytes per pixel) plus libjpeg's buffers
+            $need = $w * $h * 5 + 4 * $stride + 2 * strlen((string) $img['data']) + 4194304;
+            if (!RenderLimits::fits($need)) {
+                self::$failure = sprintf('decoding it needs about %s MB, more than the memory left (Options::$maxMemory / memory_limit)', number_format($need / 1048576, 1, '.', ''));
+                return null;
             }
-            return implode('', $out);
-        }
-        return null;
-    }
-
-    /** Reverses PNG row filters (Predictor 10..15) for 8-bit data. */
-    private static function unPredict(string $z, int $w, int $h, int $bpp): ?string
-    {
-        $stride = $w * $bpp;
-        if (strlen($z) < ($stride + 1) * $h) {
+            $gd = ImageRowStream::quietly(static fn() => imagecreatefromstring((string) $img['data']));
+            if ($gd === false || imagesx($gd) !== $w || imagesy($gd) !== $h) {
+                return null;
+            }
+        } else {
+            self::$failure = "its {$filter} encoding is not supported";
             return null;
         }
-        $out = [];
-        $prev = array_fill(0, $stride, 0);
-        $pos = 0;
+
+        $alpha = $flatten ? ImageRowStream::open((string) $img['smask'], $w, 1, false) : null;
+        $outZ = deflate_init(ZLIB_ENCODING_DEFLATE, ['level' => 6]);
+        if ($outZ === false) {
+            return null;
+        }
+        $out = ''; // appended to: deflate_add() results keep the capacity of their input
+        $cache = [];
+        $lastIn = null;
+        $lastOut = '';
         for ($y = 0; $y < $h; $y++) {
-            $type = ord($z[$pos++]);
-            $line = array_values(unpack('C*', substr($z, $pos, $stride)) ?: []);
-            $pos += $stride;
-            if (count($line) !== $stride) {
+            RenderLimits::tick();
+            if ($gd !== null) {
+                $row = '';
+                for ($x = 0; $x < $w; $x++) {
+                    $c = imagecolorat($gd, $x, $y);
+                    $row .= $channels === 3 ? chr(($c >> 16) & 255) . chr(($c >> 8) & 255) . chr($c & 255) : chr($c & 255);
+                }
+            } else {
+                $row = $rows->next();
+                if ($row === null) {
+                    return null; // truncated / corrupt pixel data
+                }
+            }
+            $a = null;
+            if ($alpha !== null) {
+                $a = $alpha->next();
+                if ($a === null) {
+                    $alpha = null; // a broken soft mask: the remaining rows are taken as opaque
+                }
+            }
+            // Identical source rows (flat areas, and every decompression bomb) are converted once
+            $sig = $a === null ? $row : $row . "\0" . $a;
+            if ($sig !== $lastIn) {
+                if ($toCmyk) {
+                    $lastOut = self::rgbRowToCmyk($row, $a, $cache);
+                } else {
+                    $lastOut = $a === null ? $row : self::compositeRowOnWhite($row, $w, $channels, $a);
+                }
+                $lastIn = $sig;
+            }
+            $out .= deflate_add($outZ, $lastOut, ZLIB_NO_FLUSH);
+            if (($y & 31) === 31 && !RenderLimits::fits(strlen($out) + 4 * strlen($lastOut) + 4194304)) {
+                self::$failure = 'the converted image does not fit the memory left (Options::$maxMemory / memory_limit)';
                 return null;
             }
-            switch ($type) {
-                case 1:
-                    for ($i = $bpp; $i < $stride; $i++) {
-                        $line[$i] = ($line[$i] + $line[$i - $bpp]) & 255;
-                    }
-                    break;
-                case 2:
-                    for ($i = 0; $i < $stride; $i++) {
-                        $line[$i] = ($line[$i] + $prev[$i]) & 255;
-                    }
-                    break;
-                case 3:
-                    for ($i = 0; $i < $stride; $i++) {
-                        $left = $i >= $bpp ? $line[$i - $bpp] : 0;
-                        $line[$i] = ($line[$i] + (($left + $prev[$i]) >> 1)) & 255;
-                    }
-                    break;
-                case 4:
-                    for ($i = 0; $i < $stride; $i++) {
-                        $a = $i >= $bpp ? $line[$i - $bpp] : 0;
-                        $b = $prev[$i];
-                        $c = $i >= $bpp ? $prev[$i - $bpp] : 0;
-                        $p = $a + $b - $c;
-                        $pa = abs($p - $a);
-                        $pb = abs($p - $b);
-                        $pc = abs($p - $c);
-                        $pr = ($pa <= $pb && $pa <= $pc) ? $a : ($pb <= $pc ? $b : $c);
-                        $line[$i] = ($line[$i] + $pr) & 255;
-                    }
-                    break;
-            }
-            $out[] = pack('C*', ...$line);
-            $prev = $line;
         }
-        return implode('', $out);
+        $gd = null;
+        $out .= deflate_add($outZ, '', ZLIB_FINISH);
+        $res = ['data' => $out, 'filter' => 'FlateDecode', 'decodeParms' => null, 'decode' => null];
+        if ($toCmyk) {
+            $res['colorSpace'] = 'DeviceCMYK';
+        }
+        return $res;
     }
 
-    private static function rgbToCmyk(string $raw, int $w, int $h, ?string $alpha): string
+    /**
+     * What is embedded when an image cannot be converted. With colorSpace 'cmyk' alone the RGB image is kept (a
+     * warning tells); under PDF/X, where an RGB or soft-masked image would make the file non-conforming, the image is
+     * skipped: a single white pixel takes its place.
+     *
+     * @param array<string, mixed> $img
+     * @return array<string, mixed>
+     */
+    private static function unconverted(array $img, Options $opt, bool $flatten): array
     {
-        $stride = $w * 3;
-        $cache = [];
-        $out = [];
-        for ($y = 0; $y < $h; $y++) {
-            $px = str_split(substr($raw, $y * $stride, $stride), 3);
-            $line = '';
-            $ao = $y * $w;
-            foreach ($px as $x => $p) {
-                $key = $alpha !== null ? $p . $alpha[$ao + $x] : $p;
-                if (!isset($cache[$key])) {
-                    if (count($cache) > 150000) {
-                        $cache = [];
-                    }
-                    $r = ord($p[0]) / 255.0;
-                    $g = ord($p[1]) / 255.0;
-                    $b = ord($p[2]) / 255.0;
-                    if ($alpha !== null) {
-                        $a = ord($alpha[$ao + $x]) / 255.0;
-                        $r = 1.0 - $a * (1.0 - $r);
-                        $g = 1.0 - $a * (1.0 - $g);
-                        $b = 1.0 - $a * (1.0 - $b);
-                    }
-                    $k = ColorOps::cmyk([$r, $g, $b, 1.0]);
-                    $cache[$key] = chr((int) round($k[0] * 255)) . chr((int) round($k[1] * 255)) . chr((int) round($k[2] * 255)) . chr((int) round($k[3] * 255));
+        $size = (int) $img['width'] . ' x ' . (int) $img['height'] . ' px';
+        if ($opt->pdfx === '' && !$flatten) {
+            $opt->addWarning("Image ({$size}) could not be converted to CMYK because " . self::$failure . '; left as is.');
+            return $img;
+        }
+        $opt->addWarning("PDF/X: image ({$size}) skipped: it could not be converted to CMYK / flattened because " . self::$failure . '.');
+        $cmyk = ColorOps::isCmykTarget() && ($img['colorSpace'] ?? '') !== 'DeviceGray';
+        return array_replace($img, [
+            'width' => 1,
+            'height' => 1,
+            'colorSpace' => $cmyk ? 'DeviceCMYK' : 'DeviceGray',
+            'bitsPerComponent' => 8,
+            'data' => (string) gzcompress($cmyk ? "\0\0\0\0" : "\xFF"),
+            'filter' => 'FlateDecode',
+            'decodeParms' => null,
+            'decode' => null,
+            'smask' => null,
+        ]);
+    }
+
+    /**
+     * @param array<string, string> $cache pixel (+ alpha) => CMYK bytes, shared by the rows of one image
+     */
+    private static function rgbRowToCmyk(string $row, ?string $alpha, array &$cache): string
+    {
+        $line = '';
+        foreach (str_split($row, 3) as $x => $p) {
+            $key = $alpha !== null ? $p . $alpha[$x] : $p;
+            if (!isset($cache[$key])) {
+                if (count($cache) > 150000) {
+                    $cache = [];
                 }
-                $line .= $cache[$key];
+                $r = ord($p[0]) / 255.0;
+                $g = ord($p[1]) / 255.0;
+                $b = ord($p[2]) / 255.0;
+                if ($alpha !== null) {
+                    $a = ord($alpha[$x]) / 255.0;
+                    $r = 1.0 - $a * (1.0 - $r);
+                    $g = 1.0 - $a * (1.0 - $g);
+                    $b = 1.0 - $a * (1.0 - $b);
+                }
+                $k = ColorOps::cmyk([$r, $g, $b, 1.0]);
+                $cache[$key] = chr((int) round($k[0] * 255)) . chr((int) round($k[1] * 255)) . chr((int) round($k[2] * 255)) . chr((int) round($k[3] * 255));
             }
-            $out[] = $line;
+            $line .= $cache[$key];
         }
-        return implode('', $out);
+        return $line;
     }
 
-    private static function compositeOnWhite(string $raw, int $w, int $h, int $channels, string $alpha): string
+    private static function compositeRowOnWhite(string $row, int $w, int $channels, string $alpha): string
     {
-        if ($alpha === '') {
-            return substr($raw, 0, $w * $h * $channels);
+        if (trim($alpha, "\xFF") === '') {
+            return $row;
         }
         $out = '';
-        $n = $w * $h;
-        for ($i = 0; $i < $n; $i++) {
+        for ($i = 0; $i < $w; $i++) {
             $a = ord($alpha[$i]);
             for ($c = 0; $c < $channels; $c++) {
-                $v = ord($raw[$i * $channels + $c]);
+                $v = ord($row[$i * $channels + $c]);
                 $out .= chr((int) round(255 - $a * (255 - $v) / 255));
             }
         }

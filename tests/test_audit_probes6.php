@@ -464,6 +464,22 @@ foreach ($cases as $label => [$html, $opt]) {
 
 // ---------------------------------------------------------------------------
 echo "\n";
+// A shrink-to-fit box sized to its max-content must not wrap: max-content is measured word by word like the
+// line layout (Inter kerns across a space, e.g. ". 0", so the whole-string width was ~0.5pt too small)
+foreach (['0', '0.5pt'] as $lsp) {
+    $fit = render('<div style="display:flex"><div id="fit" style="font-family:Inter;font-size:19pt;font-weight:bold;letter-spacing:' . $lsp . '">INVOICE No. 0000104829</div></div>');
+    $fitBox = findById($fit->getLayoutTree(), 'fit');
+    check("flex item sized to its text stays on one line (letter-spacing {$lsp})", $fitBox !== null && count($fitBox->lines) === 1, $fitBox ? count($fitBox->lines) . ' lines' : 'missing');
+}
+
+// position: relative inline content is painted after the rest of the line (CSS painting order), as in Edge:
+// it overlaps "after" and still extracts as its own word
+$rel = inspect(render('<div style="height:40pt">Left <span style="position:relative;left:10pt">TARGET</span> after</div>'));
+if ($rel !== null) {
+    $words = array_map(static fn(array $w): string => $w[4], $rel[0]['w']);
+    check('relatively positioned span extracts as its own word, painted last', $words === ['Left', 'after', 'TARGET'], implode(' ', $words));
+}
+
 check('no PHP warnings / notices', $phpIssues === [], implode(' | ', array_slice($phpIssues, 0, 3)));
 echo "=== Summary: {$passed} passed, {$failed} failed" . ($skipped > 0 ? ", {$skipped} skipped" : '') . " ===\n";
 exit($failed > 0 ? 1 : 0);

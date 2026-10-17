@@ -508,7 +508,7 @@ final class Dompdf
 
     public function render(): void
     {
-        $this->renderEngine(null);
+        $this->renderEngine(null, true);
     }
 
     /**
@@ -537,11 +537,16 @@ final class Dompdf
     private function ensureRendered(bool $compress): void
     {
         if ($this->engine === null || $this->dirtyInput || $this->renderedVersion !== $this->canvas->version() || $this->renderedCompress !== $compress) {
-            $this->renderEngine($compress);
+            $this->renderEngine($compress, $this->engine === null);
         }
     }
 
-    private function renderEngine(?bool $compress): void
+    /**
+     * @param bool $explicit render() called by the application (or the first rendering): the canvas page counters are
+     *                       reset to the page count, as dompdf's renderer does; re-renderings done by output() after
+     *                       more canvas drawing keep them
+     */
+    private function renderEngine(?bool $compress, bool $explicit = false): void
     {
         $compress ??= $this->renderedCompress ?? true;
         $engine = new IvoPdf($this->settings($compress));
@@ -581,7 +586,7 @@ final class Dompdf
         $this->pendingWarnings = [];
         $this->warnings = $engine->getWarnings();
         $canvas->setPageSize($w, $h);
-        $canvas->setPageCount($engine->getPageCount());
+        $canvas->setPageCount($engine->getPageCount(), $explicit);
         $this->renderedVersion = $canvas->version();
         $this->renderedCompress = $compress;
         $this->dirtyInput = false;
@@ -593,6 +598,7 @@ final class Dompdf
         if ($n <= 0) {
             return $html;
         }
+        // every marker starts a page (consecutive forced breaks each start one, as in browsers)
         $pages = str_repeat('<div style="page-break-before:always;height:1pt;margin:0;padding:0"></div>', $n);
         $pos = strripos($html, '</body');
         return $pos === false ? $html . $pages : substr($html, 0, $pos) . $pages . substr($html, $pos);
@@ -606,7 +612,8 @@ final class Dompdf
         foreach ($this->callbacks as $event => $fs) {
             foreach ($fs as $f) {
                 if ($event === 'end_document') {
-                    $over[] = $f;
+                    // dompdf runs these through page_script() after rendering: get_page_number() is the last page
+                    $over[] = static fn(int $pageNumber, int $pageCount, Canvas $canvas, FontMetrics $fontMetrics) => $canvas->withPageNumber($pageCount, static fn() => $f($pageNumber, $pageCount, $canvas, $fontMetrics));
                 } elseif ($event === 'end_page_render' || $event === 'begin_page_render') {
                     if (!self::acceptsNull($f)) {
                         $this->reportEvent($event, 'the callback requires a dompdf Frame as first argument, which IvoPDF cannot provide (declare it nullable, e.g. ?Frame $frame)');

@@ -194,7 +194,6 @@ class InlineLayout
             $ttf = $this->fontManager->resolveFont($ns->get('font-family', 'DejaVu Sans'), $ns->get('font-weight', 'normal'), $ns->get('font-style', 'normal'));
             $token->ascent = ($ttf->ascent / 1000.0) * $fontSizePt;
             $token->descent = (abs($ttf->descent) / 1000.0) * $fontSizePt;
-            $token->height = $token->ascent + $token->descent;
             $token->letterSpacingPt = $this->engine->resolveLength($ns->get('letter-spacing', '0'), 0.0, $fontSizePt);
             if (!$token->isWhitespace && in_array('text-transform', $props, true)) {
                 $token->text = TextEffects::transform($token->text, $ns->get('text-transform', 'none'));
@@ -524,11 +523,27 @@ class InlineLayout
             $maxLineHeight = 0.0;
             $runsTotalWidth = 0.0;
             $spaceCount = 0;
+            // vertical-align: top / bottom boxes do not take part in the baseline alignment (CSS 2.1 10.8): the line
+            // only grows to their margin-box height
+            $topBoxH = 0.0;
+            $bottomBoxH = 0.0;
 
             foreach ($runs as $run) {
                 $runsTotalWidth += $run->width + $run->paddingLeft + $run->paddingRight;
                 if ($run->isWhitespace) {
                     $spaceCount++;
+                }
+                if ($run->inlineBox !== null) {
+                    $edgeAlign = strtolower(trim($run->style->get('vertical-align', 'baseline')));
+                    if ($edgeAlign === 'top' || $edgeAlign === 'bottom') {
+                        $boxH = $run->inlineBox->height + $run->inlineBox->marginTop + $run->inlineBox->marginBottom;
+                        if ($edgeAlign === 'top') {
+                            $topBoxH = max($topBoxH, $boxH);
+                        } else {
+                            $bottomBoxH = max($bottomBoxH, $boxH);
+                        }
+                        continue;
+                    }
                 }
 
                 $lhPt = $this->resolveLineHeight($run->style, $run->fontSizePt);
@@ -565,6 +580,14 @@ class InlineLayout
                 $maxAscent += $extra;
                 $maxDescent += $extra;
             }
+            if ($bottomBoxH > $lineHeight) {
+                $maxAscent += $bottomBoxH - $lineHeight; // the baseline-aligned content sits at the bottom of the line
+                $lineHeight = $bottomBoxH;
+            }
+            if ($topBoxH > $lineHeight) {
+                $maxDescent += $topBoxH - $lineHeight; // ... and at its top
+                $lineHeight = $topBoxH;
+            }
             $lineBox->height = $lineHeight;
             $lineBox->baselineOffset = $maxAscent;
 
@@ -589,7 +612,6 @@ class InlineLayout
 
                 $run->x = $runCursorX + $run->paddingLeft;
                 $run->y = $cursorY + ($maxAscent - $run->ascent) + $vOffset;
-                $run->height = $run->ascent + $run->descent;
 
                 if ($run->inlineBox !== null) {
                     $boxY = $cursorY + $maxAscent - $run->ascent + $vOffset + $run->inlineBox->marginTop;
@@ -618,6 +640,9 @@ class InlineLayout
             }
 
             $lineBox->width = $runCursorX - $offsetX;
+            if ($extraSpacePerGap === 0.0 && count($lineBox->runs) > 1) {
+                $lineBox->runs = $this->mergeLineRuns($lineBox->runs);
+            }
             $container->lines[] = $lineBox;
             $cursorY += $lineHeight;
         }
@@ -725,6 +750,52 @@ class InlineLayout
             }
         }
         return $out;
+    }
+
+    /** @var \WeakMap<ComputedStyle, bool>|null whether the runs of a style may be merged (see mergeLineRuns()) */
+    private ?\WeakMap $mergeableStyles = null;
+
+    /**
+     * Joins neighbouring runs of a placed line that draw exactly as one: plain (unshaped) text of the same style, link
+     * and decorations that touch, so a paragraph line keeps one or a few runs instead of one per word and space
+     * (a run is about 0.4 KB: the runs were half of the memory of a long document's layout tree).
+     *
+     * @param list<TextRun> $runs
+     * @return list<TextRun>
+     */
+    private function mergeLineRuns(array $runs): array
+    {
+        $out = [];
+        $prev = null;
+        foreach ($runs as $run) {
+            if ($prev !== null && $run->style === $prev->style && $run->glyphs === null && $prev->glyphs === null
+                && $run->inlineBox === null && $prev->inlineBox === null && !$run->hasExtra() && !$prev->hasExtra()
+                && $run->href === $prev->href && $run->decorations === $prev->decorations
+                && $prev->decoRight === [] && $run->decoLeft === [] && !$run->isLineBreak && !$prev->isLineBreak
+                && $run->letterSpacingPt === 0.0 && $prev->letterSpacingPt === 0.0 && $run->fontSizePt === $prev->fontSizePt
+                && $run->ascent === $prev->ascent && $run->descent === $prev->descent && abs($run->y - $prev->y) < 0.0001
+                && abs($prev->x + $prev->width - $run->x) < 0.001 && $this->mergeableStyle($run->style)
+                && strpbrk($run->text, "{\t") === false && strpbrk($prev->text, "{\t") === false) {
+                $prev->text .= $run->text;
+                $prev->width = $run->x + $run->width - $prev->x;
+                $prev->isWhitespace = $prev->isWhitespace && $run->isWhitespace;
+                continue;
+            }
+            $out[] = $run;
+            $prev = $run;
+        }
+        return $out;
+    }
+
+    /**
+     * Runs of this style draw their text with the font's own advances (no word-spacing added to the spaces, no
+     * generated page numbers or leaders that are rewritten after pagination).
+     */
+    private function mergeableStyle(ComputedStyle $style): bool
+    {
+        $this->mergeableStyles ??= new \WeakMap();
+        return $this->mergeableStyles[$style] ??= !$style->has('ivo-leader') && !$style->has('ivo-pageref')
+            && in_array(strtolower(trim($style->get('word-spacing', 'normal'))), ['normal', '0', '0px', '0pt', ''], true);
     }
 
     /**
@@ -1312,6 +1383,11 @@ class InlineLayout
                 $baselineFromTop = $this->findLastBaseline($node);
             }
             $valign = strtolower($node->style->get('vertical-align', 'baseline'));
+            if ($baselineFromTop !== null && $baselineFromTop > $node->height && in_array($valign, ['top', 'text-top', 'bottom', 'text-bottom'], true)) {
+                // A top / bottom aligned box adds its margin box to the line, also when its content overflows a
+                // definite height (its last line, and so its baseline, lies below the box)
+                $baselineFromTop = $node->height;
+            }
             if ($valign === 'middle') {
                 $xMid = $node->parent !== null ? $node->parent->fontSizePt * 0.3 : $node->fontSizePt * 0.3;
                 $ascent = $node->marginTop + $node->height / 2.0 + $xMid;
@@ -1763,6 +1839,46 @@ class InlineLayout
     }
 
     /**
+     * A right-to-left word drawn by a fallback font keeps the punctuation inside it (the quote of דוא"ל, the hyphen of
+     * אבג-דהו) in that font when the font has it: one run instead of three, so the word keeps one bidi run and
+     * extractors read it in logical order (as when one font draws the whole word) instead of reordering the pieces
+     * of each font separately. Punctuation at the word's ends keeps the requested font.
+     *
+     * @param list<int> $codepoints
+     * @param list<?string> $families fallback family per code point (null = the requested font), updated in place
+     */
+    private function keepRtlPunctuationInFallback(array $codepoints, array &$families, string $fontWeight, string $fontStyle): void
+    {
+        $n = count($codepoints);
+        $isPunct = static fn(int $cp): bool => preg_match('/^[\p{P}\p{S}]$/u', mb_chr($cp, 'UTF-8')) === 1;
+        for ($i = 1; $i < $n - 1; $i++) {
+            $fb = $families[$i - 1];
+            if ($families[$i] !== null || $fb === null || !$isPunct($codepoints[$i])) {
+                continue;
+            }
+            $next = $i;
+            while ($next < $n && $families[$next] === null && $isPunct($codepoints[$next])) {
+                $next++;
+            }
+            if ($next >= $n || $families[$next] !== $fb) {
+                $i = $next;
+                continue;
+            }
+            $ttf = $this->fontManager->resolveFont($fb, $fontWeight, $fontStyle);
+            $covered = true;
+            for ($k = $i; $k < $next; $k++) {
+                $covered = $covered && $ttf->getGlyphId($codepoints[$k]) !== 0;
+            }
+            if ($covered) {
+                for ($k = $i; $k < $next; $k++) {
+                    $families[$k] = $fb;
+                }
+            }
+            $i = $next;
+        }
+    }
+
+    /**
      * Splits a word into segments rendered with the requested font or a fallback family covering missing glyphs.
      *
      * @return list<array{0: string, 1: ComputedStyle}>
@@ -1782,6 +1898,9 @@ class InlineLayout
         }
         if (!$needsSplit) {
             return [[$word, $style]];
+        }
+        if (preg_match('/[\x{0590}-\x{08FF}\x{FB1D}-\x{FDFF}\x{FE70}-\x{FEFF}]/u', $word) === 1) {
+            $this->keepRtlPunctuationInFallback($codepoints, $families, $fontWeight, $fontStyle);
         }
 
         $segments = [];

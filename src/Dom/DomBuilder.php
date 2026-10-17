@@ -228,8 +228,9 @@ class DomBuilder
             if ($closedSummary === null) {
                 $defSummary = new LayoutBox('summary', $parentBox->style->inheritForElement('summary'));
                 $defSummary->style->set('display', 'block');
+                $defSummary->addChild($this->insideMarkerBox("\u{25B8}", $defSummary->style->inheritForElement('span'), $defSummary->style));
                 $defText = new LayoutBox('#text', $defSummary->style);
-                $defText->textContent = "\u{25B8} Details";
+                $defText->textContent = 'Details';
                 $defSummary->addChild($defText);
                 $parentBox->addChild($defSummary);
             }
@@ -381,7 +382,11 @@ class DomBuilder
                     $listCounter = self::clampCounter($child->getAttribute('value'));
                 }
                 $listStyleType = strtolower($childStyle->get('list-style-type', 'disc'));
-                if ($listStyleType !== 'none') {
+                $rawType = trim($childStyle->get('list-style-type', 'disc'));
+                if (strlen($rawType) >= 2 && ($rawType[0] === '"' || $rawType[0] === "'") && $rawType[strlen($rawType) - 1] === $rawType[0]) {
+                    // list-style-type: '-> ' (a <string>): the string itself is the marker
+                    $childBox->listMarker = stripcslashes(substr($rawType, 1, -1));
+                } elseif ($listStyleType !== 'none') {
                     if (in_array($listStyleType, ['decimal', 'decimal-leading-zero', 'lower-alpha', 'upper-alpha', 'lower-latin', 'upper-latin', 'lower-roman', 'upper-roman', 'lower-greek', 'cyrillic', 'lower-cyrillic', 'upper-cyrillic'], true) || \IvoPdf\Text\CounterStyles::supports($listStyleType)) {
                         $childBox->listMarker = $this->formatListNumber($listCounter, $listStyleType);
                     } else {
@@ -472,19 +477,64 @@ class DomBuilder
             $img->imageSrc = $li->listMarkerImage;
             $li->addChild($img);
         } else {
-            if (in_array($li->listMarker, ['•', '◦', '▪'], true)) {
-                // Browsers pad an inside symbol marker by 7px after its "• " text
-                $spanStyle = clone $spanStyle;
-                $spanStyle->set('margin-right', '5.25pt');
-            }
-            $span = new LayoutBox('span', $spanStyle);
-            $text = new LayoutBox('#text', clone $spanStyle);
-            $text->textContent = $li->listMarker . ' ';
-            $span->addChild($text);
-            $li->addChild($span);
+            $li->addChild($this->insideMarkerBox((string) $li->listMarker, $spanStyle, $style));
         }
         $li->listMarker = null;
         $li->listMarkerImage = null;
+    }
+
+    /** The inline box of an inside marker: "1. " text, a '<string>' as is, or a symbol in a box of the browsers' width. */
+    private function insideMarkerBox(string $markerText, \IvoPdf\Css\ComputedStyle $spanStyle, \IvoPdf\Css\ComputedStyle $liStyle): LayoutBox
+    {
+        $symbolWidth = self::insideSymbolMarkerWidth($markerText, $spanStyle);
+        if ($symbolWidth !== null) {
+            // A symbol marker (disc, circle, square, disclosure triangle) is a box of Chromium's width with the
+            // symbol at its start: the text after it starts where it does in browsers
+            $spanStyle = clone $spanStyle;
+            $spanStyle->set('display', 'inline-block');
+            $spanStyle->set('width', sprintf('%.4Fpt', $symbolWidth));
+            $spanStyle->set('white-space', 'nowrap');
+            $spanStyle->set('text-indent', '0');
+            $markerText .= "\u{00A0}"; // inside the fixed width (a space there would be dropped): copy / paste sees it
+        } elseif (!self::isStringMarker($liStyle)) {
+            $markerText .= ' '; // "1. ": the counter, its suffix and a space
+        }
+        $span = new LayoutBox('span', $spanStyle);
+        $text = new LayoutBox('#text', clone $spanStyle);
+        $text->textContent = $markerText;
+        $span->addChild($text);
+        return $span;
+    }
+
+    /** list-style-type is a <string> ('-> '): the marker is exactly that text, without a space after it. */
+    private static function isStringMarker(\IvoPdf\Css\ComputedStyle $style): bool
+    {
+        $raw = trim($style->get('list-style-type', 'disc'));
+        return $raw !== '' && ($raw[0] === '"' || $raw[0] === "'");
+    }
+
+    /**
+     * Inline size of an inside symbol marker in browsers (Chromium list_marker.cc), or null for a text marker: a disc /
+     * circle / square is a (ascent * 2/3 + 1) / 2 px symbol, 1 px apart from the text that starts 1 em after it; a
+     * disclosure triangle (<summary>) with its gap takes 1.06 em.
+     */
+    private static function insideSymbolMarkerWidth(string $marker, \IvoPdf\Css\ComputedStyle $style): ?float
+    {
+        $fontPx = $style->getFontSizePt() / 0.75;
+        if ($marker === "\u{25B8}" || $marker === "\u{25BE}") {
+            return 1.06 * $fontPx * 0.75;
+        }
+        if (!in_array($marker, ['•', '◦', '▪'], true)) {
+            return null;
+        }
+        $ascent = 0.9;
+        $resolver = \IvoPdf\Css\ComputedStyle::$fontUnitResolver;
+        if ($resolver !== null) {
+            $metrics = $resolver($style->get('font-family', 'DejaVu Sans'), $style->get('font-weight', 'normal'), $style->get('font-style', 'normal'));
+            $ascent = (float) ($metrics[2] ?? 0.9);
+        }
+        $symbolPx = intdiv(intdiv((int) round($ascent * $fontPx) * 2, 3) + 1, 2);
+        return ($symbolPx + 1 + $fontPx) * 0.75;
     }
 
     /**

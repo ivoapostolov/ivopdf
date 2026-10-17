@@ -69,7 +69,22 @@ final class BorderPainter
         if (!$needs) {
             return null;
         }
-        return $this->paint($x, $y, $w, $h, $radii, $widths, $styles, $colors);
+        return $this->paint($x, $y, $w, $h, $radii, $widths, $styles, $colors, !$hasRadius && self::inCollapsedTable($box));
+    }
+
+    /** A cell of a `border-collapse: collapse` table: its borders meet the neighbours' ones without mitred joins. */
+    private static function inCollapsedTable(LayoutBox $box): bool
+    {
+        if ($box->getDisplay() !== 'table-cell') {
+            return false;
+        }
+        for ($a = $box->parent, $depth = 0; $a !== null && $depth < 3; $a = $a->parent, $depth++) {
+            $d = $a->getDisplay();
+            if ($d === 'table' || $d === 'inline-table') {
+                return strtolower(trim($a->style->get('border-collapse', 'separate'))) === 'collapse';
+            }
+        }
+        return false;
     }
 
     /**
@@ -94,7 +109,7 @@ final class BorderPainter
      * @param list<string> $styles
      * @param list<array{0: float, 1: float, 2: float, 3: float}|null> $colors
      */
-    public function paint(float $x, float $y, float $w, float $h, array $radii, array $widths, array $styles, array $colors): string
+    public function paint(float $x, float $y, float $w, float $h, array $radii, array $widths, array $styles, array $colors, bool $square = false): string
     {
         $out = '';
         $active = [];
@@ -113,7 +128,7 @@ final class BorderPainter
             return $this->fillRing($x, $y, $w, $h, $radii, $widths, 0.0, 1.0, $colors[0]);
         }
 
-        $wedges = $this->wedges($x, $y, $w, $h, $widths);
+        $wedges = $square ? $this->bands($x, $y, $w, $h, $widths) : $this->wedges($x, $y, $w, $h, $widths);
         foreach ($active as $i) {
             $style = $styles[$i];
             $color = $colors[$i];
@@ -237,6 +252,34 @@ final class BorderPainter
             [[$x + $w, $y], [$x + $w, $y + $h], [$ix1, $iy1], [$ix1, $iy0]],
             [[$x + $w, $y + $h], [$x, $y + $h], [$ix0, $iy1], [$ix1, $iy1]],
             [[$x, $y + $h], [$x, $y], [$ix0, $iy0], [$ix0, $iy1]],
+        ];
+    }
+
+    /**
+     * Four side bands without diagonal joins: each corner belongs to the wider side (the horizontal one on a tie), as
+     * browsers paint collapsed table borders (the winning border of a grid line covers the narrower ones meeting it).
+     *
+     * @param list<float> $widths
+     * @return list<list<array{0: float, 1: float}>>
+     */
+    private function bands(float $x, float $y, float $w, float $h, array $widths): array
+    {
+        [$bt, $br, $bb, $bl] = $widths;
+        $x1 = $x + $w;
+        $y1 = $y + $h;
+        $tx0 = $bl > $bt ? $x + $bl : $x;
+        $tx1 = $br > $bt ? $x1 - $br : $x1;
+        $bx0 = $bl > $bb ? $x + $bl : $x;
+        $bx1 = $br > $bb ? $x1 - $br : $x1;
+        $ly0 = $bt >= $bl ? $y + $bt : $y;
+        $ly1 = $bb >= $bl ? $y1 - $bb : $y1;
+        $ry0 = $bt >= $br ? $y + $bt : $y;
+        $ry1 = $bb >= $br ? $y1 - $bb : $y1;
+        return [
+            [[$tx0, $y], [$tx1, $y], [$tx1, $y + $bt], [$tx0, $y + $bt]],
+            [[$x1 - $br, $ry0], [$x1, $ry0], [$x1, $ry1], [$x1 - $br, $ry1]],
+            [[$bx0, $y1 - $bb], [$bx1, $y1 - $bb], [$bx1, $y1], [$bx0, $y1]],
+            [[$x, $ly0], [$x + $bl, $ly0], [$x + $bl, $ly1], [$x, $ly1]],
         ];
     }
 

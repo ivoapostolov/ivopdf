@@ -660,6 +660,54 @@ class ImageLoader
      *   smask?: string
      * }|null
      */
+    /**
+     * Undoes one PNG row filter (1 Sub, 2 Up, 3 Average, 4 Paeth) on integer arrays: one specialised loop per filter
+     * instead of a per-byte match()/ord()/chr(), several times faster on large images.
+     */
+    private static function unfilterRow(string $cur, string $prev, int $filter, int $bpp): string
+    {
+        $x = array_values(unpack('C*', $cur) ?: []);
+        $n = count($x);
+        if ($n === 0) {
+            return $cur;
+        }
+        if ($filter === 1) {
+            for ($i = $bpp; $i < $n; $i++) {
+                $x[$i] = ($x[$i] + $x[$i - $bpp]) & 0xFF;
+            }
+            return pack('C*', ...$x);
+        }
+        $b = array_values(unpack('C*', $prev) ?: []);
+        if ($filter === 2) {
+            for ($i = 0; $i < $n; $i++) {
+                $x[$i] = ($x[$i] + $b[$i]) & 0xFF;
+            }
+        } elseif ($filter === 3) {
+            for ($i = 0; $i < $bpp && $i < $n; $i++) {
+                $x[$i] = ($x[$i] + ($b[$i] >> 1)) & 0xFF;
+            }
+            for ($i = $bpp; $i < $n; $i++) {
+                $x[$i] = ($x[$i] + (($x[$i - $bpp] + $b[$i]) >> 1)) & 0xFF;
+            }
+        } elseif ($filter === 4) {
+            for ($i = 0; $i < $bpp && $i < $n; $i++) {
+                $x[$i] = ($x[$i] + $b[$i]) & 0xFF; // Paeth with a = c = 0 picks b
+            }
+            for ($i = $bpp; $i < $n; $i++) {
+                $a = $x[$i - $bpp];
+                $up = $b[$i];
+                $c = $b[$i - $bpp];
+                $pa = abs($up - $c);
+                $pb = abs($a - $c);
+                $pc = abs($a + $up - 2 * $c);
+                $x[$i] = ($x[$i] + ($pa <= $pb && $pa <= $pc ? $a : ($pb <= $pc ? $up : $c))) & 0xFF;
+            }
+        } else {
+            return $cur;
+        }
+        return pack('C*', ...$x);
+    }
+
     private function decodePngWithAlphaPurePhp(string $idat, int $width, int $height, int $colorType): ?array
     {
         $bpp = $colorType === 6 ? 4 : 2; // bytes per pixel
@@ -701,30 +749,17 @@ class ImageLoader
             $buf = substr($buf, $rowLen);
 
             if ($filter !== 0) {
-                for ($i = 0; $i < $stride; $i++) {
-                    $xByte = ord($curRow[$i]);
-                    $a = $i >= $bpp ? ord($curRow[$i - $bpp]) : 0;
-                    $b = ord($prevRow[$i]);
-                    $c = $i >= $bpp ? ord($prevRow[$i - $bpp]) : 0;
-
-                    $recon = match ($filter) {
-                        1 => ($xByte + $a) & 0xFF,
-                        2 => ($xByte + $b) & 0xFF,
-                        3 => ($xByte + (($a + $b) >> 1)) & 0xFF,
-                        4 => ($xByte + $this->paethPredictor($a, $b, $c)) & 0xFF,
-                        default => $xByte,
-                    };
-                    $curRow[$i] = chr($recon);
-                }
+                $curRow = self::unfilterRow($curRow, $prevRow, $filter, $bpp);
             }
 
             $rowColor = '';
             $rowAlpha = '';
             if ($colorType === 6) {
-                for ($p = 0; $p < $stride; $p += 4) {
-                    $rowColor .= substr($curRow, $p, 3);
-                    $rowAlpha .= $curRow[$p + 3];
+                $px = str_split($curRow, 4);
+                foreach ($px as $q) {
+                    $rowColor .= substr($q, 0, 3);
                 }
+                $rowAlpha = implode('', array_map(static fn(string $q): string => $q[3] ?? "\x00", $px));
             } else {
                 for ($p = 0; $p < $stride; $p += 2) {
                     $rowColor .= $curRow[$p];

@@ -289,8 +289,9 @@ foreach (['DejaVu Sans', 'Inter'] as $fam) {
     $texts = array_map(static fn($r) => $r->text, $runs);
     $caps = array_values(array_filter($runs, static fn($r) => near($r->fontSizePt, 20.0, 0.01)));
     $small = array_values(array_filter($runs, static fn($r) => near($r->fontSizePt, 14.0, 0.01)));
-    $capText = implode('', array_map(static fn($r) => $r->text, $caps));
-    $smallText = implode('', array_map(static fn($r) => $r->text, $small));
+    // the space before a capital is drawn at its size and joins its run (" C"): compare the letters only
+    $capText = str_replace(' ', '', implode('', array_map(static fn($r) => $r->text, $caps)));
+    $smallText = str_replace(' ', '', implode('', array_map(static fn($r) => $r->text, $small)));
     check("[$fam] real capitals stay full size", $capText === 'SCT', $capText);
     check("[$fam] lowercase letters become capitals at 0.7x size", $smallText === 'MALLAPSEXT', $smallText . ' / ' . implode('|', $texts));
 }

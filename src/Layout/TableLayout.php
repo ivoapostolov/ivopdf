@@ -167,6 +167,14 @@ class TableLayout
         // (CSS 2.1 17.6.2); like browsers, the table box holds all of it, so the grid starts half of it inside
         $outer = null;
         if ($borderCollapse) {
+            // Every cell takes the winning border of each of its edges (cell, neighbour, row, row group, table)
+            $rowsByIdx = [];
+            $groupsByIdx = [];
+            foreach ($orderedRows as $ri => $entry) {
+                $rowsByIdx[$ri] = $entry['rowBox'];
+                $groupsByIdx[$ri] = $entry['groupBox'];
+            }
+            CollapsedBorders::apply($this->engine, $table, $cellPlacements, $rowsByIdx, $groupsByIdx, $numRows, $numCols, $contentWidth);
             $outer = TableMetrics::collapsedOuterBorders($this->engine, $table, $cellPlacements, $numRows, $numCols, $contentWidth);
             $contentX += ($outer['left'] - $table->borderLeft) / 2.0;
             $contentY += ($outer['top'] - $table->borderTop) / 2.0;
@@ -361,9 +369,15 @@ class TableLayout
         $totalHeight += $captionHeight + $bottomCaptionHeight;
 
         if ($outer !== null) {
-            // LayoutEngine adds the table's own padding and border; a collapsed table has no padding and its border
-            // box ends half of the outer collapsed border beyond the first and last grid lines
-            return max(0.0, $totalHeight + ($outer['top'] + $outer['bottom']) / 2.0 - $table->borderTop - $table->borderBottom - $table->paddingTop - $table->paddingBottom);
+            // The cells paint the resolved borders, the table's own ones took part in that resolution: the table
+            // paints none (browsers draw each collapsed border once)
+            $table->borderTop = 0.0;
+            $table->borderRight = 0.0;
+            $table->borderBottom = 0.0;
+            $table->borderLeft = 0.0;
+            // LayoutEngine adds the table's own padding; a collapsed table has no padding and its border box ends
+            // half of the outer collapsed border beyond the first and last grid lines
+            return max(0.0, $totalHeight + ($outer['top'] + $outer['bottom']) / 2.0 - $table->paddingTop - $table->paddingBottom);
         }
         return max(0.0, $totalHeight);
     }

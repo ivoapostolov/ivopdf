@@ -217,19 +217,23 @@ class LayoutEngine
         }
 
         // Resolve final border-box height
+        $fixed = false;
         if ($box->forcedBorderBoxHeight !== null) {
             $box->height = max($contentHeight + $box->getVerticalSpacing(), $box->forcedBorderBoxHeight);
         } else {
             $explicitContentH = $this->getExplicitContentHeight($box, $containingWidth);
             $finalContentH = $explicitContentH !== null ? max($contentHeight, $explicitContentH) : $contentHeight;
-            $hCss = strtolower(trim($box->style->get('height', 'auto')));
-            if ($explicitContentH !== null && $hCss !== 'auto' && $hCss !== '' && strtolower($box->style->get('overflow', 'visible')) !== 'visible') {
-                // Fixed height with clipped overflow: the box keeps its declared height
+            $fixed = $explicitContentH !== null && $this->hasDefiniteHeight($box, $display);
+            if ($fixed) {
+                // A definite height is the used height whatever the overflow: content that does not fit overflows
+                // the box (painted outside it, or clipped by overflow: hidden) and the following content starts
+                // after the declared height, as in browsers. min-height is already in $explicitContentH.
                 $finalContentH = $explicitContentH;
             }
             $box->height = $finalContentH + $box->getVerticalSpacing();
         }
         $this->applyMaxHeight($box, $containingWidth);
+        $box->fixedHeight = $fixed || $box->height < $contentHeight + $box->getVerticalSpacing() - 0.01; // max-height also caps it
 
         // Layout out-of-flow (position: absolute | fixed) children relative to this box
         $this->layoutPositionedChildren($box);
@@ -289,6 +293,23 @@ class LayoutEngine
             $box->children = $children;
         }
         return $h;
+    }
+
+    /**
+     * Whether the box's `height` is definite: a length, or a percentage of a definite containing-block height (not
+     * auto / *-content). Tables only treat their height as a minimum (CSS 2.1 17.5.3), as do flex / grid items and
+     * table cells sized by their parent layout.
+     */
+    private function hasDefiniteHeight(LayoutBox $box, string $display): bool
+    {
+        if ($box->forcedBorderBoxHeight !== null || $display === 'table' || $display === 'inline-table') {
+            return false;
+        }
+        $hCss = strtolower(trim($box->style->get('height', 'auto')));
+        if ($hCss === '' || $hCss === 'auto' || str_contains($hCss, 'content') || str_contains($hCss, 'stretch') || str_contains($hCss, 'fill')) {
+            return false;
+        }
+        return !str_contains($hCss, '%') || BoxSizing::percentBase($this, $box) !== null;
     }
 
     private function applyMaxHeight(LayoutBox $box, float $containingWidth): void
@@ -1384,6 +1405,18 @@ class LayoutEngine
             $ls = $this->resolveLength($box->style->get('letter-spacing', '0'), 0.0, $box->fontSizePt);
 
             $maxW = $this->fontManager->measureText($text, $ff, $fw, $fs, $box->fontSizePt, $ls);
+            if (str_contains($text, ' ')) {
+                // Lines are laid out word by word with separate spaces (no kerning across a space): measure the
+                // max-content the same way, or a box sized to it wraps its last word (Inter kerns e.g. ". 0")
+                $pieces = explode(' ', (string) preg_replace('/[ \t\n\r\f]+/', ' ', $text));
+                $sum = (count($pieces) - 1) * $this->fontManager->measureText(' ', $ff, $fw, $fs, $box->fontSizePt, $ls);
+                foreach ($pieces as $piece) {
+                    if ($piece !== '') {
+                        $sum += $this->fontManager->measureText($piece, $ff, $fw, $fs, $box->fontSizePt, $ls);
+                    }
+                }
+                $maxW = max($maxW, $sum);
+            }
             $words = preg_split('/[ \t\n\r\f]+|(?<=[\p{L}\p{N}][\-\/])(?=[\p{L}\p{N}])/u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: [$text];
             $noWrap = in_array(strtolower($box->style->get('white-space', 'normal')), ['nowrap', 'pre'], true);
             if ($noWrap) {

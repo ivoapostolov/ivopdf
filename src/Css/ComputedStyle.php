@@ -472,6 +472,7 @@ class ComputedStyle
                 $this->set('display', 'table');
                 $this->set('border-collapse', 'separate');
                 $this->set('border-spacing', '1.5pt');
+                $this->set('box-sizing', 'border-box'); // Chromium / WebKit UA style: `width` is the table's border box
                 break;
             case 'thead':
                 $this->set('display', 'table-header-group');
@@ -1285,8 +1286,8 @@ class ComputedStyle
 
         foreach ($tokens as $tok) {
             $tl = strtolower($tok);
-            if (in_array($tl, ['none', 'solid', 'dashed', 'dotted', 'double', 'groove', 'ridge', 'inset', 'outset'], true)) {
-                $style = $tl;
+            if (in_array($tl, ['none', 'hidden', 'solid', 'dashed', 'dotted', 'double', 'groove', 'ridge', 'inset', 'outset'], true)) {
+                $style = $tl; // `hidden` (collapsed table borders: it suppresses every border of the edge) is a style, not a colour
             } elseif (preg_match('/^([+]?\.?\d|thin$|medium$|thick$|calc\()/i', $tl)) {
                 $width = $tok;
             } else {

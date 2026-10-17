@@ -597,12 +597,133 @@ class PdfRenderer
             return false;
         }
         $run = $line->runs[$runIdx];
+        if ($this->bidiSpaceOwner($line, $runIdx + 1) !== null) {
+            return false; // a space next to right-to-left text is drawn on its own (see bidiSpaceOwner())
+        }
         if (preg_match('/\p{S}$/u', $run->text) === 1 || preg_match('/^\p{S}/u', $next->text) === 1 || $next->actualText !== null
             || ($next->glyphs !== null && in_array(0, array_column($next->glyphs, 0), true)) || $this->fontManager->hasMissingGlyphs($ttf, $run->text)) {
             return true;
         }
         $nextTtf = $this->fontManager->resolveFont($next->style->get('font-family', 'DejaVu Sans'), $next->style->get('font-weight', 'normal'), $next->style->get('font-style', 'normal'));
         return $nextTtf !== $ttf || $this->fontManager->hasMissingGlyphs($nextTtf, $next->text);
+    }
+
+    /**
+     * TJ operation drawing the whitespace run $space as one space glyph of $ttf (a space has no ink) whose advance is
+     * exactly the run's width, so the next glyph follows without a gap or an overlap.
+     */
+    private function spaceTj(\IvoPdf\Font\TtfParser $ttf, \IvoPdf\Layout\TextRun $space, float $fontSizePt, float $letterSpacingPt): string
+    {
+        $hex = $ttf->getGlyphId(0x20) !== 0 ? $this->fontManager->encodeTextToHexGids($ttf, ' ') : '';
+        if ($hex === '') {
+            return '';
+        }
+        $adjust = $ttf->getCharWidth(0x20) - ($space->width - $letterSpacingPt) * 1000.0 / max(0.01, $fontSizePt);
+        return sprintf('[<%s> %.1F] TJ', $hex, $adjust);
+    }
+
+    /**
+     * Inter-word space next to right-to-left text: the neighbouring run that draws it as a space glyph, or null when
+     * the space stays undrawn (extractors infer it from the gap). Bidi-aware extractors (MuPDF, PDFium, Acrobat) give a
+     * glyph the direction of the text it is shown with and reverse the right-to-left stretches of a line; a gap between
+     * runs of different directions is not seen as a space there, and a space shown with the wrong side moves to the
+     * other end of the right-to-left stretch. So, as Chrome / Edge do, every space beside right-to-left text is a glyph
+     * shown with the neighbour that has its resolved direction (bidi level parity): the LTR side in an LTR paragraph
+     * ("contains |שלום| in"), the RTL side between right-to-left words. Nothing moves on the page.
+     */
+    private function bidiSpaceOwner(LineBox $line, int $spaceIdx): ?\IvoPdf\Layout\TextRun
+    {
+        $space = $line->runs[$spaceIdx] ?? null;
+        $prev = $line->runs[$spaceIdx - 1] ?? null;
+        $next = $line->runs[$spaceIdx + 1] ?? null;
+        if ($space === null || $prev === null || $next === null || !$space->isWhitespace || $space->inlineBox !== null
+            || $prev->isWhitespace || $prev->inlineBox !== null || $next->isWhitespace || $next->inlineBox !== null
+            || $prev->text === '' || $next->text === '') {
+            return null;
+        }
+        $level = $space->bidiLevel & 1;
+        if ((($space->bidiLevel | $prev->bidiLevel | $next->bidiLevel) & 1) === 0) {
+            return null;
+        }
+        if (strtolower($space->style->get('text-decoration', 'none')) !== 'none') {
+            return null; // drawn with its decoration already
+        }
+        $prevSide = ($prev->bidiLevel & 1) === $level;
+        $nextSide = ($next->bidiLevel & 1) === $level;
+        if ($prevSide && $nextSide) {
+            // both have its direction: the one it shares its font and colour with (a space after a link goes with the
+            // plain text that follows, as in Chrome)
+            $same = static fn(\IvoPdf\Layout\TextRun $r): bool => $r->style->get('color', '') === $space->style->get('color', '')
+                && $r->style->get('font-family', '') === $space->style->get('font-family', '');
+            return $same($prev) || !$same($next) ? $prev : $next;
+        }
+        return $prevSide || !$nextSide ? $prev : $next;
+    }
+
+    /**
+     * Text-showing operators of the glyphs of a right-to-left run (visual order). A mirrored glyph (the "[" drawn for a
+     * logical "]") is shown on its own with its logical character as /ActualText: bidi-aware extractors reverse the run
+     * but do not mirror its brackets back. The pieces are joined with relative Td moves at the glyphs' positions.
+     *
+     * @param list<array{0: int, 1: float, 2: float, 3: float, 4: string}> $glyphs
+     * @return array{0: string, 1: float} operators, and how far the last Td moved the start of the text line (pt)
+     */
+    private function rtlShowOps(\IvoPdf\Font\TtfParser $ttf, array $glyphs, float $fontSizePt, float $letterSpacingPt): array
+    {
+        $pieces = [];
+        $piece = [];
+        $at = 0.0;
+        $start = 0.0;
+        foreach ($glyphs as $g) {
+            $cp = mb_strlen($g[4], 'UTF-8') === 1 ? mb_ord($g[4], 'UTF-8') : 0;
+            $mirrored = $cp > 0 && \IvoPdf\Text\Bidi::mirror($cp) !== $cp ? mb_chr(\IvoPdf\Text\Bidi::mirror($cp), 'UTF-8') : null;
+            if ($mirrored !== null) {
+                if ($piece !== []) {
+                    $pieces[] = [$start, $piece, null];
+                }
+                $pieces[] = [$at, [$g], $mirrored];
+                $piece = [];
+                $start = $at + $g[1] * $fontSizePt / 1000.0 + $letterSpacingPt;
+            } else {
+                $piece[] = $g;
+            }
+            $at += $g[1] * $fontSizePt / 1000.0 + $letterSpacingPt;
+        }
+        if ($piece !== []) {
+            $pieces[] = [$start, $piece, null];
+        }
+        if (count($pieces) === 1 && $pieces[0][2] === null) {
+            return [$this->fontManager->encodeShapedGlyphs($ttf, $glyphs, $fontSizePt), 0.0];
+        }
+        $ops = '';
+        $moved = 0.0;
+        foreach ($pieces as [$x, $gs, $actual]) {
+            $x = round($x, 2);
+            if ($x !== $moved) {
+                $ops .= sprintf('%.2F 0 Td ', $x - $moved);
+                $moved = $x;
+            }
+            $show = $this->fontManager->encodeShapedGlyphs($ttf, $gs, $fontSizePt);
+            $ops .= ($actual !== null ? '/Span << /ActualText <' . strtoupper(bin2hex("\xFE\xFF" . (string) mb_convert_encoding($actual, 'UTF-16BE', 'UTF-8'))) . '> >> BDC ' . $show . ' EMC' : $show) . ' ';
+        }
+        return [rtrim($ops), $moved];
+    }
+
+    /**
+     * Glyphs of a right-to-left run with every multi-character cluster's text reversed (lam-alef "لا" -> "ال"): the
+     * glyphs are in visual order and bidi-aware extractors reverse the characters again, as for Chrome / Edge PDFs.
+     *
+     * @param list<array{0: int, 1: float, 2: float, 3: float, 4: string}> $glyphs
+     * @return list<array{0: int, 1: float, 2: float, 3: float, 4: string}>
+     */
+    private static function rtlClusterText(array $glyphs): array
+    {
+        foreach ($glyphs as $k => $g) {
+            if (isset($g[4][2]) && mb_strlen($g[4], 'UTF-8') > 1 && preg_match('/^\p{Mn}+$/u', $g[4]) !== 1) {
+                $glyphs[$k][4] = implode('', array_reverse(mb_str_split($g[4], 1, 'UTF-8')));
+            }
+        }
+        return $glyphs;
     }
 
     /**
@@ -620,8 +741,34 @@ class PdfRenderer
             $this->registerInlineAnchors($line, $yShift);
         }
 
-        foreach ($line->runs as $runIdx => $run) {
+        // A line holding right-to-left text: neighbouring runs in the same font, size and colour share one text object
+        // (see flushTextGroup())
+        $bidiLine = false;
+        foreach ($line->runs as $r) {
+            if (($r->bidiLevel & 1) === 1 && !$r->isWhitespace && $r->inlineBox === null) {
+                $bidiLine = true;
+                break;
+            }
+        }
+        $group = null;
+
+        // Runs of `position: relative` inline elements are positioned content: painted after the line's other runs
+        // (CSS painting order), so they overlap them like in browsers and extract as separate words
+        $ordered = $line->runs;
+        $shifted = [];
+        foreach ($line->runs as $k => $r) {
+            if ($r->relDx !== 0.0 || $r->relDy !== 0.0) {
+                $shifted[$k] = $r;
+                unset($ordered[$k]);
+            }
+        }
+        if ($shifted !== []) {
+            $ordered += $shifted;
+        }
+
+        foreach ($ordered as $runIdx => $run) {
             if ($run->inlineBox !== null) {
+                $out .= $this->flushTextGroup($group);
                 $linked =$run->href !== null && $run->href !== '' && $this->annotOwned
                     && $run->inlineBox->tagName !== 'a' && $run->inlineBox->isInlineLevel();
                 if ($linked) {
@@ -633,11 +780,13 @@ class PdfRenderer
                 if ($ownedOuter !== null && !$replacePageTokens) {
                     $this->annotOwned = $ownedOuter;
                 }
+                // The slice is the inline box's painted extent: content overflowing a definite height stays visible
+                [$ibTop, $ibBottom] = ($this->cull ??= new RenderCull())->extent($run->inlineBox);
                 $out .= $this->renderBoxTree(
                     $run->inlineBox,
                     $yShift,
-                    max($run->inlineBox->y - 1.0, $sliceTop),
-                    min($run->inlineBox->y + $run->inlineBox->height + 1.0, $sliceBottom),
+                    max(min($ibTop, $run->inlineBox->y) - 1.0, $sliceTop),
+                    min(max($ibBottom, $run->inlineBox->y + $run->inlineBox->height) + 1.0, $sliceBottom),
                     $replacePageTokens
                 );
                 $this->annotOwned = $ownedHere;
@@ -692,6 +841,7 @@ class PdfRenderer
             }
 
             $textStartLen = strlen($out);
+            $lineStartShift = 0.0; // relative Td moves inside $showOps (see rtlShowOps())
             $spaceAfter = $text === $run->text && $this->needsExtractableSpace($line, $runIdx, $ttf);
             if ($run->glyphs !== null && $text === $run->text) {
                 // Shaped run (ligatures, kerning, Arabic forms, RTL): positioned glyph ids in visual order
@@ -702,7 +852,11 @@ class PdfRenderer
                     $logical .= ' ';
                     $spaceAfter = false;
                 }
-                $showOps = $this->fontManager->encodeShapedGlyphs($ttf, $run->glyphs, $run->fontSizePt, $logical);
+                if ($logical === null && ($run->bidiLevel & 1) === 1) {
+                    [$showOps, $lineStartShift] = $this->rtlShowOps($ttf, self::rtlClusterText($run->glyphs), $run->fontSizePt, $run->letterSpacingPt);
+                } else {
+                    $showOps = $this->fontManager->encodeShapedGlyphs($ttf, $run->glyphs, $run->fontSizePt, $logical);
+                }
                 if ($notdef && $showOps !== '') {
                     // .notdef glyphs (no font has them): one /ActualText span over the run keeps the code points
                     $actual = $text . ($spaceAfter ? ' ' : '');
@@ -727,6 +881,26 @@ class PdfRenderer
             if ($showOps !== '' && $spaceAfter && $ttf->getGlyphId(0x20) !== 0) {
                 $showOps .= ' <' . $this->fontManager->encodeTextToHexGids($ttf, ' ') . '> Tj';
             }
+            if ($showOps !== '' && $text === $run->text) {
+                // spaces beside right-to-left text are shown with the run that has their direction (bidiSpaceOwner())
+                $before = $line->runs[$runIdx - 1] ?? null;
+                if ($before !== null && $before->isWhitespace && $this->bidiSpaceOwner($line, $runIdx - 1) === $run
+                    && ($tj = $this->spaceTj($ttf, $before, $run->fontSizePt, $run->letterSpacingPt)) !== '') {
+                    if ($lineStartShift !== 0.0) {
+                        // the run moves the text line start itself (rtlShowOps()): start it again at the run
+                        $move = round($runX, 2) - round($before->x, 2);
+                        $showOps = sprintf('%s %.2F 0 Td %s', $tj, $move, $showOps);
+                        $lineStartShift += $move;
+                    } else {
+                        $showOps = $tj . ' ' . $showOps;
+                    }
+                    $runX = $before->x;
+                }
+                $after = $line->runs[$runIdx + 1] ?? null;
+                if ($after !== null && $after->isWhitespace && $this->bidiSpaceOwner($line, $runIdx + 1) === $run) {
+                    $showOps .= ' ' . $this->spaceTj($ttf, $after, $run->fontSizePt, $run->letterSpacingPt);
+                }
+            }
             if ($showOps !== '') {
                 $tcCmd = abs($run->letterSpacingPt) > 0.001 ? sprintf('%.3F Tc ', $run->letterSpacingPt) : '';
                 $tcReset = abs($run->letterSpacingPt) > 0.001 ? ' 0 Tc' : '';
@@ -743,6 +917,28 @@ class PdfRenderer
                     $boldOff = ' 0 Tr';
                 }
 
+                $plain = $bidiLine && $alphaGuard === '' && $tcCmd === '' && $boldOn === '' && !$synth['oblique']
+                    && strtolower(trim($run->style->get('text-shadow', 'none'))) === 'none'
+                    && strtolower(trim($run->style->get('text-decoration', 'none'))) === 'none';
+                if ($plain) {
+                    $x = round($runX, 2);
+                    $key = $fontId . '|' . sprintf('%.2F|%.2F|%d|', $run->fontSizePt, $baselinePdfY, $run->bidiLevel & 1) . ColorOps::fillOp($color);
+                    if ($group !== null && $group['key'] !== $key) {
+                        $out .= $this->flushTextGroup($group);
+                    }
+                    if ($group === null) {
+                        $group = ['key' => $key, 'x' => $x, 'ops' => sprintf('BT /%s %.2F Tf %s %.2F %.2F Td %s', $fontId, $run->fontSizePt, ColorOps::fillOp($color), $x, $baselinePdfY, $showOps)];
+                    } else {
+                        $group['ops'] .= sprintf(' %.2F 0 Td %s', $x - $group['x'], $showOps);
+                    }
+                    $group['x'] = $x + $lineStartShift;
+                    $showOps = '';
+                } else {
+                    $out .= $this->flushTextGroup($group);
+                    $textStartLen = strlen($out);
+                }
+            }
+            if ($showOps !== '') {
                 $out .= sprintf(
                     "%s%sBT /%s %.2F Tf %s%s %s%s %s%s%s ET%s%s\n",
                     $alphaGuard,
@@ -815,8 +1011,27 @@ class PdfRenderer
                 $this->pdf->addLinkAnnotation($this->currentPageIndex, $run->x, $pdfRunBottom, $run->width, $run->height, $run->href);
             }
         }
+        $out .= $this->flushTextGroup($group);
 
         return $out;
+    }
+
+    /**
+     * Ends a text object shared by neighbouring runs of a line with right-to-left text. Chrome / Edge show such a line
+     * with one text operation; bidi-aware extractors (MuPDF) reorder the right-to-left stretches within a text object,
+     * so separate text objects per word give the words, numbers and punctuation of the line in a wrong order. The runs
+     * keep their positions (relative Td moves); the page looks the same.
+     *
+     * @param array{key: string, x: float, ops: string}|null $group
+     */
+    private function flushTextGroup(?array &$group): string
+    {
+        if ($group === null) {
+            return '';
+        }
+        $ops = $group['ops'] . " ET\n";
+        $group = null;
+        return $ops;
     }
 
     /**
@@ -1180,6 +1395,8 @@ class PdfRenderer
             // symbol, (ascent * 2/3 + 1) / 2 px wide, is drawn 1 px into it; the glyph is centred on that symbol
             $offsetPx = intdiv((int) round($ttf->ascent / 1000.0 * $fs / 0.75) * 2, 3);
             $markerX = $localX - ($offsetPx + 8) * 0.75 + (1 + intdiv($offsetPx + 1, 2) / 2.0) * 0.75 - $markerW / 2.0;
+        } elseif (in_array(substr(ltrim($liBox->style->get('list-style-type', 'disc')), 0, 1), ['"', "'"], true)) {
+            $markerX = $localX - $markerW; // list-style-type: '-> ': the string ends at the content edge
         } else {
             // "1. ": the marker text and a space end at the content edge
             $markerX = $localX - $markerW - $this->fontManager->measureText(' ', $fontFamily, $fontWeight, 'normal', $fs);

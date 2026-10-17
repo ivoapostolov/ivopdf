@@ -264,7 +264,10 @@ check('visibility: hidden parent paints no background', !str_contains($b, '1.000
 check('visibility: visible child of a hidden parent is painted', str_contains($b, '0.000 0.000 1.000 rg') && count(lineTexts(byId($pdf, 'v'))) === 1);
 [$pdf] = renderPdf('<style>li::marker{color:#c00;font-size:20pt}</style><ul><li id="m">x</li></ul><ul style="list-style-position:inside"><li id="in">inside item</li></ul>');
 check('::marker style is captured', byId($pdf, 'm')->markerStyle?->get('color') === '#c00');
-check('list-style-position: inside moves the marker into the text', byId($pdf, 'in')->listMarker === null && str_starts_with(lineTexts(byId($pdf, 'in'))[0], '• '), lineTexts(byId($pdf, 'in'))[0] ?? '');
+// the inside bullet is an inline box of the browsers' width at the start of the first line, the text follows it
+$inFirst = byId($pdf, 'in')->lines[0]->runs[0] ?? null;
+check('list-style-position: inside moves the marker into the text', byId($pdf, 'in')->listMarker === null && $inFirst?->inlineBox !== null
+    && str_starts_with(implode('', lineTexts($inFirst->inlineBox)), '•') && str_contains(implode('', lineTexts(byId($pdf, 'in'))), 'inside item'), implode('|', lineTexts(byId($pdf, 'in'))));
 [$pdf] = renderPdf('<ul style="list-style-image:url(' . $red . ')"><li id="li">img</li></ul>');
 check('list-style-image is recorded for the item', byId($pdf, 'li')->listMarkerImage === $red);
 

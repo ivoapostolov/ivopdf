@@ -16,14 +16,11 @@ class TextRun
     public float $x = 0.0;
     public float $y = 0.0;
     public float $width = 0.0;
-    public float $height = 0.0;
     public float $ascent = 0.0;
     public float $descent = 0.0;
     public float $fontSizePt = 12.0;
-    public float $letterSpacingPt = 0.0;
     public bool $isWhitespace = false;
     public bool $isLineBreak = false;
-    public ?string $href = null;
 
     /**
      * Shaped glyphs in visual (left-to-right) order, or null when plain codepoint->glyph encoding applies.
@@ -39,9 +36,6 @@ class TextRun
     // Optional inline-block child box (e.g. inline <img>, <svg>, or inline-block badge)
     public ?LayoutBox $inlineBox = null;
 
-    /** Whether a line break is allowed immediately before this run (false = glued to the previous run) */
-    public bool $breakBefore = true;
-
     /** @var list<LayoutBox> Decorated inline ancestors (background/border), outermost first */
     public array $decorations = [];
 
@@ -53,12 +47,20 @@ class TextRun
 
     /**
      * Rarely used properties live in a RunExtra that exists only while one of them holds a non-default value:
-     * isWbr, lineStart, bidiLevel, bidiPre, bidiPost, wide, afterHyphen, softBreak, softBreakWidth and the inline box
-     * paddings (paddingTop / Right / Bottom / Left). They read and
-     * write like ordinary properties (through __get / __set), but an array one is replaced as a whole.
+     * href (link target), breakBefore (false = glued to the previous run), letterSpacingPt, isWbr, lineStart, bidiLevel, bidiPre, bidiPost,
+     * wide, afterHyphen, softBreak, softBreakWidth and the inline box paddings (paddingTop / Right / Bottom / Left).
+     * They read and write like ordinary properties (through __get / __set), but an array one is replaced as a whole.
+     * `height` reads as ascent + descent (it is always that sum; assigning it has no effect). Four fewer declared
+     * properties make a run 64 bytes smaller (a long document has hundreds of thousands of runs).
      */
     private ?RunExtra $extra = null;
     private static ?RunExtra $defaults = null;
+
+    /** Whether one of the rarely used properties (bidi, hyphenation, inline paddings...) holds a non-default value. */
+    public function hasExtra(): bool
+    {
+        return $this->extra !== null;
+    }
 
     public function __clone()
     {
@@ -69,11 +71,17 @@ class TextRun
 
     public function __get(string $name): mixed
     {
+        if ($name === 'height') {
+            return $this->ascent + $this->descent;
+        }
         return ($this->extra ?? self::$defaults ??= new RunExtra())->$name;
     }
 
     public function __set(string $name, mixed $value): void
     {
+        if ($name === 'height') {
+            return; // derived from ascent and descent
+        }
         if ($this->extra === null) {
             $default = (self::$defaults ??= new RunExtra())->$name;
             if ($value === $default || (is_int($value) && is_float($default) && (float) $value === $default)) {
@@ -86,6 +94,9 @@ class TextRun
 
     public function __isset(string $name): bool
     {
+        if ($name === 'height') {
+            return true;
+        }
         return property_exists(RunExtra::class, $name) && ($this->extra ?? self::$defaults ??= new RunExtra())->$name !== null;
     }
 
@@ -110,8 +121,9 @@ class TextRun
         $this->fontSizePt = $fontSizePt;
         $this->ascent = $ascent;
         $this->descent = $descent;
-        $this->height = $ascent + $descent;
         $this->isWhitespace = $isWhitespace;
-        $this->href = $href;
+        if ($href !== null) {
+            $this->href = $href;
+        }
     }
 }

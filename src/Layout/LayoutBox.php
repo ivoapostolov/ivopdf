@@ -29,7 +29,7 @@ class LayoutBox
     /**
      * Rarely used properties live in a BoxExtra that exists only while one of them holds a non-default value:
      * href, imageSrc, listMarker, listMarkerImage, markerStyle, firstLineStyle, firstLineProps, formControl, formBaseline,
-     * collapsedMarginTop, collapsedMarginBottom, colspan, rowspan, columnFlow and columnRects. They read and write like
+     * collapsedMarginTop, collapsedMarginBottom, colspan, rowspan, fixedHeight, columnFlow and columnRects. They read and write like
      * ordinary properties (through __get / __set), but an array one is replaced as a whole: no `$box->columnRects[] = x`.
      */
     private ?BoxExtra $extra = null;

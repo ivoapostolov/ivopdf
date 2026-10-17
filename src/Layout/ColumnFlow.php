@@ -229,6 +229,9 @@ final class ColumnFlow
                     $line->translate(0.0, $delta);
                 }
             }
+            if ($parent->fixedHeight) {
+                break; // a definite height is kept: the content overflows it
+            }
             $parent->height += $delta;
             $curr = $parent;
         }

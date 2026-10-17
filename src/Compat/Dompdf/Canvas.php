@@ -9,12 +9,19 @@ namespace IvoPdf\Compat\Dompdf;
  * drawn here becomes an overlay layer of the page (absolutely positioned HTML / inline SVG laid out by the IvoPDF
  * engine), coordinates are dompdf's: points from the top-left corner of the page.
  *
- *  - page_text() / page_line(): drawn on every page, `{PAGE_NUM}` / `{PAGE_COUNT}` substituted
+ *  - page_text() / page_line(): drawn on every page, `{PAGE_NUM}` / `{PAGE_COUNT}` substituted (only there: text()
+ *    prints them literally, as in dompdf)
  *  - page_script(callable): called once per page with ($pageNumber, $pageCount, $canvas, $fontMetrics); the drawing
  *    calls it makes (text(), line(), rectangle(), image() ...) land on that page. Strings of PHP code are NOT executed.
- *  - text() / line() / rectangle() / image() ... outside page_script draw on the current page. "Current" is the page
- *    number returned by get_page_number(): 1 before render(), the last page after render() (as in dompdf, whose canvas
- *    stays on the last page), the page added by new_page(), or whatever set_page_number() chose.
+ *    After render() page_text() / page_line() / page_script() work like dompdf's: they are applied at once to the pages
+ *    that exist, with the page count get_page_count() reports (set_page_count() changes it), and get_page_number()
+ *    inside the callback is the canvas' page number. Called before render() they are kept and applied to every page
+ *    of the finished document (dompdf would only reach its first page).
+ *  - text() / line() / rectangle() / image() ... outside page_script draw on the page the canvas is on: the first page
+ *    before render(), the last page after render() (dompdf's canvas stays on its last page), the page added by
+ *    new_page(), or a page reopened with reopen_object(<new_page() handle>) until close_object().
+ *  - get_page_number() / get_page_count() are counters, as in dompdf: render() sets both to the number of pages,
+ *    new_page() increments both, set_page_number() / set_page_count() only change the numbers (no drawing moves).
  *  - set_opacity($alpha, $mode) / save() / restore(): the opacity (and blend mode, for text and images) applies to the
  *    drawing calls that follow, until restore() returns to the saved state. The state starts fresh (opaque) for every
  *    page_script() call. Colors with an 'alpha' entry are multiplied with it.
@@ -27,7 +34,8 @@ namespace IvoPdf\Compat\Dompdf;
  *    stop_object() ends the repetition after the current page, reopen_object() records more calls into an object.
  *    page_text() is not recorded into objects (it already repeats on every page).
  *  - add_link() / add_named_dest(): clickable areas (URL or '#name') and named destinations on the current page;
- *    add_info(): document metadata; javascript(): document-level JavaScript; new_page(): appends an empty page.
+ *    add_info(): document metadata; javascript(): document-level JavaScript; new_page(): appends an empty page and
+ *    returns a handle for it (like dompdf's page content object id: an int to pass to reopen_object()).
  *  - Methods of the CPDF adapter that have no equivalent here (serialize_object(), form fields select() / input() ...)
  *    are accepted, do nothing and add one warning per method to Dompdf::getWarnings().
  *
@@ -40,10 +48,24 @@ final class Canvas
 
     private float $width;
     private float $height;
+    /** dompdf's page counters (get_page_number() / get_page_count()) */
     private int $pageCount = 0;
     private int $current = 1;
+    /**
+     * The page drawing calls land on: 'p<n>' = page n of the document, 'x<k>' = the k-th page added by new_page()
+     * (laid out after the document, whatever its length turns out to be).
+     */
+    private string $target = 'p1';
+    /** Pages of the document itself in the last rendering (without the new_page() pages); 0 before render(). */
+    private int $docPages = 0;
+    /** @var array<int, string> new_page() handle => page key */
+    private array $pageHandles = [];
+    /** @var list<array{0: ?int, 1: string}> open_object() / reopen_object() nesting: [object, page] to return to */
+    private array $targetStack = [];
     private int $version = 0;
     private bool $rendering = false;
+    /** Page being built while $rendering */
+    private int $renderingPage = 1;
     private ?Dompdf $dompdf = null;
 
     /** @var list<array<string, mixed>> operations repeated on every page */
@@ -160,10 +182,36 @@ final class Canvas
         $this->height = $h;
     }
 
-    public function setPageCount(int $count): void
+    /**
+     * @internal The document has $count pages (the new_page() pages included). $reset (render() called by the
+     * application, or the first rendering): like dompdf's renderer, both page counters become $count and drawing moves
+     * to the last page. A re-rendering done by output() keeps the counters and the drawing page as they are.
+     */
+    public function setPageCount(int $count, bool $reset = true): void
     {
-        $this->pageCount = $count;
-        $this->current = max(1, $count);
+        $this->docPages = max(1, $count - $this->extraPages);
+        if ($reset) {
+            $this->pageCount = $count;
+            $this->current = max(1, $count);
+            $this->target = $this->extraPages > 0 ? 'x' . $this->extraPages : 'p' . $this->docPages;
+            $this->targetStack = [];
+            $this->objectTarget = null;
+        }
+    }
+
+    /**
+     * @internal Runs $fn with get_page_number() reporting $number (dompdf end_document callbacks run after rendering,
+     * when its counter is on the last page).
+     */
+    public function withPageNumber(int $number, callable $fn): mixed
+    {
+        $saved = $this->current;
+        $this->current = $number;
+        try {
+            return $fn();
+        } finally {
+            $this->current = $saved;
+        }
     }
 
     public function get_dompdf(): ?Dompdf
@@ -191,9 +239,10 @@ final class Canvas
         return $this->pageCount;
     }
 
+    /** dompdf: renumbers only; drawing stays on the page the canvas is on. */
     public function set_page_number($num): void
     {
-        $this->current = max(1, (int) $num);
+        $this->current = (int) $num;
     }
 
     public function set_page_count($count): void
@@ -231,16 +280,20 @@ final class Canvas
     }
 
     /**
-     * dompdf CPDF::new_page(): appends an empty page after the document and makes it the current page (the drawing
-     * calls that follow land on it). Returns its page number.
+     * dompdf CPDF::new_page(): appends an empty page after the document, draws on it from now on and increments the
+     * page number and page count. Returns a handle of the page (dompdf returns the id of the page's content object): an
+     * int that reopen_object() accepts to draw on that page again, not a page number.
      */
     public function new_page(): int
     {
         $this->version++;
         $this->extraPages++;
-        $this->pageCount = max($this->pageCount, $this->current) + 1;
-        $this->current = $this->pageCount;
-        return $this->current;
+        $this->pageCount++;
+        $this->current++;
+        $this->target = 'x' . $this->extraPages;
+        $handle = $this->nextObject++;
+        $this->pageHandles[$handle] = $this->target;
+        return $handle;
     }
 
     /** dompdf CPDF::set_default_view(): initial view ('Fit', 'FitH', 'FitV', 'FitB', 'FitBH', 'XYZ' with [left, top, zoom]). */
@@ -261,13 +314,30 @@ final class Canvas
     public function page_text($x, $y, $text, $font, $size, $color = [0, 0, 0], $word_space = 0.0, $char_space = 0.0, $angle = 0.0): void
     {
         $this->version++;
-        $this->everyPage[] = $this->textOp($x, $y, (string) $text, $font, $size, $color, $word_space, $char_space, $angle);
+        $op = $this->textOp($x, $y, (string) $text, $font, $size, $color, $word_space, $char_space, $angle);
+        if ($this->docPages === 0) {
+            $this->everyPage[] = $op + ['pageText' => true];
+            return;
+        }
+        // after render(), as dompdf: written on the pages that exist now, numbered 1..n of get_page_count()
+        $pages = $this->docPages + $this->extraPages;
+        for ($n = 1; $n <= $pages; $n++) {
+            $this->perPage[$this->keyOf($n, $this->docPages)][] = ['text' => strtr($op['text'], ['{PAGE_NUM}' => (string) $n, '{PAGE_COUNT}' => (string) $this->pageCount])] + $op;
+        }
     }
 
     public function page_line($x1, $y1, $x2, $y2, $color = [0, 0, 0], $width = 1.0, $style = []): void
     {
         $this->version++;
-        $this->everyPage[] = ['op' => 'line', 'x1' => (float) $x1, 'y1' => (float) $y1, 'x2' => (float) $x2, 'y2' => (float) $y2, 'color' => $color, 'w' => (float) $width, 'dash' => (array) $style, 'cap' => 'butt'];
+        $op = ['op' => 'line', 'x1' => (float) $x1, 'y1' => (float) $y1, 'x2' => (float) $x2, 'y2' => (float) $y2, 'color' => $color, 'w' => (float) $width, 'dash' => (array) $style, 'cap' => 'butt'];
+        if ($this->docPages === 0) {
+            $this->everyPage[] = $op;
+            return;
+        }
+        $pages = $this->docPages + $this->extraPages;
+        for ($n = 1; $n <= $pages; $n++) {
+            $this->perPage[$this->keyOf($n, $this->docPages)][] = $op;
+        }
     }
 
     /** dompdf: `$code` is PHP source when isPhpEnabled; IvoPDF only accepts a callable (security). */
@@ -275,7 +345,25 @@ final class Canvas
     {
         $this->version++;
         if (is_callable($callback) && !(is_string($callback) && preg_match('~^[\w\\\\:]+$~', $callback) !== 1)) {
-            $this->scripts[] = $callback;
+            if ($this->docPages === 0) {
+                $this->scripts[] = $callback;
+                return;
+            }
+            // after render(), as dompdf: called at once for every page that exists, drawing on that page
+            $saved = [$this->target, $this->objectTarget, $this->targetStack, $this->gs, $this->gsStack];
+            $pages = $this->docPages + $this->extraPages;
+            try {
+                for ($n = 1; $n <= $pages; $n++) {
+                    $this->target = $this->keyOf($n, $this->docPages);
+                    $this->objectTarget = null;
+                    $this->targetStack = [];
+                    $this->gs = self::freshState();
+                    $this->gsStack = [];
+                    $callback($n, $this->pageCount, $this, $this->metrics);
+                }
+            } finally {
+                [$this->target, $this->objectTarget, $this->targetStack, $this->gs, $this->gsStack] = $saved;
+            }
             return;
         }
         $this->warnings[] = 'Canvas::page_script() received a string of PHP code; IvoPDF never executes PHP code from documents - pass a PHP callable (function ($pageNumber, $pageCount, $canvas, $fontMetrics) { ... }) or use page_text().';
@@ -506,22 +594,36 @@ final class Canvas
         if ($this->rendering) {
             $this->scriptObjects[] = $id;
         }
+        $this->targetStack[] = [$this->objectTarget, $this->target];
         $this->objectTarget = $id;
         return $id;
     }
 
-    /** Records the drawing calls that follow into an existing object again (until close_object()). */
+    /**
+     * Records the drawing calls that follow into an existing object again, or (with a handle returned by new_page())
+     * draws on that page again, until close_object().
+     */
     public function reopen_object($object): void
     {
         $id = (int) $object;
-        if (isset($this->objects[$id])) {
+        if (isset($this->pageHandles[$id])) {
+            $this->targetStack[] = [$this->objectTarget, $this->target];
+            $this->objectTarget = null;
+            $this->target = $this->pageHandles[$id];
+        } elseif (isset($this->objects[$id])) {
+            $this->targetStack[] = [$this->objectTarget, $this->target];
             $this->objectTarget = $id;
         }
     }
 
+    /** Ends open_object() / reopen_object(): drawing returns to where it went before. */
     public function close_object(): void
     {
-        $this->objectTarget = null;
+        if ($this->targetStack !== []) {
+            [$this->objectTarget, $this->target] = array_pop($this->targetStack);
+        } else {
+            $this->objectTarget = null;
+        }
         if (!$this->rendering) {
             $this->version++;
         }
@@ -538,16 +640,16 @@ final class Canvas
         if (!in_array($where, ['all', 'add', 'next', 'even', 'odd', 'nexteven', 'nextodd'], true)) {
             $where = 'add';
         }
-        $placement = ['id' => $id, 'where' => $where, 'page' => $this->current];
         if ($this->rendering) {
+            $placement = ['id' => $id, 'where' => $where, 'page' => $this->renderingPage];
             $this->scriptPlacements[] = $placement;
-            if (self::placed($placement, $this->current)) {
+            if (self::placed($placement, $this->renderingPage)) {
                 array_push($this->buffer, ...$this->objects[$id]);
             }
             return;
         }
         $this->version++;
-        $this->placements[] = $placement;
+        $this->placements[] = ['id' => $id, 'where' => $where, 'page' => $this->target];
     }
 
     /** Stops repeating an object (added with 'all', 'next', ...) on the pages after the current one. */
@@ -557,7 +659,7 @@ final class Canvas
         foreach (['placements', 'scriptPlacements'] as $list) {
             foreach ($this->{$list} as $k => $p) {
                 if ($p['id'] === $id && !isset($p['until'])) {
-                    $this->{$list}[$k]['until'] = $this->current;
+                    $this->{$list}[$k]['until'] = $this->rendering ? $this->renderingPage : $this->target;
                 }
             }
         }
@@ -585,13 +687,16 @@ final class Canvas
         }
     }
 
-    /** @param array{id: int, where: string, page: int, until?: int} $p */
-    private static function placed(array $p, int $page): bool
+    /**
+     * @param array{id: int, where: string, page: int|string, until?: int|string} $p pages as numbers or page keys
+     * @param int $docPages pages of the document being rendered (to place the new_page() pages)
+     */
+    private static function placed(array $p, int $page, int $docPages = 0): bool
     {
-        if (isset($p['until']) && $page > $p['until']) {
+        if (isset($p['until']) && $page > self::physical($p['until'], $docPages)) {
             return false;
         }
-        $from = $p['page'];
+        $from = self::physical($p['page'], $docPages);
         return match ($p['where']) {
             'add' => $page === $from,
             'all' => $page >= $from,
@@ -602,6 +707,21 @@ final class Canvas
             'nextodd' => $page > $from && $page % 2 === 1,
             default => false,
         };
+    }
+
+    /** Page key ('p<n>' / 'x<k>', see $target) of page $n of a document whose own pages are $docPages. */
+    private function keyOf(int $n, int $docPages): string
+    {
+        return $docPages > 0 && $n > $docPages ? 'x' . ($n - $docPages) : 'p' . $n;
+    }
+
+    /** Page number of a page key (or a page number) in a document whose own pages are $docPages. */
+    private static function physical(int|string $key, int $docPages): int
+    {
+        if (is_int($key)) {
+            return $key;
+        }
+        return $key[0] === 'x' ? $docPages + (int) substr($key, 1) : (int) substr($key, 1);
     }
 
     // ------------------------------------------------------------------
@@ -674,14 +794,18 @@ final class Canvas
     {
         $this->width = $w;
         $this->height = $h;
-        $this->pageCount = $pageCount;
-        $saved = [$this->current, $this->version, $this->gs, $this->gsStack, $this->objectTarget];
+        $docPages = max(1, $pageCount - $this->extraPages);
+        $saved = [$this->current, $this->pageCount, $this->version, $this->gs, $this->gsStack, $this->objectTarget, $this->targetStack];
+        // callbacks that run while the pages are built (page_script() before render(), setCallbacks()) see the page
         $this->current = $pageNumber;
+        $this->pageCount = $pageCount;
+        $this->renderingPage = $pageNumber;
         $this->rendering = true;
         $this->buffer = [];
         $this->gs = self::freshState();
         $this->gsStack = [];
         $this->objectTarget = null;
+        $this->targetStack = [];
         if (!$under && $pageNumber <= $this->lastRendered) {
             // a new overlay pass: forget the objects the callbacks created during the previous one
             foreach ($this->scriptObjects as $id) {
@@ -697,6 +821,7 @@ final class Canvas
                     $this->gsStack = [];
                     $cb($pageNumber, $pageCount, $this, $this->metrics);
                     $this->objectTarget = null;
+                    $this->targetStack = [];
                 }
             } else {
                 $this->lastRendered = $pageNumber;
@@ -704,7 +829,7 @@ final class Canvas
                     $this->buffer[] = $op;
                 }
                 foreach ($this->placements as $p) {
-                    if (self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
+                    if (self::placed($p, $pageNumber, $docPages) && isset($this->objects[$p['id']])) {
                         array_push($this->buffer, ...$this->objects[$p['id']]);
                     }
                 }
@@ -718,8 +843,9 @@ final class Canvas
                     $this->gsStack = [];
                     $cb($pageNumber, $pageCount, $this, $this->metrics);
                     $this->objectTarget = null;
+                    $this->targetStack = [];
                 }
-                foreach ($this->perPage[$pageNumber] ?? [] as $op) {
+                foreach ($this->perPage[$this->keyOf($pageNumber, $docPages)] ?? [] as $op) {
                     $this->buffer[] = $op;
                 }
             }
@@ -727,7 +853,7 @@ final class Canvas
         } finally {
             $this->rendering = false;
             $this->buffer = [];
-            [$this->current, $this->version, $this->gs, $this->gsStack, $this->objectTarget] = $saved; // drawing done by callbacks is not an application change
+            [$this->current, $this->pageCount, $this->version, $this->gs, $this->gsStack, $this->objectTarget, $this->targetStack] = $saved; // drawing done by callbacks is not an application change
         }
         if ($ops === []) {
             return '';
@@ -767,7 +893,7 @@ final class Canvas
             return;
         }
         $this->version++;
-        $this->perPage[$this->current][] = $op;
+        $this->perPage[$this->target][] = $op;
     }
 
     /** Saves the state and intersects the clip with a polygon given in the current (transformed) coordinates. */
@@ -945,7 +1071,8 @@ final class Canvas
     /** @param array<string, mixed> $op */
     private function textHtml(array $op, int $pageNumber, int $pageCount): string
     {
-        $text = strtr($op['text'], ['{PAGE_NUM}' => (string) $pageNumber, '{PAGE_COUNT}' => (string) $pageCount]);
+        // only page_text() substitutes the placeholders (dompdf's text() prints them as they are)
+        $text = !empty($op['pageText']) ? strtr($op['text'], ['{PAGE_NUM}' => (string) $pageNumber, '{PAGE_COUNT}' => (string) $pageCount]) : $op['text'];
         [$family, $weight, $style] = FontMetrics::parse($op['font']);
         [$rgb, $alpha] = self::color($op['color']);
         $alpha *= (float) ($op['opacity'] ?? 1.0);
@@ -976,7 +1103,12 @@ final class Canvas
             $css .= sprintf(';transform-origin:0 %.3Fpt;transform:rotate(%.3Fdeg)', $asc, -$op['angle']);
         }
         $css .= self::blend((string) ($op['mode'] ?? 'Normal'));
-        return '<div style="' . $css . '">' . htmlspecialchars($text, ENT_QUOTES, 'UTF-8') . '</div>';
+        $body = htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+        if (empty($op['pageText']) && str_contains($body, '{')) {
+            // the engine fills page-number placeholders in any text run: a brace in a run of its own stays literal
+            $body = str_replace('{', '<span>{</span>', $body);
+        }
+        return '<div style="' . $css . '">' . $body . '</div>';
     }
 
     /** CSS for a PDF blend mode name ("Multiply" -> mix-blend-mode), empty for Normal / unknown. */

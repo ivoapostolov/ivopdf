@@ -75,9 +75,10 @@ function byId(IvoPdf $pdf, string $id): ?LayoutBox
 function visualWords(LayoutBox $box, int $line = 0): array
 {
     $words = [];
+    // Neighbouring plain runs of a line are joined into one ("Hello " + "world"): split them into words again
     foreach ($box->lines[$line]->runs ?? [] as $run) {
-        if (!$run->isWhitespace && $run->text !== '') {
-            $words[] = $run->text;
+        foreach (preg_split('/\s+/u', $run->text, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
+            $words[] = $word;
         }
     }
     return $words;

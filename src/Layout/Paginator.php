@@ -40,7 +40,11 @@ class Paginator
     public function paginate(LayoutBox $root): int
     {
         $this->root = $root;
+        $this->shifts = [];
+        $this->dirty = [];
+        $this->childIndex = [];
         $this->processBox($root);
+        $this->settleRemaining();
         $this->flushAll($root);
 
         $maxBottom = $this->findMaxBottom($root);
@@ -197,7 +201,7 @@ class Paginator
             [$pageTop, $pageBottom] = $this->getPageBounds($curPage);
             // A box that merely carries its top margin below the page top is already at the start of the page,
             // and so is one that a page-name change (mPDF <pagebreak orientation>) has just moved to a new page
-            if ($this->brokenForPageName !== $box && $box->y - $this->leadingSpace($box) > $pageTop + 1.0) {
+            if ($this->brokenForPageName !== $box && ($box->y - $this->leadingSpace($box) > $pageTop + 1.0 || $this->precededOnPage($box, $pageTop))) {
                 $target = $curPage + 1;
             } else {
                 $target = $curPage;
@@ -277,6 +281,7 @@ class Paginator
         foreach ($box->columnFlow === null ? $box->children : [] as $child) {
             $this->processBox($child);
         }
+        $this->settleHeight($box);
 
         // Headings (and page-break-after: avoid) stay with the content that follows them
         $avoidAfter = strtolower($box->style->get('page-break-after', 'auto'));
@@ -414,6 +419,35 @@ class Paginator
     }
 
     /**
+     * Whether flow content before $box already lies on the page starting at $pageTop: an earlier sibling (also an empty
+     * block that a forced break of its own moved there), or one of an ancestor it is the first child of. Then a forced
+     * break before $box starts a new page even though $box itself sits at the page top, as in browsers (two
+     * consecutive `page-break-before: always` blocks leave a page holding only the first one).
+     */
+    private function precededOnPage(LayoutBox $box, float $pageTop): bool
+    {
+        for ($cur = $box, $parent = $box->parent; $parent !== null; $cur = $parent, $parent = $parent->parent) {
+            foreach ($parent->lines as $line) {
+                if ($line->y >= $pageTop - 0.5 && $line->y < $box->y - 0.01) {
+                    return true; // inline content of the parent before the box on this page
+                }
+            }
+            $children = $parent->children;
+            for ($i = $this->indexInParent($parent, $cur) - 1; $i >= 0 && $i < count($children); $i--) {
+                $prev = $children[$i];
+                if ($this->outOfFlow($prev) || $prev->isTextNode() || ($parent->lines !== [] && $prev->isInlineLevel())) {
+                    continue;
+                }
+                return $this->syncedY($prev) >= $pageTop - 0.5; // the previous box starts on this page
+            }
+            if ($parent->y < $pageTop - 0.5) {
+                return false; // the first child of a box that started on an earlier page
+            }
+        }
+        return false;
+    }
+
+    /**
      * Page side demanded by a `left` / `right` / `recto` / `verso` forced break: 1 = left page (odd 0-based index),
      * 0 = right page, null = not a side break. Page 1 is a right (recto) page.
      */
@@ -446,6 +480,8 @@ class Paginator
         if ($this->root !== null) {
             $this->flushAll($this->root); // ColumnFlow::shiftFollowing reads sibling positions directly
         }
+        $this->shifts = []; // everything is applied; the shifts below (possibly upwards) do not keep the sibling order
+
         $oldBottom = $box->y + $box->height;
         $oldContent = $flow->contentHeight;
         $flow->place($box, $this->topMargin, $this->printableHeight);
@@ -483,6 +519,7 @@ class Paginator
             }
         }
         if ($footGroups !== [] || $bottomCaptions !== []) {
+            $this->dropShiftState($table);
             $table->children = array_merge($otherChildren, $footGroups, $bottomCaptions);
         }
 
@@ -582,6 +619,12 @@ class Paginator
             }
         }
 
+        // Row groups and the table enclose the rows the breaks moved (before the repeated headers join them)
+        foreach ($table->children as $group) {
+            $this->settleHeight($group);
+        }
+        $this->settleHeight($table);
+
         foreach ($clonedHeaders as $ch) {
             $table->addChild($ch);
         }
@@ -643,16 +686,38 @@ class Paginator
 
     private function nextInFlowSibling(LayoutBox $box): ?LayoutBox
     {
-        $found = false;
-        foreach ($box->parent?->children ?? [] as $sib) {
-            if ($found && !$sib->isPositionedOutOfFlow() && !$sib->isTextNode()) {
+        $parent = $box->parent;
+        if ($parent === null) {
+            return null;
+        }
+        $children = $parent->children;
+        for ($i = $this->indexInParent($parent, $box) + 1, $n = count($children); $i < $n; $i++) {
+            $sib = $children[$i];
+            if (!$this->outOfFlow($sib) && !$sib->isTextNode()) {
                 return $sib;
-            }
-            if ($sib === $box) {
-                $found = true;
             }
         }
         return null;
+    }
+
+    /** @var array<int, array<int, int>> spl_object_id(parent) => spl_object_id(child) => index in $parent->children */
+    private array $childIndex = [];
+
+    /** Index of $child in $parent->children (PHP_INT_MAX - 1 when it is not there): O(1) instead of a scan per heading. */
+    private function indexInParent(LayoutBox $parent, LayoutBox $child): int
+    {
+        $pid = spl_object_id($parent);
+        $cid = spl_object_id($child);
+        $i = $this->childIndex[$pid][$cid] ?? -1;
+        if ($i < 0 || ($parent->children[$i] ?? null) !== $child) {
+            $map = [];
+            foreach ($parent->children as $k => $c) {
+                $map[spl_object_id($c)] = $k;
+            }
+            $this->childIndex[$pid] = $map;
+            $i = $map[$cid] ?? PHP_INT_MAX - 1;
+        }
+        return $i;
     }
 
     private function deepCloneBox(LayoutBox $source): LayoutBox
@@ -720,9 +785,6 @@ class Paginator
         return false;
     }
 
-    /**
-     * Shifts $target and all boxes located vertically at or below $target->y in its ancestor chain down by $delta.
-     */
     /** @var array<int, bool> spl_object_id => isPositionedOutOfFlow(): fixed during pagination, asked for every following sibling on every push */
     private array $outOfFlowMemo = [];
 
@@ -731,6 +793,15 @@ class Paginator
         return $this->outOfFlowMemo[spl_object_id($box)] ??= $box->isPositionedOutOfFlow();
     }
 
+    /** @var array<int, SiblingShift> spl_object_id(parent) => lazy shifts of its children */
+    private array $shifts = [];
+
+    /** @var array<int, LayoutBox> boxes whose height must grow to enclose children that page breaks moved (see settleHeight()) */
+    private array $dirty = [];
+
+    /**
+     * Shifts $target and all boxes located vertically at or below $target->y in its ancestor chain down by $delta.
+     */
     private function pushBoxAndFollowing(LayoutBox $target, float $delta): void
     {
         if ($delta <= 0.01) {
@@ -744,19 +815,7 @@ class Paginator
         $curr = $target;
         while ($curr->parent !== null) {
             $parent = $curr->parent;
-            $foundCurr = false;
-
-            foreach ($parent->children as $sibling) {
-                if ($sibling === $curr) {
-                    $foundCurr = true;
-                    continue;
-                }
-                // numeric test first: the style lookups are the cost of this loop (it runs on every page)
-                if ($foundCurr && $sibling->y + $sibling->pendingDy >= $thresholdY && !$this->outOfFlow($sibling)
-                    && !($parent->lines !== [] && $sibling->isInlineLevel())) {
-                    $sibling->pendingDy += $delta; // applied lazily: O(1) instead of re-translating the whole remaining document
-                }
-            }
+            $this->shiftChildren($parent, $curr, $thresholdY, $delta);
 
             foreach ($parent->lines as $line) {
                 if ($line->y >= $thresholdY) {
@@ -764,22 +823,11 @@ class Paginator
                 }
             }
 
-            // Expand parent height to enclose shifted children
-            $maxChildBottom = $parent->y + $parent->height;
-            foreach ($parent->children as $ch) {
-                $b = $ch->y + $ch->pendingDy + $ch->height + $ch->marginBottom + $parent->paddingBottom + $parent->borderBottom;
-                if ($b > $maxChildBottom && !$this->outOfFlow($ch)) {
-                    $maxChildBottom = $b;
-                }
+            if ($parent->fixedHeight) {
+                break; // a box with a definite height keeps it: the moved content overflows it, nothing after it moves
             }
-            foreach ($parent->lines as $ln) {
-                $b = $ln->y + $ln->height + $parent->paddingBottom + $parent->borderBottom;
-                if ($b > $maxChildBottom) {
-                    $maxChildBottom = $b;
-                }
-            }
-            $parent->height = max($parent->height, $maxChildBottom - $parent->y);
-
+            // The parent grows to enclose the shifted children: computed once, when its pagination ends
+            $this->dirty[spl_object_id($parent)] = $parent;
             $curr = $parent;
         }
     }
@@ -789,11 +837,12 @@ class Paginator
         if ($delta <= 0.01) {
             return;
         }
-        foreach ($shiftChildren ? $box->children : [] as $child) {
+        if ($shiftChildren) {
             // Inline-level children are positioned through the (already shifted) line boxes: never shift them twice
-            if (!$child->isPositionedOutOfFlow() && $child->y + $child->pendingDy >= $thresholdY && !($child->isInlineLevel() && !empty($box->lines))) {
-                $child->translate(0.0, $delta);
-            }
+            $this->shiftChildren($box, null, $thresholdY, $delta);
+        }
+        if ($box->fixedHeight) {
+            return; // the lines below the break overflow the box's definite height (browsers do the same)
         }
         $box->height += $delta;
         $this->pushFollowingOnly($box, $delta);
@@ -810,19 +859,7 @@ class Paginator
 
         while ($curr->parent !== null) {
             $parent = $curr->parent;
-            $foundCurr = false;
-
-            foreach ($parent->children as $sibling) {
-                if ($sibling === $curr) {
-                    $foundCurr = true;
-                    continue;
-                }
-                // numeric test first: the style lookups are the cost of this loop (it runs on every page)
-                if ($foundCurr && $sibling->y + $sibling->pendingDy >= $thresholdY && !$this->outOfFlow($sibling)
-                    && !($parent->lines !== [] && $sibling->isInlineLevel())) {
-                    $sibling->pendingDy += $delta;
-                }
-            }
+            $this->shiftChildren($parent, $curr, $thresholdY, $delta);
 
             // Inline content (anonymous text / inline boxes) of the parent that follows $curr moves with it
             foreach ($parent->lines as $line) {
@@ -831,8 +868,213 @@ class Paginator
                 }
             }
 
+            if ($parent->fixedHeight) {
+                break;
+            }
             $parent->height += $delta;
             $curr = $parent;
+        }
+    }
+
+    /**
+     * Moves down by $delta every child of $parent after $after (all children when null) whose top is at or below
+     * $thresholdY, except out-of-flow boxes and inline-level children placed by the parent's line boxes. The shift
+     * is owed lazily (pendingDy, or the tail of the parent's SiblingShift), so a page break costs O(log n) here
+     * instead of a pass over every following sibling.
+     */
+    private function shiftChildren(LayoutBox $parent, ?LayoutBox $after, float $thresholdY, float $delta): void
+    {
+        $s = $this->shiftState($parent);
+        $k0 = 0;
+        if ($after !== null) {
+            $slot = $s->slot[spl_object_id($after)] ?? null;
+            if ($slot === null) {
+                return; // not a child of $parent (cannot happen): nothing follows it
+            }
+            $k0 = ($slot >> 1) + ($slot & 1);
+        }
+        $kids = $s->kids; // read-only: objects are changed through $kid = $kids[$k] (a write fetch would copy the array)
+        $count = count($kids);
+        // Before the ordered run every kid is tested on its own
+        for ($k = $k0, $end = min($count, max($k0, $s->mono)); $k < $end; $k++) {
+            if ($this->kidTop($s, $k) >= $thresholdY) {
+                $kid = $kids[$k];
+                $kid->pendingDy += $delta;
+            }
+        }
+        $lo = max($k0, $s->mono);
+        if ($lo >= $count) {
+            return;
+        }
+        // In the ordered run the kids at or below the threshold are a suffix
+        $hi = $count;
+        while ($lo < $hi) {
+            $mid = ($lo + $hi) >> 1;
+            if ($this->kidTop($s, $mid) >= $thresholdY) {
+                $hi = $mid;
+            } else {
+                $lo = $mid + 1;
+            }
+        }
+        if ($lo >= $count) {
+            return;
+        }
+        if ($s->tailFrom === PHP_INT_MAX) {
+            $s->tailFrom = $lo; // the first tail: every kid from $lo on has taken nothing yet
+        } elseif ($lo > $s->tailFrom) {
+            // The tail now starts later: the kids it leaves take what they owe now
+            for ($k = $s->tailFrom; $k < $lo; $k++) {
+                $kid = $kids[$k];
+                $kid->pendingDy += $s->tailDy - ($s->seen[$k] ?? 0.0);
+                unset($s->seen[$k]);
+            }
+            $s->tailFrom = $lo;
+        } else {
+            for ($k = $lo; $k < $s->tailFrom; $k++) {
+                $kid = $kids[$k];
+                $kid->pendingDy += $delta;
+            }
+        }
+        $s->tailDy += $delta;
+    }
+
+    /** Current top of kid $k, including the shifts it still owes. */
+    private function kidTop(SiblingShift $s, int $k): float
+    {
+        $c = $s->kids[$k];
+        $y = $c->y + $c->pendingDy;
+        if ($k >= $s->tailFrom) {
+            $y += $s->tailDy - ($s->seen[$k] ?? 0.0);
+        }
+        return $y;
+    }
+
+    private function shiftState(LayoutBox $parent): SiblingShift
+    {
+        $id = spl_object_id($parent);
+        $s = $this->shifts[$id] ?? null;
+        if ($s !== null && $s->childCount === count($parent->children)) {
+            return $s;
+        }
+        if ($s !== null) {
+            $this->dropShiftState($parent); // children were added: rebuild from the applied positions
+        }
+        $s = new SiblingShift();
+        $hasLines = $parent->lines !== [];
+        $k = 0;
+        foreach ($parent->children as $child) {
+            $kid = !$this->outOfFlow($child) && !($hasLines && $child->isInlineLevel());
+            $s->slot[spl_object_id($child)] = ($k << 1) | ($kid ? 1 : 0);
+            if ($kid) {
+                $s->kids[] = $child;
+                $k++;
+            }
+        }
+        $s->childCount = count($parent->children);
+        $mono = $k;
+        $next = INF;
+        for ($j = $k - 1; $j >= 0; $j--) {
+            $y = $s->kids[$j]->y + $s->kids[$j]->pendingDy;
+            if ($y > $next) {
+                break;
+            }
+            $next = $y;
+            $mono = $j;
+        }
+        $s->mono = $mono;
+        return $this->shifts[$id] = $s;
+    }
+
+    /** Moves the shifts the tail of $parent still owes into its kids' pendingDy and forgets the state. */
+    private function dropShiftState(LayoutBox $parent): void
+    {
+        $id = spl_object_id($parent);
+        $s = $this->shifts[$id] ?? null;
+        if ($s === null) {
+            return;
+        }
+        for ($k = $s->tailFrom, $n = count($s->kids); $k < $n; $k++) {
+            $kid = $s->kids[$k];
+            $kid->pendingDy += $s->tailDy - ($s->seen[$k] ?? 0.0);
+        }
+        unset($this->shifts[$id]);
+    }
+
+    /** Moves the tail shift $box owes as a child of its parent into its pendingDy. */
+    private function takeTail(LayoutBox $box): void
+    {
+        $parent = $box->parent;
+        if ($parent === null || ($s = $this->shifts[spl_object_id($parent)] ?? null) === null) {
+            return;
+        }
+        $slot = $s->slot[spl_object_id($box)] ?? 0;
+        $k = $slot >> 1;
+        if (($slot & 1) === 0 || $k < $s->tailFrom || $s->kids[$k] !== $box) {
+            return;
+        }
+        $owed = $s->tailDy - ($s->seen[$k] ?? 0.0);
+        if ($owed !== 0.0) {
+            $box->pendingDy += $owed;
+            $s->seen[$k] = $s->tailDy;
+        }
+    }
+
+    /**
+     * Grows $box to enclose its in-flow children after page breaks moved them (once per box, when its pagination
+     * ends, instead of a pass over all its children at every break).
+     */
+    private function settleHeight(LayoutBox $box): void
+    {
+        $id = spl_object_id($box);
+        if (!isset($this->dirty[$id])) {
+            return;
+        }
+        unset($this->dirty[$id]);
+        $s = $this->shifts[$id] ?? null;
+        $maxChildBottom = $box->y + $box->height;
+        $edge = $box->paddingBottom + $box->borderBottom;
+        foreach ($box->children as $ch) {
+            if ($this->outOfFlow($ch)) {
+                continue;
+            }
+            $b = $ch->y + $ch->pendingDy + $ch->height + $ch->marginBottom + $edge;
+            if ($s !== null) {
+                $slot = $s->slot[spl_object_id($ch)] ?? 0;
+                if (($slot & 1) === 1 && ($slot >> 1) >= $s->tailFrom) {
+                    $b += $s->tailDy - ($s->seen[$slot >> 1] ?? 0.0);
+                }
+            }
+            if ($b > $maxChildBottom) {
+                $maxChildBottom = $b;
+            }
+        }
+        foreach ($box->lines as $ln) {
+            $b = $ln->y + $ln->height + $edge;
+            if ($b > $maxChildBottom) {
+                $maxChildBottom = $b;
+            }
+        }
+        $box->height = max($box->height, $maxChildBottom - $box->y);
+    }
+
+    /** Settles the boxes no pagination pass ended on (deepest first, so parents see their children's final size). */
+    private function settleRemaining(): void
+    {
+        while ($this->dirty !== []) {
+            $depth = [];
+            foreach ($this->dirty as $id => $b) {
+                $d = 0;
+                for ($a = $b->parent; $a !== null; $a = $a->parent) {
+                    $d++;
+                }
+                $depth[$id] = $d;
+            }
+            arsort($depth);
+            foreach (array_keys($depth) as $id) {
+                if (isset($this->dirty[$id])) {
+                    $this->settleHeight($this->dirty[$id]);
+                }
+            }
         }
     }
 
@@ -843,6 +1085,7 @@ class Paginator
     {
         $chain = null;
         for ($a = $box; $a !== null; $a = $a->parent) {
+            $this->takeTail($a);
             if ($a->pendingDy !== 0.0) {
                 $chain[] = $a;
             }
@@ -863,6 +1106,7 @@ class Paginator
         $stack = [$root];
         while ($stack !== []) {
             $b = array_pop($stack);
+            $this->takeTail($b);
             if ($b->pendingDy !== 0.0) {
                 $d = $b->pendingDy;
                 $b->pendingDy = 0.0;

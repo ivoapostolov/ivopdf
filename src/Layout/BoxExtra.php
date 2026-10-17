@@ -42,6 +42,11 @@ final class BoxExtra
     // Table cell attributes
     public int $colspan = 1;
     public int $rowspan = 1;
+    /**
+     * The box has a definite `height` (not auto, not only a min-height): its content overflows it instead of growing
+     * it, and page breaks inside it move only its content (the box keeps its height, as in browsers)
+     */
+    public bool $fixedHeight = false;
     /** Multi-column flow state (set on column containers by ColumnLayout) */
     public ?ColumnFlow $columnFlow = null;
     /** @var list<array{x: float, y: float, w: float, h: float, chunk: int, col: int}> Used column rects of a multicol container */

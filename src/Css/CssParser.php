@@ -56,6 +56,8 @@ class CssParser
     private ?\WeakMap $tokenMemo = null;
     private int $styleMemoRules = -1;
     private ?bool $positionRules = null;
+    /** @var array<string, true>|null attributes no selector of the stylesheet looks at (see memoIgnoredAttributes()) */
+    private ?array $memoIgnored = null;
     /** @var array<int, int> rule order => 2: the outcome depends on neither the position of the subject nor of its ancestors, 1: not on the subject's sibling position, 0: it may */
     private array $positionFreeRules = [];
 
@@ -518,11 +520,18 @@ class CssParser
                 $this->positionRules = null;
                 $this->tokenMemo = new \WeakMap();
                 $this->styleMemoRules = count($this->rules);
+                $this->memoIgnored = null;
             }
             $memoKey = $tag;
             if ($el->hasAttributes()) {
+                $ignored = $this->memoIgnored ??= $this->memoIgnoredAttributes();
                 foreach ($el->attributes as $attr) {
-                    $memoKey .= "\0" . $attr->nodeName . "\1" . $attr->nodeValue;
+                    $name = strtolower($attr->nodeName);
+                    // an id / href / data-* that no selector reads does not change the style: the 8 000 headings and
+                    // links of a table of contents share one cascade (a style of its own costs ~5 KB)
+                    $memoKey .= isset($ignored[$name]) || (str_starts_with($name, 'data-') && isset($ignored['data-']))
+                        ? "\0" . $name
+                        : "\0" . $attr->nodeName . "\1" . $attr->nodeValue;
                 }
             }
             $hit = ($this->tokenMemo[$parentStyle->shareToken()] ?? [])[$memoKey] ?? ($this->styleMemo[$parentStyle] ?? [])[$memoKey] ?? null;
@@ -613,6 +622,34 @@ class CssParser
         }
 
         return $style;
+    }
+
+    /**
+     * Attributes whose value no selector of the stylesheet can depend on and that set no presentational hint: id
+     * without `#` / `[id`, href without `[href` / `:link` / `:visited`, name, title, target, rel, alt and data-*
+     * without an attribute selector on them.
+     *
+     * @return array<string, true>
+     */
+    private function memoIgnoredAttributes(): array
+    {
+        $selectors = '';
+        foreach ($this->rules as $rule) {
+            $selectors .= strtolower((string) ($rule['selector'] ?? '')) . "\n";
+        }
+        $out = [];
+        if (!str_contains($selectors, '#') && !str_contains($selectors, '[id')) {
+            $out['id'] = true;
+        }
+        if (!str_contains($selectors, '[href') && !str_contains($selectors, 'link') && !str_contains($selectors, ':visited')) {
+            $out['href'] = true;
+        }
+        foreach (['name', 'title', 'target', 'rel', 'alt', 'data-'] as $attr) {
+            if (!str_contains($selectors, '[' . $attr)) {
+                $out[$attr] = true;
+            }
+        }
+        return $out;
     }
 
     /** Whether any rule of the stylesheet depends on the position of an element (sibling combinators, structural pseudo-classes). */
