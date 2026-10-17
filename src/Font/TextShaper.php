@@ -50,8 +50,17 @@ final class TextShaper
         $hasArabic = false;
         $script = 'latn';
         $indic = false;
+        $lang = '';
+        if (isset($features[FontFeatures::LANG_KEY])) {
+            $lang = pack('N', $features[FontFeatures::LANG_KEY]);
+            unset($features[FontFeatures::LANG_KEY]);
+        }
         foreach ($cps as $cp) {
-            if ($cp >= 0x0590) {
+            if ($cp >= 0x0370 && $cp < 0x0530) {
+                if ($script === 'latn') {
+                    $script = $cp < 0x0400 ? 'grek' : 'cyrl';
+                }
+            } elseif ($cp >= 0x0590) {
                 if (ArabicShaper::isArabicLike($cp)) {
                     $hasArabic = true;
                     $script = 'arab';
@@ -149,7 +158,7 @@ final class TextShaper
         // ---- GSUB ----
         $buf = $indicRes['buf'] ?? $items;
         if ($indicRes === null && $layout !== null && $layout->hasTable('GSUB') && $buf !== []) {
-            $stages = self::gsubStages($layout, (string) $script, $features, $gsubForms);
+            $stages = self::gsubStages($layout, (string) $script, $features, $gsubForms, $lang);
             if ($stages !== []) {
                 $buf = $layout->applyGsub($buf, $stages);
             }
@@ -274,14 +283,14 @@ final class TextShaper
      * @param array<string, int> $features
      * @return list<array<int, int>>
      */
-    private static function gsubStages(OpenTypeLayout $layout, string $script, array $features, bool $arabicForms): array
+    private static function gsubStages(OpenTypeLayout $layout, string $script, array $features, bool $arabicForms, string $lang = ''): array
     {
         $scripts = [$script];
         $stage1 = [];
         $stage2 = [];
         $stage3 = [];
-        $add = static function (array &$stage, string $tag, int $bit) use ($layout, $scripts): void {
-            foreach ($layout->featureLookups('GSUB', $scripts, $tag) as $li) {
+        $add = static function (array &$stage, string $tag, int $bit) use ($layout, $scripts, $lang): void {
+            foreach ($layout->featureLookups('GSUB', $scripts, $tag, $lang) as $li) {
                 $stage[$li] = ($stage[$li] ?? 0) | $bit;
             }
         };

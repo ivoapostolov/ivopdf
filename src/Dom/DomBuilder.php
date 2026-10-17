@@ -194,6 +194,7 @@ class DomBuilder
         }
 
         foreach ($parentNode->childNodes as $child) {
+            \IvoPdf\RenderLimits::tick();
             if ($child instanceof DOMText) {
                 $text = $child->data; // not wholeText: adjacent text nodes (around a dropped comment) would be duplicated
                 // Preserve whitespace inside <pre>, otherwise collapse runs of whitespace
@@ -699,7 +700,8 @@ class DomBuilder
             '/<barcode\b((?:"[^"]*"|\'[^\']*\'|[^>"\'])*)>(?:\s*<\/barcode>)?/is',
             fn(array $m): string => \IvoPdf\Widget\Barcode::fromAttributes(
                 rtrim($m[1], "/ \t\r\n"),
-                fn(string $msg) => $this->options->addWarning($msg)
+                fn(string $msg) => $this->options->addWarning($msg),
+                $this->options->maxBarcodeLength
             ),
             $html
         );

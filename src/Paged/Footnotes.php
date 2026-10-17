@@ -286,7 +286,7 @@ final class Footnotes
                     $this->scan($run->inlineBox, $pageOfY);
                     continue;
                 }
-                $idx = $run->style->all()[self::STYLE_KEY] ?? null;
+                $idx = $run->style->has(self::STYLE_KEY) ? $run->style->get(self::STYLE_KEY) : null;
                 if ($idx !== null && !isset($this->actual[(int) $idx])) {
                     $this->actual[(int) $idx] = $pageOfY($run->y);
                 }

@@ -15,7 +15,7 @@ Requirements: PHP ≥ 8.1 with `ext-dom`, `ext-mbstring`, `ext-zlib`. Optional: 
 - HTML5 parsing per the WHATWG algorithm (PHP ≥ 8.4).
 
 **Text and fonts**
-- UTF-8 everywhere; bundled **Inter** (default sans-serif, full Cyrillic), **Liberation** Sans/Serif/Mono (metric-compatible with Arial, Times New Roman and Courier New, so templates written for those fonts keep their line breaks) and DejaVu Sans/Serif/Mono (Latin, Cyrillic, Greek, Arabic, Hebrew…, also used automatically for characters the other fonts lack).
+- UTF-8 everywhere; bundled **Inter** (default sans-serif, full Cyrillic), **Liberation** Sans/Serif/Mono (metric-compatible with Arial, Times New Roman and Courier New, so templates written for those fonts keep their line breaks), **Sofia Sans** and **Sofia Sans Semi Condensed** (Bulgarian Cyrillic letterforms) and DejaVu Sans/Serif/Mono (Latin, Cyrillic, Greek, Arabic, Hebrew…, also used automatically for characters the other fonts lack).
 - **Font subsetting** (a typical invoice is ≈ 40 KB instead of ~900 KB), TrueType and **OpenType/CFF (`.otf`)**, `.ttc` collections, `@font-face`, automatic **fallback fonts** and per-script font selection.
 - **OpenType shaping**: ligatures, kerning, `font-feature-settings`, `font-variant-*`; `font-variant: small-caps` / `all-small-caps` use the font's `smcp`/`c2sc` glyphs and are synthesized (capitals at 70 % size) for fonts without them, as browsers and mPDF do. GSUB/GPOS lookups are pre-filtered per glyph, so Inter shapes at nearly DejaVu speed.
 - **Typographic pseudo-elements**: `::first-letter` (drop caps via `float` / `initial-letter`) and `::first-line` (font, colour, `text-transform` on the first line box, re-broken when the metrics change).
@@ -81,6 +81,8 @@ print_r($pdf->getWarnings());                              // e.g. images that c
 
 Default styles follow browsers (and dompdf): table cells get `padding: 1px`, so templates written for a browser keep their row heights. Give tables their own `td { padding: … }` for roomier cells.
 
+Tables without a `width` are shrink-to-fit like in browsers (content width, at most the available width); use `width: 100%` for a full-width table. Position them with `margin-left/right: auto`, `float`, or the legacy `align="center|left|right"` attribute (`left` / `right` float the table, as in browsers); `text-align` on the parent does not move a block table, but `<center>` and `align=` on a block container do. Also supported: `font:` shorthand with any order of style / variant / weight / stretch keywords (unspecified parts reset to their initial values), `page-break-before/after` and `break-before/after: left | right | recto | verso` (an empty page is inserted when needed; page 1 is a right page), `@page { size: 100mm }` / `100mm 50mm` / `A4 landscape` / `landscape`, `<wbr>`, and `ex` / `ch` units (x-height from the font's OS/2 table and the width of `0`; 0.5 em when the font has no x-height). `<noscript>` content is hidden, as in a browser with scripting (dompdf renders it).
+
 For Laravel and Symfony see [Framework integrations](#framework-integrations).
 
 ### dompdf code, unchanged
@@ -145,6 +147,9 @@ Not supported: the imperative drawing API (`Cell`, `Ln`, `Rect`, `Image`, `Write
 | `isRemoteEnabled` | `false` | allow `http(s)` resources (SSRF-protected) |
 | `maxRemoteBytes`, `maxImagePixels` | 10 MB, 25 MP | resource limits |
 | `maxHtmlBytes`, `maxNestingDepth`, `maxWordLength`, `maxPages` | 32 MB, 200, 2000, 5000 | failure guards |
+| `maxRenderTime` | `120` | seconds one rendering may take (parse, layout, pagination, painting); when it runs out a catchable `IvoPdf\Exception\LimitExceededException` (a `RuntimeException`, `getLimit() === 'time'`) is thrown. `0` = unlimited |
+| `maxMemory` | `0` | memory one rendering may use: bytes, a string such as `'256M'` / `'1G'`, or `'auto'` (90 % of PHP's `memory_limit`). Exceeding it throws `LimitExceededException` (`getLimit() === 'memory'`); with a PHP `memory_limit` set the budget never exceeds 90 % of it, so the exception comes before PHP's uncatchable fatal error. `0` = off |
+| `maxBarcodeLength` | `5000` | longest `<barcode>` value; longer ones are skipped with a warning (`0` = unlimited) |
 | `html5Parser` | `true` | WHATWG HTML5 parser (PHP ≥ 8.4); `false` uses libxml's HTML4 parser |
 | `inputEncoding` | `'auto'` | `auto`: BOM, then `<meta charset>`, then valid UTF-8; legacy bytes without a meta are read as Windows-1251 when they look Cyrillic, otherwise Windows-1252. Set it explicitly (e.g. `'ISO-8859-2'`, `'KOI8-R'`, `'Shift_JIS'`) for other legacy files without a meta |
 | `shrinkTablesToFit` | `1.4` | maximum shrink factor for too-wide tables (`0` = off) |
@@ -169,7 +174,16 @@ $pdf->registerFontFamily('Inter', ['regular' => '/fonts/Inter.ttf', 'bold' => '/
 $pdf->addFallbackFont('Noto Sans Symbols');
 ```
 
-CSS `@font-face` works with `.ttf` / `.otf` sources (data URI, allowed local path, or remote when enabled). Asian and Indic scripts need fonts that are not bundled (for example Google's Noto fonts, OFL-licensed):
+The language of the text (`<html lang="bg">`, `lang` on any element) selects the font's localized letterforms (OpenType `locl`), as browsers do. For Bulgarian typography use the bundled Sofia Sans, which draws Bulgarian Cyrillic forms by default (and Russian forms under `lang="ru"`); Semi Condensed fits more text per line:
+
+```css
+body { font-family: 'Sofia Sans', sans-serif; }
+table, .compact { font-family: 'Sofia Sans Semi Condensed', sans-serif; }
+```
+
+`lang="sr"` / `lang="mk"` likewise give Serbian / Macedonian forms in DejaVu and Liberation. Inter has no Bulgarian forms.
+
+CSS `@font-face` works with `.ttf` / `.otf` sources (data URI, allowed local path, or remote when enabled); data URI and downloaded fonts are kept in memory, no temporary files are written. Asian and Indic scripts need fonts that are not bundled (for example Google's Noto fonts, OFL-licensed):
 
 ```php
 $pdf = new IvoPdf(['scriptFonts' => ['Hani' => 'Noto CJK SC', 'Hani:ja' => 'Noto CJK JP', 'Hang' => 'Noto CJK KR', 'Deva' => 'Noto Deva']]);
@@ -294,7 +308,7 @@ IvoPDF is free and open-source software licensed under the **GNU Affero General 
 
 - You may use, study, modify and share it freely, including in commercial projects.
 - If you distribute software that includes IvoPDF, or let users interact with it over a network (web apps, SaaS, APIs), the **whole application must be released under the AGPL** with its source code available to those users. Embedding IvoPDF into closed-source products is not permitted.
-- Bundled third-party data keeps its own permissive license: Inter fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), Liberation fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Liberation.txt](resources/fonts/LICENSE-Liberation.txt)), DejaVu fonts ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) and the TeX hyphenation patterns (license headers in `resources/hyphenation/`).
+- Bundled third-party data keeps its own permissive license: Inter fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), Liberation fonts (SIL Open Font License 1.1, [resources/fonts/LICENSE-Liberation.txt](resources/fonts/LICENSE-Liberation.txt)), Sofia Sans fonts by Lettersoup (SIL Open Font License 1.1, [resources/fonts/LICENSE-SofiaSans.txt](resources/fonts/LICENSE-SofiaSans.txt); static instances of the variable fonts), DejaVu fonts ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) and the TeX hyphenation patterns (license headers in `resources/hyphenation/`).
 
 ## Contributing
 

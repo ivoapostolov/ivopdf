@@ -53,15 +53,19 @@ class TtfParser
     private ?array $cffGidToCid = null;
     private bool $cffCidLoaded = false;
 
-    public function __construct(string $filePath)
+    /**
+     * @param string  $filePath path of the font file; with $data it is only an identity key (e.g. "memory:<sha1>")
+     * @param ?string $data     font bytes already in memory (data: URIs, downloaded fonts): no file is read
+     */
+    public function __construct(string $filePath, ?string $data = null)
     {
         // "file.ttc#2" selects face 2 of a font collection (the reference stays the cache/identity key)
         [$realPath, $faceIndex] = TtcExtractor::splitReference($filePath);
-        if (!is_file($realPath)) {
+        if ($data === null && !is_file($realPath)) {
             throw new RuntimeException("TTF font file not found: {$filePath}");
         }
         $this->filePath = $filePath;
-        $raw = file_get_contents($realPath);
+        $raw = $data ?? file_get_contents($realPath);
         if ($raw === false) {
             throw new RuntimeException("Unable to read TTF font file: {$filePath}");
         }

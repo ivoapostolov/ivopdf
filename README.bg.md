@@ -15,7 +15,7 @@ IvoPDF превръща HTML + CSS в PDF **без външни програми
 - HTML5 парсване по алгоритъма на WHATWG (PHP ≥ 8.4).
 
 **Текст и шрифтове**
-- UTF-8 навсякъде; вградени **Inter** (шрифт по подразбиране, пълна кирилица), **Liberation** Sans/Serif/Mono (със същите ширини като Arial, Times New Roman и Courier New, така че шаблоните за тези шрифтове се пренасят по същия начин) и DejaVu Sans/Serif/Mono (латиница, кирилица, гръцки, арабски, иврит…; ползват се автоматично и за знаци, които липсват в другите шрифтове).
+- UTF-8 навсякъде; вградени **Inter** (шрифт по подразбиране, пълна кирилица), **Liberation** Sans/Serif/Mono (със същите ширини като Arial, Times New Roman и Courier New, така че шаблоните за тези шрифтове се пренасят по същия начин), **Sofia Sans** и **Sofia Sans Semi Condensed** (български форми на кирилицата) и DejaVu Sans/Serif/Mono (латиница, кирилица, гръцки, арабски, иврит…; ползват се автоматично и за знаци, които липсват в другите шрифтове).
 - **Изрязване на шрифтовете** (типична фактура е ≈ 40 KB вместо ~900 KB), TrueType и **OpenType/CFF (`.otf`)**, колекции `.ttc`, `@font-face`, автоматични **резервни шрифтове** и избор на шрифт според писмеността.
 - **OpenType оформяне**: лигатури, кернинг, `font-feature-settings`, `font-variant-*`; `font-variant: small-caps` / `all-small-caps` ползват знаците `smcp`/`c2sc` на шрифта, а при шрифтове без тях се синтезират (главни букви на 70 % размер), както правят браузърите и mPDF. GSUB/GPOS правилата се филтрират предварително за всеки знак, затова Inter е почти толкова бърз, колкото DejaVu.
 - **Типографски псевдо-елементи**: `::first-letter` (буквица чрез `float` / `initial-letter`) и `::first-line` (шрифт, цвят, `text-transform` върху първия ред, който се пренарежда при промяна на размерите).
@@ -81,6 +81,8 @@ print_r($pdf->getWarnings());                              // напр. изоб
 
 Стиловете по подразбиране са като в браузъра (и в dompdf): клетките на таблици имат `padding: 1px`, така че шаблоните, писани за браузър, запазват височината на редовете. За по-просторни клетки задайте собствен `td { padding: … }`.
 
+Таблиците без `width` се оразмеряват по съдържанието си, както в браузъра (ширина на съдържанието, най-много наличната ширина); за таблица на цялата ширина ползвайте `width: 100%`. Позиционират се с `margin-left/right: auto`, `float` или старите атрибути `align="center|left|right"` (`left` / `right` плаваща таблица, както в браузъра); `text-align` на родителя не премества блокова таблица, но `<center>` и `align=` на блоков контейнер я премества. Поддържани са още: съкратеният запис `font:` с произволен ред на ключовите думи за стил / вариант / дебелина / разтегляне (непосочените части се връщат към началните стойности), `page-break-before/after` и `break-before/after: left | right | recto | verso` (при нужда се добавя празна страница; страница 1 е дясна), `@page { size: 100mm }` / `100mm 50mm` / `A4 landscape` / `landscape`, `<wbr>` и единиците `ex` / `ch` (височина на малко „x“ от OS/2 таблицата на шрифта и ширина на „0“; 0,5 em, ако шрифтът няма такава стойност). Съдържанието на `<noscript>` е скрито, както в браузър със скриптове (dompdf го показва).
+
 За Laravel и Symfony вижте [Интеграции с фреймуърци](#интеграции-с-фреймуърци).
 
 ### dompdf код без промени
@@ -145,6 +147,9 @@ echo $dompdf->output(['compress' => 0]);        // или $dompdf->stream('x.pdf
 | `isRemoteEnabled` | `false` | разрешава `http(s)` ресурси (със защита от SSRF) |
 | `maxRemoteBytes`, `maxImagePixels` | 10 MB, 25 MP | лимити на ресурсите |
 | `maxHtmlBytes`, `maxNestingDepth`, `maxWordLength`, `maxPages` | 32 MB, 200, 2000, 5000 | защитни лимити |
+| `maxRenderTime` | `120` | секунди, които може да отнеме един рендер (разбор, подредба, разделяне на страници, рисуване); при изтичане се хвърля прихващаемото `IvoPdf\Exception\LimitExceededException` (наследник на `RuntimeException`, `getLimit() === 'time'`). `0` = без лимит |
+| `maxMemory` | `0` | памет, която може да ползва един рендер: байтове, низ като `'256M'` / `'1G'` или `'auto'` (90 % от `memory_limit` на PHP). При превишаване се хвърля `LimitExceededException` (`getLimit() === 'memory'`); ако PHP има `memory_limit`, лимитът не надвишава 90 % от него, така че изключението идва преди неприхващаемата фатална грешка на PHP. `0` = изключено |
+| `maxBarcodeLength` | `5000` | най-дълга стойност на `<barcode>`; по-дългите се пропускат с предупреждение (`0` = без лимит) |
 | `html5Parser` | `true` | HTML5 парсер на WHATWG (PHP ≥ 8.4); `false` ползва HTML4 парсера на libxml |
 | `inputEncoding` | `'auto'` | `auto`: BOM, после `<meta charset>`, после валиден UTF-8; стари байтове без meta се четат като Windows-1251, ако приличат на кирилица, иначе като Windows-1252. За други стари файлове без meta я задайте изрично (напр. `'ISO-8859-2'`, `'KOI8-R'`, `'Shift_JIS'`) |
 | `shrinkTablesToFit` | `1.4` | максимално свиване на твърде широки таблици (`0` = изключено) |
@@ -169,7 +174,16 @@ $pdf->registerFontFamily('Inter', ['regular' => '/fonts/Inter.ttf', 'bold' => '/
 $pdf->addFallbackFont('Noto Sans Symbols');
 ```
 
-CSS `@font-face` работи с `.ttf` / `.otf` източници (data URI, разрешен локален път или отдалечен, ако е включено). Азиатските и индийските писмености изискват шрифтове, които не са включени в проекта (например шрифтовете Noto на Google, с лиценз OFL):
+Езикът на текста (`<html lang="bg">` или `lang` на всеки елемент) избира локалните форми на буквите в шрифта (OpenType `locl`), както в браузъра. За българска типография ползвайте вградения Sofia Sans, който рисува български форми на кирилицата по подразбиране (а руски при `lang="ru"`); Semi Condensed събира повече текст на ред:
+
+```css
+body { font-family: 'Sofia Sans', sans-serif; }
+table, .compact { font-family: 'Sofia Sans Semi Condensed', sans-serif; }
+```
+
+По същия начин `lang="sr"` / `lang="mk"` дават сръбски / македонски форми в DejaVu и Liberation. Inter няма български форми.
+
+CSS `@font-face` работи с `.ttf` / `.otf` източници (data URI, разрешен локален път или отдалечен, ако е включено); шрифтовете от data URI и изтеглените се държат в паметта, без временни файлове. Азиатските и индийските писмености изискват шрифтове, които не са включени в проекта (например шрифтовете Noto на Google, с лиценз OFL):
 
 ```php
 $pdf = new IvoPdf(['scriptFonts' => ['Hani' => 'Noto CJK SC', 'Hani:ja' => 'Noto CJK JP', 'Hang' => 'Noto CJK KR', 'Deva' => 'Noto Deva']]);
@@ -294,7 +308,7 @@ IvoPDF е безплатен софтуер с отворен код под ли
 
 - Можете свободно да го използвате, изучавате, променяте и споделяте, включително в търговски проекти.
 - Ако разпространявате софтуер, който включва IvoPDF, или давате достъп до него през мрежа (уеб приложения, SaaS, API), **цялото приложение трябва да бъде пуснато под AGPL** с изходен код, достъпен за потребителите му. Вграждането на IvoPDF в продукти със затворен код не е разрешено.
-- Вградените чужди данни запазват собствения си свободен лиценз: шрифтовете Inter (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), шрифтовете Liberation (SIL Open Font License 1.1, [resources/fonts/LICENSE-Liberation.txt](resources/fonts/LICENSE-Liberation.txt)), шрифтовете DejaVu ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) и TeX шаблоните за пренасяне (лицензите са в началото на файловете в `resources/hyphenation/`).
+- Вградените чужди данни запазват собствения си свободен лиценз: шрифтовете Inter (SIL Open Font License 1.1, [resources/fonts/LICENSE-Inter.txt](resources/fonts/LICENSE-Inter.txt)), шрифтовете Liberation (SIL Open Font License 1.1, [resources/fonts/LICENSE-Liberation.txt](resources/fonts/LICENSE-Liberation.txt)), шрифтовете Sofia Sans на Lettersoup (SIL Open Font License 1.1, [resources/fonts/LICENSE-SofiaSans.txt](resources/fonts/LICENSE-SofiaSans.txt); статични варианти на вариативните шрифтове), шрифтовете DejaVu ([resources/fonts/LICENSE-DejaVu.txt](resources/fonts/LICENSE-DejaVu.txt)) и TeX шаблоните за пренасяне (лицензите са в началото на файловете в `resources/hyphenation/`).
 
 ## Принос
 

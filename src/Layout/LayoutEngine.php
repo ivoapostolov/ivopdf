@@ -96,6 +96,7 @@ class LayoutEngine
      */
     public function layoutElement(LayoutBox $box, float $x, float $y, float $containingWidth): void
     {
+        \IvoPdf\RenderLimits::tick();
         $box->lines = [];
         $box->collapsedMarginTop = 0.0;
         $box->collapsedMarginBottom = 0.0;
@@ -385,6 +386,13 @@ class LayoutEngine
                 $child->marginLeft = max(0.0, $freeW - $child->marginRight);
             } elseif ($mrCss === 'auto') {
                 $child->marginRight = max(0.0, $freeW - $child->marginLeft);
+            } else {
+                // <center> / align=center on a container (text-align: -webkit-center) moves narrower blocks and tables too
+                $blockAlign = $container->style->get('-ivopdf-block-align', '');
+                if (($blockAlign === 'center' || $blockAlign === 'right') && $freeW > $child->marginLeft + $child->marginRight + 0.01) {
+                    $room = $freeW - $child->marginLeft - $child->marginRight;
+                    $child->marginLeft += $blockAlign === 'center' ? $room / 2.0 : $room;
+                }
             }
 
             $childX = $bandLeft + $child->marginLeft;
@@ -814,6 +822,10 @@ class LayoutEngine
             };
         } elseif ($wCss !== 'auto' && $wCss !== '') {
             $w = $this->resolveBoxHorizontalDimension($box, $wCss, $containingWidth);
+        } elseif ($box->getDisplay() === 'table') {
+            // An auto-width table is shrink-to-fit: its max-content width, but never wider than the available space
+            $avail = max(0.0, $containingWidth - $box->marginLeft - $box->marginRight);
+            $w = min($avail, $this->measureIntrinsicWidth($box, $containingWidth)['max']);
         } else {
             $w = max(0.0, $containingWidth - $box->marginLeft - $box->marginRight);
         }
@@ -895,6 +907,7 @@ class LayoutEngine
      */
     public function measureIntrinsicWidth(LayoutBox $box, float $referenceWidth, bool $ignoreExplicitWidth = false): array
     {
+        \IvoPdf\RenderLimits::tick();
         $this->resolveBoxMetrics($box, $referenceWidth);
         $hSpace = $box->getHorizontalSpacing();
 

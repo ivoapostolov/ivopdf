@@ -313,7 +313,10 @@ check('left float is as wide as its longest line, not the sum of lines', $lf !==
 check('right float stays beside the left float', $lf !== null && $rf !== null && abs($rf->y - $lf->y) < 0.5, $rf ? sprintf('y %.1f vs %.1f', $rf->y, $lf?->y ?? 0) : 'missing');
 $br = render('<div id="f" style="float:left">aaaa aaaa aaaa<br><b>bb</b></div>');
 $brNoBr = render('<div id="f" style="float:left">aaaa aaaa aaaa <b>bb</b></div>');
-check('<br> ends the line run for max-content', findById($br->getLayoutTree(), 'f')->width < findById($brNoBr->getLayoutTree(), 'f')->width - 5.0);
+$tiny = render('<table id="tt" border="1"><tr><td>c</td><td>c</td></tr></table>');
+$tt = findById($tiny->getLayoutTree(), 'tt');
+check('a tiny auto-width table is not shrunk (no per-column minimum width)', $tt !== null && \IvoPdf\Layout\TableShrink::appliedScale($tt) === 1.0 && $tt->width < 40.0, $tt ? sprintf('w=%.1f scale=%.3f', $tt->width, \IvoPdf\Layout\TableShrink::appliedScale($tt)) : 'missing');
+check('<br> ends the line run for max-content',findById($br->getLayoutTree(), 'f')->width < findById($brNoBr->getLayoutTree(), 'f')->width - 5.0);
 
 // ---------------------------------------------------------------------------
 echo "\n";

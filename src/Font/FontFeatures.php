@@ -13,6 +13,23 @@ use WeakMap;
  */
 final class FontFeatures
 {
+    /** Feature-array entry carrying the OpenType language system tag (4 bytes packed big-endian), not a feature. */
+    public const LANG_KEY = '~lang';
+
+    /** BCP 47 primary language subtag => OpenType language system tag (languages with localized forms in common fonts). */
+    private const OT_LANGS = [
+        'bg' => 'BGR ', 'ru' => 'RUS ', 'uk' => 'UKR ', 'be' => 'BEL ', 'sr' => 'SRB ', 'mk' => 'MKD ',
+        'kk' => 'KAZ ', 'ky' => 'KIR ', 'tt' => 'TAT ', 'ba' => 'BSH ', 'cv' => 'CHU ', 'mn' => 'MNG ',
+        'ro' => 'ROM ', 'mo' => 'MOL ', 'tr' => 'TRK ', 'az' => 'AZE ', 'crh' => 'CRT ', 'pl' => 'PLK ',
+        'nl' => 'NLD ', 'ca' => 'CAT ', 'de' => 'DEU ', 'en' => 'ENG ', 'fr' => 'FRA ', 'es' => 'ESP ',
+        'it' => 'ITA ', 'pt' => 'PTG ', 'el' => 'ELL ', 'hu' => 'HUN ', 'cs' => 'CSY ', 'sk' => 'SKY ',
+        'hr' => 'HRV ', 'sl' => 'SLV ', 'bs' => 'BOS ', 'lt' => 'LTH ', 'lv' => 'LVI ', 'et' => 'ETI ',
+        'fi' => 'FIN ', 'sv' => 'SVE ', 'da' => 'DAN ', 'no' => 'NOR ', 'nb' => 'NOR ', 'nn' => 'NYN ',
+        'is' => 'ISL ', 'ga' => 'IRI ', 'cy' => 'WEL ', 'mt' => 'MTS ', 'sq' => 'SQI ', 'vi' => 'VIT ',
+        'ja' => 'JAN ', 'ko' => 'KOR ', 'zh' => 'ZHS ', 'ar' => 'ARA ', 'fa' => 'FAR ', 'ur' => 'URD ',
+        'he' => 'IWR ', 'hi' => 'HIN ', 'mr' => 'MAR ', 'ne' => 'NEP ', 'sa' => 'SAN ',
+    ];
+
     /** @var WeakMap<ComputedStyle, array<string, int>>|null */
     private static ?WeakMap $cache = null;
 
@@ -23,7 +40,12 @@ final class FontFeatures
     {
         self::$cache ??= new WeakMap();
         if (!isset(self::$cache[$style])) {
-            self::$cache[$style] = self::compute($style);
+            $computed = self::compute($style);
+            $lang = self::otLanguage($style->get('-ivopdf-lang', ''));
+            if ($lang !== null) {
+                $computed[self::LANG_KEY] = (int) unpack('N', $lang)[1];
+            }
+            self::$cache[$style] = $computed;
         }
         $features = self::$cache[$style];
         if (abs($letterSpacingPt) > 0.001) {
@@ -31,6 +53,20 @@ final class FontFeatures
             $features += ['liga' => 0, 'clig' => 0];
         }
         return $features;
+    }
+
+    /** OpenType language system tag for a CSS/HTML language ("bg", "sr-Latn", "zh-Hant"...), or null. */
+    public static function otLanguage(string $lang): ?string
+    {
+        $lang = strtolower(trim(str_replace('_', '-', $lang)));
+        if ($lang === '') {
+            return null;
+        }
+        if ($lang === 'zh-hant' || str_starts_with($lang, 'zh-tw') || str_starts_with($lang, 'zh-hk')) {
+            return 'ZHT ';
+        }
+        $primary = explode('-', $lang)[0];
+        return self::OT_LANGS[$primary] ?? null;
     }
 
     /**

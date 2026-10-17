@@ -39,6 +39,24 @@ class Options
     public int $maxWordLength = 2000;
     /** Output is truncated (with a warning) after this many pages (runaway-layout guard). 0 = unlimited */
     public int $maxPages = 5000;
+    /**
+     * Longest value (characters) a `<barcode>` accepts; longer values are skipped with a warning instead of building
+     * an enormous symbol. 0 = unlimited. (QR: up to ~4300 alphanumeric characters, the others far fewer.)
+     */
+    public int $maxBarcodeLength = 5000;
+    /**
+     * Processing time budget of one rendering in seconds (parse, layout, pagination and painting). When it runs out a
+     * catchable \IvoPdf\Exception\LimitExceededException is thrown instead of letting a pathological document block the
+     * process. 0 = unlimited. Default 120.
+     */
+    public float $maxRenderTime = 120.0;
+    /**
+     * Memory budget of one rendering: bytes (int), a php.ini style string ('256M', '1G'), or 'auto' (90 % of PHP's
+     * memory_limit). Exceeding it throws \IvoPdf\Exception\LimitExceededException while PHP still has room to unwind.
+     * With a PHP memory_limit set, the budget never exceeds 90 % of it, so the exception always comes before PHP's own
+     * fatal "Allowed memory size exhausted". 0 = off (default).
+     */
+    public int|string $maxMemory = 0;
     /** Parse HTML with the WHATWG HTML5 algorithm (PHP >= 8.4, \Dom\HTMLDocument); false = libxml's HTML4 parser */
     public bool $html5Parser = true;
     /** Charset of the HTML input: 'auto' (BOM, then valid UTF-8, then <meta charset>, else Windows-1252) or a charset name such as 'windows-1251'. */
@@ -167,6 +185,10 @@ class Options
             }
             if ($key === 'compat') {
                 $this->compat = is_array($value) ? $value : [];
+                continue;
+            }
+            if ($key === 'maxMemory') {
+                $this->maxMemory = is_int($value) || is_string($value) ? $value : (is_float($value) ? (int) $value : 0);
                 continue;
             }
             if ($key === 'encryption' || $key === 'signature') {
@@ -307,6 +329,23 @@ class Options
             $out['compat'] = \IvoPdf\Compat\MpdfConfig::normalize($compat);
         }
         return $out;
+    }
+
+    /**
+     * The effective memory budget in bytes (0 = not limited): Options::$maxMemory, capped at 90 % of PHP's memory_limit.
+     */
+    public function getMaxMemoryBytes(): int
+    {
+        $phpLimit = RenderLimits::phpMemoryLimit();
+        $ceiling = $phpLimit > 0 ? (int) ($phpLimit * 0.9) : 0;
+        if (is_string($this->maxMemory) && strtolower(trim($this->maxMemory)) === 'auto') {
+            return $ceiling;
+        }
+        $bytes = RenderLimits::parseBytes($this->maxMemory);
+        if ($bytes <= 0) {
+            return 0;
+        }
+        return $ceiling > 0 ? min($bytes, $ceiling) : $bytes;
     }
 
     public function addWarning(string $message): void

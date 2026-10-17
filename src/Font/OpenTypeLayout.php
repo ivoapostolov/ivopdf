@@ -78,9 +78,9 @@ final class OpenTypeLayout
      * @param list<string> $scripts
      * @return list<int>
      */
-    public function featureLookups(string $table, array $scripts, string $tag): array
+    public function featureLookups(string $table, array $scripts, string $tag, string $lang = ''): array
     {
-        $key = implode(',', $scripts) . '|' . $tag;
+        $key = implode(',', $scripts) . '|' . $tag . '|' . $lang;
         if (isset($this->featureCache[$table][$key])) {
             return $this->featureCache[$table][$key];
         }
@@ -94,9 +94,10 @@ final class OpenTypeLayout
                     break;
                 }
             }
-            if ($script !== null && $script['def'] !== null) {
+            // Language-specific system (e.g. 'BGR ' for Bulgarian Cyrillic forms), else the script default
+            $ls = $script !== null ? ($script['langs'][$lang] ?? $script['def']) : null;
+            if ($ls !== null) {
                 $d = $this->t[$table];
-                $ls = $script['def'];
                 $req = $this->u16($d, $ls + 2);
                 $indices = [];
                 if ($req !== 0xFFFF) {

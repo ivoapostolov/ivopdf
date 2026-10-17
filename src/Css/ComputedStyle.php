@@ -18,10 +18,26 @@ class ComputedStyle
     /** @var array<string, string> CSS custom properties (--var-name) */
     private array $variables = [];
 
+    /**
+     * Property values layered over $props (anonymous text nodes, see forTextNode()): lets the many text styles of a
+     * document share their parent's property array instead of each holding a modified copy of it.
+     *
+     * @var array<string, string>
+     */
+    private array $over = [];
+
     private float $parentFontSizePt = 12.0;
     private float $rootFontSizePt = 12.0;
     private float $computedFontSizePt = 12.0;
     private string $defaultBoxSizing = 'content-box';
+
+    /**
+     * Supplies the `ex` / `ch` unit sizes (as fractions of the font size) for a font family, weight and style.
+     * Set by the renderer while a document is parsed; without it both units fall back to 0.5 em.
+     *
+     * @var (\Closure(string, string, string): array{0: float, 1: float})|null
+     */
+    public static ?\Closure $fontUnitResolver = null;
 
     /** @var array<string, string>|null Cached initial values used for the `initial` / `unset` keywords */
     private static ?array $initialValues = null;
@@ -35,6 +51,7 @@ class ComputedStyle
         'line-height',
         'letter-spacing',
         'text-align',
+        '-ivopdf-block-align',
         'text-decoration',
         'text-transform',
         'text-indent',
@@ -234,6 +251,7 @@ class ComputedStyle
      */
     public function inheritForElement(string $tagName): self
     {
+        $this->materialize();
         $child = new self(
             [],
             $this->variables,
@@ -257,6 +275,7 @@ class ComputedStyle
 
     public function applyUserAgentDefaults(string $tag): void
     {
+        $this->materialize();
         switch ($tag) {
             case 'html':
             case 'body':
@@ -265,6 +284,7 @@ class ComputedStyle
             case 'center':
                 $this->set('display', 'block');
                 $this->set('text-align', 'center');
+                $this->props['-ivopdf-block-align'] = 'center'; // <center> (text-align: -webkit-center) also centres block children such as tables
                 break;
             case 'span':
             case 'a':
@@ -407,7 +427,6 @@ class ComputedStyle
                 break;
             case 'table':
                 $this->set('display', 'table');
-                $this->set('width', '100%');
                 $this->set('border-collapse', 'collapse');
                 $this->set('margin-bottom', '8pt');
                 break;
@@ -512,12 +531,12 @@ class ComputedStyle
     public function get(string $prop, string $default = ''): string
     {
         // Hot path: callers almost always pass the canonical lowercase key, stored keys are canonical
-        $val = $this->props[$prop] ?? null;
+        $val = $this->over[$prop] ?? $this->props[$prop] ?? null;
         if ($val !== null) {
             $key = $prop;
         } else {
             $key = strtolower(trim($prop));
-            $val = $this->props[$key] ?? $default;
+            $val = $this->over[$key] ?? $this->props[$key] ?? $default;
         }
         // currentColor (the CSS initial value of border/decoration colors) resolves to the element's color
         if (strlen($val) === 12 && $key !== 'color' && strcasecmp($val, 'currentcolor') === 0) {
@@ -531,7 +550,22 @@ class ComputedStyle
      */
     public function all(): array
     {
-        return $this->props;
+        return $this->over === [] ? $this->props : array_replace($this->props, $this->over);
+    }
+
+    /** Whether a property is set (declared or defaulted) on this style. */
+    public function has(string $prop): bool
+    {
+        return isset($this->over[$prop]) || isset($this->props[$prop]);
+    }
+
+    /** Folds the text-node overrides into the property array (before the style is modified). */
+    private function materialize(): void
+    {
+        if ($this->over !== []) {
+            $this->props = array_replace($this->props, $this->over);
+            $this->over = [];
+        }
     }
 
     /**
@@ -549,14 +583,14 @@ class ComputedStyle
      */
     public function forTextNode(): self
     {
-        $copy = clone $this;
+        $copy = clone $this; // shares the property arrays; only the differing values are layered on top
         foreach ([
             'position' => 'static', 'float' => 'none', 'clear' => 'none', 'display' => 'inline',
             'transform' => 'none', 'z-index' => 'auto', 'top' => 'auto', 'right' => 'auto',
             'bottom' => 'auto', 'left' => 'auto', 'column-count' => 'auto', 'column-width' => 'auto',
         ] as $prop => $initial) {
-            if (array_key_exists($prop, $copy->props)) {
-                $copy->props[$prop] = $initial;
+            if (array_key_exists($prop, $this->props) && ($this->over[$prop] ?? $this->props[$prop]) !== $initial) {
+                $copy->over[$prop] = $initial;
             }
         }
         return $copy;
@@ -564,6 +598,7 @@ class ComputedStyle
 
     public function set(string $prop, string $value): void
     {
+        $this->materialize();
         $key = strtolower(trim($prop));
         $val = trim($value);
         $val = trim((string) preg_replace('/!\s*important$/i', '', $val));
@@ -574,6 +609,9 @@ class ComputedStyle
         }
 
         $val = $this->resolveVariables($val);
+        if (self::$fontUnitResolver !== null && $val !== '' && preg_match('/[\d.](?:ex|ch)(?![a-z0-9_-])/i', $val) === 1) {
+            $val = $this->resolveFontRelativeUnits($key, $val);
+        }
         $lowerVal = strtolower($val);
 
         if ($lowerVal === 'unset' || $lowerVal === 'revert' || $lowerVal === 'revert-layer') {
@@ -602,6 +640,18 @@ class ComputedStyle
                 }
             }
             return;
+        }
+
+        if ($key === 'text-align') {
+            // -webkit-center / -webkit-right (and the HTML align attribute) also align shrink-wrapped block children
+            if (preg_match('/^-(?:webkit|moz)-(left|center|right)$/', $lowerVal, $wm) === 1) {
+                $this->props['text-align'] = $wm[1];
+                $this->props['-ivopdf-block-align'] = $wm[1];
+                return;
+            }
+            if (CssValidator::isValid($key, $val)) {
+                unset($this->props['-ivopdf-block-align']);
+            }
         }
 
         // CSS error recovery: an invalid value drops the declaration (the earlier cascade value stays)
@@ -833,6 +883,21 @@ class ComputedStyle
         }
     }
 
+    /** Rewrites `ex` / `ch` lengths into `em` using the metrics of the element's font (the parent's font for font-size). */
+    private function resolveFontRelativeUnits(string $key, string $val): string
+    {
+        $resolver = self::$fontUnitResolver;
+        if ($resolver === null) {
+            return $val;
+        }
+        $src = $key === 'font-size' ? $this->parentProps : $this->props;
+        $metrics = $resolver((string) ($src['font-family'] ?? $this->props['font-family'] ?? ''), (string) ($src['font-weight'] ?? 'normal'), (string) ($src['font-style'] ?? 'normal'));
+        return (string) preg_replace_callback('/(\d*\.?\d+)(ex|ch)(?![a-z0-9_-])/i', static function (array $m) use ($metrics): string {
+            $ratio = strtolower($m[2]) === 'ex' ? $metrics[0] : $metrics[1];
+            return rtrim(rtrim(sprintf('%.5f', (float) $m[1] * $ratio), '0'), '.') . 'em';
+        }, $val);
+    }
+
     private function resolveFontSizeValue(string $val): float
     {
         $v = strtolower(trim($val));
@@ -861,22 +926,78 @@ class ComputedStyle
 
     private function expandFontShorthand(string $val): void
     {
-        // Match optional style/weight, then size(/line-height), then family
-        if (preg_match('/^(?:(italic|oblique|normal|bold|bolder|lighter|\d{3})\s+)*(?:(italic|oblique|normal|bold|bolder|lighter|\d{3})\s+)?([\d.]+(?:px|pt|em|rem|%)|xx-small|x-small|small|medium|large|x-large|xx-large)(?:\/([\d.]+(?:px|pt|em|rem|%)?))?\s+(.+)$/i', trim($val), $m)) {
-            foreach ([$m[1], $m[2]] as $mod) {
-                $modL = strtolower(trim($mod));
-                if ($modL === 'italic' || $modL === 'oblique') {
-                    $this->props['font-style'] = $modL;
-                } elseif ($modL !== '' && $modL !== 'normal') {
-                    $this->props['font-weight'] = $modL;
-                }
-            }
-            $this->set('font-size', $m[3]);
-            if (isset($m[4]) && $m[4] !== '') {
-                $this->props['line-height'] = $m[4];
-            }
-            $this->props['font-family'] = trim($m[5]);
+        $rest = trim($val);
+        if ($rest === '') {
+            return;
         }
+        $lenRe = '(?:\d*\.?\d+(?:[eE][+-]?\d+)?(?:px|pt|em|rem|ex|ch|%|mm|cm|in|pc|q|vw|vh|vmin|vmax)|0)';
+        $sizeRe = '(?:' . $lenRe . '|xxx-large|xx-small|x-small|xx-large|x-large|small|medium|large|larger|smaller|calc\([^)]*\))';
+        $lhRe = '(?:normal|\d*\.?\d+(?:px|pt|em|rem|ex|ch|%|mm|cm|in|pc|q)?)';
+        // CSS Fonts 4: [ <style> || <variant-css2> || <weight> || <stretch-css3> ]? <size> [/ <line-height>]? <family>
+        $style = null;
+        $weight = null;
+        $variant = null;
+        $stretch = null;
+        $sizeFound = false;
+        $size = '';
+        $lineHeight = 'normal';
+        $family = '';
+        $guard = 0;
+        $systemFonts = ['caption', 'icon', 'menu', 'message-box', 'small-caption', 'status-bar'];
+        if (in_array(strtolower($rest), $systemFonts, true)) {
+            // System font keywords: degrade to a plain 13.33px face, reset the rest like the browser does
+            $this->props['font-style'] = 'normal';
+            $this->props['font-weight'] = 'normal';
+            $this->props['font-variant'] = 'normal';
+            $this->props['font-stretch'] = 'normal';
+            $this->props['line-height'] = 'normal';
+            $this->set('font-size', '13.3333px');
+            return;
+        }
+        while ($rest !== '' && $guard++ < 12) {
+            if (preg_match('/^(' . $sizeRe . ')(?:\s*\/\s*(' . $lhRe . '))?(?:\s+(.+))?$/is', $rest, $m)) {
+                if (!isset($m[3]) || trim($m[3]) === '') {
+                    return; // a family is required
+                }
+                $sizeFound = true;
+                $size = $m[1];
+                if (isset($m[2]) && $m[2] !== '') {
+                    $lineHeight = $m[2];
+                }
+                $family = trim($m[3]);
+                break;
+            }
+            if (preg_match('/^(\S+)\s*(.*)$/s', $rest, $t) !== 1) {
+                return;
+            }
+            $tok = strtolower($t[1]);
+            $rest = $t[2];
+            if ($tok === 'normal') {
+                continue;
+            }
+            if ($tok === 'italic' || $tok === 'oblique') {
+                $style = $tok;
+            } elseif (preg_match('/^(?:bold|bolder|lighter|[1-9]00|1000)$/', $tok) === 1) {
+                $weight = $tok;
+            } elseif ($tok === 'small-caps') {
+                $variant = $tok;
+            } elseif (in_array($tok, ['ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed', 'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded'], true)) {
+                $stretch = $tok;
+            } else {
+                return; // invalid: the whole declaration is ignored
+            }
+        }
+        if (!$sizeFound) {
+            return;
+        }
+        // Everything the shorthand does not mention goes back to its initial value
+        $this->props['font-style'] = $style ?? 'normal';
+        $this->props['font-weight'] = $weight ?? 'normal';
+        $this->props['font-variant'] = $variant ?? 'normal';
+        $this->props['font-stretch'] = $stretch ?? 'normal';
+        $this->props['line-height'] = $lineHeight;
+        $this->set('font-size', $size);
+        $this->props['font-family'] = $family;
     }
 
     private function resolveVariables(string $val): string

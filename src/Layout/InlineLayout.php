@@ -263,6 +263,7 @@ class InlineLayout
         $strutLh = $this->resolveLineHeight($container->style->get('line-height', '1.4'), $container->fontSizePt);
 
         $flushLine = function (bool $forced) use (&$rawLines, &$currentRuns, &$currentWidth, &$availW, &$lineDx, &$lineY, $band, $startX, $strutLh, $container): void {
+            \IvoPdf\RenderLimits::tick();
             $this->trimTrailingWhitespace($currentRuns);
             $rawLines[] = ['runs' => $currentRuns, 'forcedBreak' => $forced, 'dx' => $lineDx, 'w' => $availW];
             if ($band !== null) {
@@ -280,6 +281,7 @@ class InlineLayout
         };
 
         foreach ($tokens as $token) {
+            \IvoPdf\RenderLimits::tick();
             if ($token->isLineBreak) {
                 $flushLine(true);
                 continue;
@@ -935,6 +937,8 @@ class InlineLayout
                 $token->breakBefore = true;
             } elseif ($this->isNoWrap($token) && $this->isNoWrap($prev)) {
                 $token->breakBefore = false;
+            } elseif ($token->isWbr) {
+                $token->breakBefore = true; // <wbr>: a break opportunity without a hyphen
             } elseif ($token->isWhitespace || $prev->isWhitespace) {
                 $token->breakBefore = true;
             } elseif ($token->inlineBox !== null || $prev->inlineBox !== null) {
@@ -1082,6 +1086,9 @@ class InlineLayout
             return;
         }
         if ($node->tagName === 'wbr') {
+            $wbrRun = new TextRun('', $node->style, 0.0, $node->fontSizePt, $node->fontSizePt * 0.8, $node->fontSizePt * 0.2);
+            $wbrRun->isWbr = true;
+            $tokens[] = $wbrRun;
             return;
         }
 

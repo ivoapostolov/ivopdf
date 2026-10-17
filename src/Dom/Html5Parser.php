@@ -38,7 +38,7 @@ final class Html5Parser
             return null;
         }
         try {
-            $src = \Dom\HTMLDocument::createFromString(self::expandSelfClosing($html), LIBXML_NOERROR, 'UTF-8');
+            $src = \Dom\HTMLDocument::createFromString(self::expandSelfClosing(self::stripNoscript($html)), LIBXML_NOERROR, 'UTF-8');
         } catch (\Throwable) {
             return null;
         }
@@ -140,6 +140,18 @@ final class Html5Parser
     }
 
     /**
+     * Drops <noscript> elements: a browser with scripting enabled does not render them (dompdf does; we follow browsers).
+     * Done on the source so that a <noscript> in <head> cannot spill its content into the body either.
+     */
+    private static function stripNoscript(string $html): string
+    {
+        if (stripos($html, '<noscript') === false) {
+            return $html;
+        }
+        return (string) preg_replace('~<noscript\b[^>]*>.*?</noscript\s*>~is', '', $html);
+    }
+
+    /**
      * libxml's HTML4 parser (the pre-PHP-8.4 behaviour): wraps fragments, forces UTF-8.
      *
      * libxml stops parsing at 256 nested elements and silently drops the rest, so a too-deep source is flattened
@@ -151,6 +163,11 @@ final class Html5Parser
     {
         $maxDepth = max(8, $maxDepth);
         $flattened = false;
+        $html = self::stripNoscript($html);
+        if (stripos($html, '<wbr') !== false) {
+            // libxml's HTML4 parser does not know the void element <wbr> and would nest the following content inside it
+            $html = (string) preg_replace('~<wbr\s*/?>~i', '<wbr></wbr>', $html);
+        }
         $dom = self::loadLegacy($html, $tooDeep);
         if ($tooDeep) {
             $dom = self::loadLegacy(self::capSourceDepth($html, min($maxDepth, 200)), $tooDeep);

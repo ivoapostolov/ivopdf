@@ -143,6 +143,17 @@ class FontManager
         foreach ($metricAliases as $alias => $family) {
             $this->aliases[$alias] = $family;
         }
+
+        // Sofia Sans (SIL OFL 1.1, Lettersoup): Bulgarian Cyrillic forms by default (Russian forms with lang="ru")
+        foreach (['sofia sans' => 'SofiaSans', 'sofia sans semi condensed' => 'SofiaSansSemiCondensed'] as $family => $file) {
+            $this->registerFamily($family, [
+                'regular' => $this->fontDir . "/{$file}-Regular.ttf",
+                'bold' => $this->fontDir . "/{$file}-Bold.ttf",
+                'italic' => $this->fontDir . "/{$file}-Italic.ttf",
+                'bold_italic' => $this->fontDir . "/{$file}-BoldItalic.ttf",
+            ]);
+            $this->aliases[str_replace(' ', '', $family)] = $family;
+        }
     }
 
     /**
@@ -164,6 +175,24 @@ class FontManager
     /**
      * Registers (or replaces) a single variant ('regular', 'bold', 'italic', 'bold_italic') of a family, e.g. from @font-face.
      */
+    /** @var array<string, string> "memory:<sha1>" => font bytes of fonts that never touch the filesystem (data: URIs, downloads) */
+    private array $memoryFonts = [];
+
+    /**
+     * Registers a font that exists only in memory (an @font-face data: URI or a downloaded file).
+     *
+     * @throws \RuntimeException when the bytes are not a usable TrueType/OpenType font
+     */
+    public function registerFontData(string $familyName, string $variant, string $bytes): void
+    {
+        $key = 'memory:' . sha1($bytes);
+        if (!isset($this->parsedFonts[$key])) {
+            $this->parsedFonts[$key] = new TtfParser($key, $bytes); // validates the font before it is registered
+        }
+        $this->memoryFonts[$key] = $bytes;
+        $this->registerFontVariant($familyName, $variant, $key);
+    }
+
     public function registerFontVariant(string $familyName, string $variant, string $filePath): void
     {
         $key = strtolower(trim($familyName, " \t\n\r\0\x0B'\""));
@@ -328,7 +357,7 @@ class FontManager
             $filePath = $variants['regular'];
         }
 
-        if (!is_file(TtcExtractor::splitReference($filePath)[0])) {
+        if (!isset($this->memoryFonts[$filePath]) && !is_file(TtcExtractor::splitReference($filePath)[0])) {
             $fallbackVariants = $this->families['dejavu sans'];
             if ($isBold && $isItalic) {
                 $filePath = $fallbackVariants['bold_italic'] ?? $fallbackVariants['regular'];
@@ -343,7 +372,7 @@ class FontManager
 
         if (!isset($this->parsedFonts[$filePath])) {
             try {
-                $this->parsedFonts[$filePath] = new TtfParser($filePath);
+                $this->parsedFonts[$filePath] = new TtfParser($filePath, $this->memoryFonts[$filePath] ?? null);
             } catch (\Throwable) {
                 $fallbackPath = $this->families['dejavu sans']['regular'];
                 if (!isset($this->parsedFonts[$fallbackPath])) {
@@ -393,6 +422,38 @@ class FontManager
         }
 
         return $hex;
+    }
+
+    /** @var array<string, array{0: float, 1: float}> */
+    private array $unitMetricsCache = [];
+
+    /**
+     * The CSS `ex` and `ch` units of a font as fractions of its font size: the x-height (OS/2 sxHeight) and the
+     * advance width of the digit zero. Falls back to 0.5 em when the font does not provide the value.
+     *
+     * @return array{0: float, 1: float} [ex, ch]
+     */
+    public function fontRelativeUnits(string $fontFamily, string|int $fontWeight = 'normal', string $fontStyle = 'normal'): array
+    {
+        $key = $fontFamily . '|' . $fontWeight . '|' . $fontStyle;
+        if (isset($this->unitMetricsCache[$key])) {
+            return $this->unitMetricsCache[$key];
+        }
+        $ex = 0.5;
+        $ch = 0.5;
+        try {
+            $font = $this->resolveFont($fontFamily, $fontWeight, $fontStyle);
+            if ($font->xHeight > 50 && $font->xHeight < 1000) {
+                $ex = $font->xHeight / 1000.0;
+            }
+            $zero = $font->getCharWidth(0x30);
+            if ($zero > 50 && $zero < 2000) {
+                $ch = $zero / 1000.0;
+            }
+        } catch (\Throwable) {
+            // keep the 0.5 em fallbacks
+        }
+        return $this->unitMetricsCache[$key] = [$ex, $ch];
     }
 
     /**

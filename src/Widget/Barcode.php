@@ -67,7 +67,7 @@ final class Barcode
      * Builds the SVG for a <barcode ...> tag attribute string (mPDF style: code|value, type, size, error, height,
      * disableborder; plus width, height in px, color, text="false").
      */
-    public static function fromAttributes(string $attrs, ?callable $warn = null): string
+    public static function fromAttributes(string $attrs, ?callable $warn = null, int $maxLength = 0): string
     {
         $a = [];
         if (preg_match_all('/([A-Za-z_:][-\w:.]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>]+))/s', $attrs, $mm, PREG_SET_ORDER)) {
@@ -78,7 +78,7 @@ final class Barcode
         }
         $value = $a['value'] ?? $a['code'] ?? '12345678';
         $type = $a['type'] ?? 'C128';
-        $opt = ['warn' => $warn];
+        $opt = ['warn' => $warn, 'maxLength' => $maxLength];
         foreach (['width', 'height'] as $k) {
             if (isset($a[$k]) && ($px = self::toPx($a[$k])) !== null) {
                 $opt[$k] = $px;
@@ -141,6 +141,10 @@ final class Barcode
         $error = null;
         if (str_contains($type, ',')) { // TCPDF style "QRCODE,H"
             [$type, $error] = array_map('trim', explode(',', $type, 2));
+        }
+        $maxLength = (int) ($o['maxLength'] ?? 0);
+        if ($maxLength > 0 && strlen($value) > $maxLength) {
+            throw new InvalidArgumentException('value of ' . strlen($value) . ' characters exceeds Options::$maxBarcodeLength (' . $maxLength . ')');
         }
         $type = self::normalizeType($type);
         if (!empty($o['checksum']) && in_array($type, ['C39', 'C39E', 'I25'], true)) {

@@ -53,6 +53,7 @@ class PdfRenderer
             $pdf->paints(),
             static fn(string $src): ?array => $imageLoader->load($src)
         );
+        $this->svgRenderer->setWarningSink(static fn(string $m) => $imageLoader->addWarning($m));
         $this->pageWidth = $pageWidth;
         $this->pageHeight = $pageHeight;
         $this->borderPainter = new BorderPainter($pdf, $pageHeight);
@@ -166,23 +167,15 @@ class PdfRenderer
     /**
      * Drops children whose whole subtree lies outside the page slice (cheap, order-preserving; keeps paint-order sorting small).
      *
-     * @param list<LayoutBox> $children
      * @return list<LayoutBox>
      */
-    private function childrenTouchingPage(array $children, bool $isFixedContext, float $top, float $bottom): array
+    private function childrenTouchingPage(LayoutBox $box, bool $isFixedContext, float $top, float $bottom): array
     {
+        $children = $box->children;
         if ($isFixedContext || count($children) < 6) {
             return $children;
         }
-        $cull = $this->cull ??= new RenderCull();
-        $out = [];
-        foreach ($children as $child) {
-            [$lo, $hi] = $cull->extent($child);
-            if ($hi >= $top - RenderCull::SLACK && $lo <= $bottom + RenderCull::SLACK) {
-                $out[] = $child;
-            }
-        }
-        return $out;
+        return ($this->cull ??= new RenderCull())->touching($box, $top, $bottom);
     }
 
     /**
@@ -216,6 +209,7 @@ class PdfRenderer
         bool $isFixedContext,
         bool $skipChildren = false
     ): string {
+        \IvoPdf\RenderLimits::tick();
         if ($box->isTextNode()) {
             return '';
         }
@@ -419,10 +413,22 @@ class PdfRenderer
         }
 
         // 7. Render inline LineBoxes belonging to this box
-        foreach ($box->lines as $line) {
+        $lineFrom = 0;
+        $linesOrdered = false;
+        if (!$isFixedContext && count($box->lines) > 48) {
+            [$lineFrom, $linesOrdered] = ($this->cull ??= new RenderCull())->lineStart($box, $visibleVirtualTop);
+        }
+        for ($li = $lineFrom, $lineCount = count($box->lines); $li < $lineCount; $li++) {
+            $line = $box->lines[$li];
             $lineTop = $line->y;
             $lineBottom = $line->y + $line->height;
-            if (!$isFixedContext && ($lineBottom < $visibleVirtualTop - 0.5 || $lineTop > $visibleVirtualBottom + 0.5)) {
+            if (!$isFixedContext && $lineTop > $visibleVirtualBottom + 0.5) {
+                if ($linesOrdered) {
+                    break; // every following line starts even lower
+                }
+                continue;
+            }
+            if (!$isFixedContext && $lineBottom < $visibleVirtualTop - 0.5) {
                 continue;
             }
             $out .= $this->renderLineBox($line, $yShift, $isFixedContext);
@@ -432,7 +438,7 @@ class PdfRenderer
         //    Table sections paint every row background first and the cells afterwards, so row-spanning cells stay visible.
         $isTableSection = in_array($box->getDisplay(), ['table', 'table-row-group', 'table-header-group', 'table-footer-group'], true);
         $deferredRows = [];
-        foreach ($skipChildren ? [] : $this->paintOrder($this->childrenTouchingPage($box->children, $isFixedContext, $visibleVirtualTop, $visibleVirtualBottom)) as $child) {
+        foreach ($skipChildren ? [] : $this->paintOrder($this->childrenTouchingPage($box, $isFixedContext, $visibleVirtualTop, $visibleVirtualBottom)) as $child) {
             if ($isTableSection && $child->getDisplay() === 'table-row') {
                 $out .= $this->renderBoxTree($child, $yShift, $visibleVirtualTop, $visibleVirtualBottom, $isFixedContext, true);
                 $deferredRows[] = $child;

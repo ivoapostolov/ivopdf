@@ -21,6 +21,9 @@ final class PageRefResolver
     /** @var array<int, bool> */
     private array $seen = [];
 
+    /** @var array<int, bool> boxes already walked (an atomic inline box is reachable both as a child and from a line run) */
+    private array $visited = [];
+
     /** @var list<array{0: LayoutBox, 1: LineBox}> */
     private array $lines = [];
 
@@ -43,6 +46,7 @@ final class PageRefResolver
         $this->targets = [];
         $this->lines = [];
         $this->seen = [];
+        $this->visited = [];
         $this->collect($root, $root);
         if ($this->lines === []) {
             return 0;
@@ -72,6 +76,11 @@ final class PageRefResolver
 
     private function collect(LayoutBox $box, LayoutBox $owner): void
     {
+        $oid = spl_object_id($box);
+        if (isset($this->visited[$oid])) {
+            return; // walking it again would double the work at every nesting level of inline-blocks
+        }
+        $this->visited[$oid] = true;
         if ($box->domElement !== null) {
             foreach (['id', 'name'] as $attr) {
                 $v = trim($box->domElement->getAttribute($attr));
@@ -88,8 +97,7 @@ final class PageRefResolver
                     $this->collect($run->inlineBox, $run->inlineBox);
                     continue;
                 }
-                $props = $run->style->all();
-                if (isset($props['ivo-leader']) || isset($props['ivo-pageref'])) {
+                if ($run->style->has('ivo-leader') || $run->style->has('ivo-pageref')) {
                     $has = true;
                 }
             }
@@ -126,14 +134,13 @@ final class PageRefResolver
         for ($i = 0; $i < $n; $i++) {
             $run = $runs[$i];
             $run->x -= $shift;
-            $props = $run->style->all();
-            if (isset($props['ivo-leader'])) {
+            if ($run->style->has('ivo-leader')) {
                 $lastLeader = $i;
             }
-            if (!isset($props['ivo-pageref'])) {
+            if (!$run->style->has('ivo-pageref')) {
                 continue;
             }
-            $page = $this->pageOfTarget((string) $props['ivo-pageref']);
+            $page = $this->pageOfTarget($run->style->get('ivo-pageref'));
             $text = $page !== null ? (string) $page : '';
             $newW = $this->measure($run, $text);
             $diff = $run->width - $newW;
@@ -179,7 +186,7 @@ final class PageRefResolver
     /** Repeats the leader character so that it ends flush (minus a small gap) with the trailing text. */
     private function fillLeader(TextRun $leader, float $tailStart): void
     {
-        $spec = (string) ($leader->style->all()['ivo-leader'] ?? '.');
+        $spec = $leader->style->has('ivo-leader') ? $leader->style->get('ivo-leader') : '.';
         $ch = $spec === 'space' ? "\u{00A0}" : $spec;
         $charW = $this->measure($leader, $ch);
         if ($charW < 0.1) {

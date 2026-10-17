@@ -336,28 +336,7 @@ class TableLayout
      */
     private function readColumnWidths(LayoutBox $table, int $numCols, float $usableWidth): array
     {
-        $widths = [];
-        $dom = $table->domElement;
-        if ($dom === null) {
-            return $widths;
-        }
-        $col = 0;
-        foreach ($dom->getElementsByTagName('col') as $colEl) {
-            if (!$colEl instanceof \DOMElement || $col >= $numCols) {
-                break;
-            }
-            $span = max(1, min(100, (int) ($colEl->getAttribute('span') ?: 1)));
-            $w = trim($colEl->getAttribute('width'));
-            if (preg_match('/(?:^|;)\s*width\s*:\s*([^;]+)/i', $colEl->getAttribute('style'), $sm)) {
-                $w = trim($sm[1]);
-            }
-            for ($k = 0; $k < $span && $col < $numCols; $k++, $col++) {
-                if ($w !== '' && $w !== 'auto') {
-                    $widths[$col] = $this->engine->resolveLength(is_numeric($w) ? $w . 'px' : $w, $usableWidth, $table->fontSizePt);
-                }
-            }
-        }
-        return $widths;
+        return TableMetrics::columnElementWidths($this->engine, $table, $numCols, $usableWidth);
     }
 
     /**
@@ -372,8 +351,8 @@ class TableLayout
                 $explicitWidths[$c] = $w;
             }
         }
-        $minWidths = array_fill(0, $numCols, 15.0);
-        $maxWidths = array_fill(0, $numCols, 20.0);
+        $minWidths = array_fill(0, $numCols, 0.0);
+        $maxWidths = array_fill(0, $numCols, 0.0);
 
         foreach ($cellPlacements as $cp) {
             if ($cp['colSpan'] !== 1) {

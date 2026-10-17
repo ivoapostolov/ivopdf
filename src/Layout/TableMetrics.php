@@ -83,6 +83,37 @@ final class TableMetrics
     }
 
     /**
+     * Reads widths from <colgroup>/<col> elements (width attribute or style).
+     *
+     * @return array<int, float>
+     */
+    public static function columnElementWidths(LayoutEngine $engine, LayoutBox $table, int $numCols, float $usableWidth): array
+    {
+        $widths = [];
+        $dom = $table->domElement;
+        if ($dom === null) {
+            return $widths;
+        }
+        $col = 0;
+        foreach ($dom->getElementsByTagName('col') as $colEl) {
+            if (!$colEl instanceof \DOMElement || $col >= $numCols) {
+                break;
+            }
+            $span = max(1, min(100, (int) ($colEl->getAttribute('span') ?: 1)));
+            $w = trim($colEl->getAttribute('width'));
+            if (preg_match('/(?:^|;)\s*width\s*:\s*([^;]+)/i', $colEl->getAttribute('style'), $sm)) {
+                $w = trim($sm[1]);
+            }
+            for ($k = 0; $k < $span && $col < $numCols; $k++, $col++) {
+                if ($w !== '' && $w !== 'auto') {
+                    $widths[$col] = $engine->resolveLength(is_numeric($w) ? $w . 'px' : $w, $usableWidth, $table->fontSizePt);
+                }
+            }
+        }
+        return $widths;
+    }
+
+    /**
      * Intrinsic min / max border-box width of a table: the sum of its column widths (content based).
      *
      * @return array{min: float, max: float}
@@ -146,6 +177,13 @@ final class TableMetrics
                 if ($mx > $curMax) {
                     $colMax[$c] = ($colMax[$c] ?? 0.0) + ($mx - $curMax) / $cs;
                 }
+            }
+        }
+        // <col width> fixes a column's width (percentages are ignored here: they depend on the table width)
+        foreach (self::columnElementWidths($engine, $table, 100, 0.0) as $c => $cw) {
+            if ($cw > 0.0 && isset($colMax[$c])) {
+                $colMin[$c] = max($colMin[$c] ?? 0.0, $cw);
+                $colMax[$c] = max($colMin[$c], $cw);
             }
         }
         $sumMin = array_sum($colMin);

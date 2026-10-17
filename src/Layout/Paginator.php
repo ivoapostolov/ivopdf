@@ -162,6 +162,7 @@ class Paginator
 
     private function processBox(LayoutBox $box): void
     {
+        \IvoPdf\RenderLimits::tick();
         $this->sync($box);
         if ($this->heightFn === null || $box->isPositionedOutOfFlow() || $box->isTextNode()) {
             $this->processBoxCore($box);
@@ -184,14 +185,23 @@ class Paginator
         }
 
         // Handle explicit page-break-before: always
-        $breakBefore = strtolower($box->style->get('page-break-before', 'auto'));
-        if ($breakBefore === 'always' || $breakBefore === 'page') {
+        $breakBefore = strtolower(trim($box->style->get('page-break-before', 'auto')));
+        $beforeSide = self::breakSide($breakBefore);
+        if ($breakBefore === 'always' || $breakBefore === 'page' || $beforeSide !== null) {
             $curPage = $this->getPageIndexForY($box->y);
             [$pageTop, $pageBottom] = $this->getPageBounds($curPage);
             // A box that merely carries its top margin below the page top is already at the start of the page
             if ($box->y - max(0.0, $box->marginTop) > $pageTop + 1.0) {
-                $delta = $pageBottom - $box->y;
-                $this->pushBoxAndFollowing($box, $delta);
+                $target = $curPage + 1;
+            } else {
+                $target = $curPage;
+            }
+            // left / right / recto / verso: the box must start on a page of that side (page 1 is a right page)
+            if ($beforeSide !== null && $target % 2 !== $beforeSide) {
+                $target++;
+            }
+            if ($target !== $curPage) {
+                $this->pushBoxAndFollowing($box, $this->getPageBounds($target)[0] - $box->y);
             }
         }
 
@@ -219,8 +229,25 @@ class Paginator
         // Check inline lines inside this box so no LineBox is sliced across a page break
         if (!empty($box->lines) && $box->columnFlow === null) {
             $count = count($box->lines);
+            // Lines after a page break owe the break's shift; it is applied when the loop reaches them instead of
+            // re-translating the whole tail at every break (that is quadratic for 20 000 <br>)
+            $carry = 0.0;
+            $applied = -1;
+            $shiftChildren = false;
+            foreach ($box->children as $child) {
+                if (!$child->isPositionedOutOfFlow() && !$child->isInlineLevel()) {
+                    $shiftChildren = true;
+                    break;
+                }
+            }
             for ($i = 0; $i < $count; $i++) {
                 $line = $box->lines[$i];
+                if ($carry !== 0.0 && $i > $applied) {
+                    $line->translate(0.0, $carry);
+                }
+                if ($i > $applied) {
+                    $applied = $i;
+                }
                 $startPage = $this->getPageIndexForY($line->y);
                 [$pageTop, $pageBottom] = $this->getPageBounds($startPage);
 
@@ -231,10 +258,11 @@ class Paginator
                         $line = $box->lines[0];
                     }
                     $delta = $pageBottom - $line->y;
-                    for ($j = $i; $j < $count; $j++) {
+                    for ($j = $i; $j <= $applied; $j++) {
                         $box->lines[$j]->translate(0.0, $delta);
                     }
-                    $this->pushDescendantsAndFollowingBelow($box, $line->y - $delta, $delta);
+                    $carry += $delta;
+                    $this->pushDescendantsAndFollowingBelow($box, $line->y - $delta, $delta, $shiftChildren);
                 }
             }
         }
@@ -260,8 +288,17 @@ class Paginator
         }
 
         // Handle explicit page-break-after: always
-        $breakAfter = strtolower($box->style->get('page-break-after', 'auto'));
-        if ($breakAfter === 'always' || $breakAfter === 'page') {
+        $breakAfter = strtolower(trim($box->style->get('page-break-after', 'auto')));
+        $afterSide = self::breakSide($breakAfter);
+        if ($afterSide !== null) {
+            // The following content starts on the next page of the requested side (an empty page is skipped over if needed)
+            $bottomY = $box->y + $box->height;
+            $target = $this->getPageIndexForY(max($this->topMargin, $bottomY - 0.5)) + 1;
+            if ($target % 2 !== $afterSide) {
+                $target++;
+            }
+            $this->pushFollowingOnly($box, $this->getPageBounds($target)[0] - $bottomY);
+        } elseif ($breakAfter === 'always' || $breakAfter === 'page') {
             $bottomY = $box->y + $box->height;
             $curPage = $this->getPageIndexForY($bottomY);
             [$pageTop, $pageBottom] = $this->getPageBounds($curPage);
@@ -270,6 +307,19 @@ class Paginator
                 $this->pushFollowingOnly($box, $delta);
             }
         }
+    }
+
+    /**
+     * Page side demanded by a `left` / `right` / `recto` / `verso` forced break: 1 = left page (odd 0-based index),
+     * 0 = right page, null = not a side break. Page 1 is a right (recto) page.
+     */
+    private static function breakSide(string $value): ?int
+    {
+        return match ($value) {
+            'left', 'verso' => 1,
+            'right', 'recto' => 0,
+            default => null,
+        };
     }
 
     /**
@@ -426,8 +476,16 @@ class Paginator
         }
 
         // Handle explicit page-break-after on the table itself
-        $breakAfter = strtolower($table->style->get('page-break-after', 'auto'));
-        if ($breakAfter === 'always' || $breakAfter === 'page') {
+        $breakAfter = strtolower(trim($table->style->get('page-break-after', 'auto')));
+        $afterSide = self::breakSide($breakAfter);
+        if ($afterSide !== null) {
+            $bottomY = $table->y + $table->height;
+            $target = $this->getPageIndexForY(max($this->topMargin, $bottomY - 0.5)) + 1;
+            if ($target % 2 !== $afterSide) {
+                $target++;
+            }
+            $this->pushFollowingOnly($table, $this->getPageBounds($target)[0] - $bottomY);
+        } elseif ($breakAfter === 'always' || $breakAfter === 'page') {
             $bottomY = $table->y + $table->height;
             $curPage = $this->getPageIndexForY($bottomY);
             [, $pageBottom] = $this->getPageBounds($curPage);
@@ -586,12 +644,12 @@ class Paginator
         }
     }
 
-    private function pushDescendantsAndFollowingBelow(LayoutBox $box, float $thresholdY, float $delta): void
+    private function pushDescendantsAndFollowingBelow(LayoutBox $box, float $thresholdY, float $delta, bool $shiftChildren = true): void
     {
         if ($delta <= 0.01) {
             return;
         }
-        foreach ($box->children as $child) {
+        foreach ($shiftChildren ? $box->children : [] as $child) {
             // Inline-level children are positioned through the (already shifted) line boxes: never shift them twice
             if (!$child->isPositionedOutOfFlow() && $child->y + $child->pendingDy >= $thresholdY && !($child->isInlineLevel() && !empty($box->lines))) {
                 $child->translate(0.0, $delta);

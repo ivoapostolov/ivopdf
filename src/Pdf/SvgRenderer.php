@@ -28,6 +28,8 @@ class SvgRenderer
 
     private const KAPPA = 0.5522847498;
     private const MAX_USE_DEPTH = 8;
+    /** Elements that may be instantiated through <use> in one SVG (chained groups of <use> grow exponentially) */
+    private const MAX_USE_INSTANCES = 50000;
     private const NUMBER_RE = '[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?';
     private const XLINK_NS = 'http://www.w3.org/1999/xlink';
 
@@ -61,6 +63,22 @@ class SvgRenderer
 
     private ?DOMElement $rootSvg = null;
 
+    /** Remaining <use> instance budget of the SVG being rendered */
+    private int $useBudget = self::MAX_USE_INSTANCES;
+
+    /** @var Closure(string): void|null */
+    private ?Closure $warn = null;
+
+    /**
+     * Receives a message when an SVG had to be truncated (e.g. exponential <use> expansion).
+     *
+     * @param Closure(string): void|null $warn
+     */
+    public function setWarningSink(?Closure $warn): void
+    {
+        $this->warn = $warn;
+    }
+
     /**
      * @param SvgPaintRegistry|null $paints Enables gradients / patterns / masks (PDF objects registered on the document)
      * @param Closure|null $imageResolver fn(string $src): ?array returning ImageLoader::load() data for <image href>
@@ -91,6 +109,7 @@ class SvgRenderer
         }
 
         $this->rootSvg = $svg;
+        $this->useBudget = self::MAX_USE_INSTANCES;
         $this->idMap = [];
         $this->indexIds($svg);
         $this->sink = null;
@@ -333,8 +352,15 @@ class SvgRenderer
      */
     private function renderNode(DOMElement $el, array $state, string &$out): void
     {
+        \IvoPdf\RenderLimits::tick();
         $tag = $this->tagOf($el);
         if (in_array($tag, self::NON_RENDERED, true)) {
+            return;
+        }
+        if ((int) ($state['useDepth'] ?? 0) > 0 && --$this->useBudget < 0) {
+            if ($this->useBudget === -1 && $this->warn !== null) {
+                ($this->warn)('SVG <use> expansion exceeded ' . self::MAX_USE_INSTANCES . ' elements and was truncated.');
+            }
             return;
         }
 

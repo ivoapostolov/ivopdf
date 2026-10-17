@@ -270,6 +270,9 @@ class IvoPdf
             $this->options->basePath = $this->overrideBasePath;
         }
 
+        $fm = $this->fontManager;
+        ComputedStyle::$fontUnitResolver = static fn(string $family, string $weight, string $style): array => $fm->fontRelativeUnits($family, $weight, $style);
+        RenderLimits::begin($this->options); // Options::$maxRenderTime / $maxMemory
         try {
             $cssParser = new CssParser();
             $domBuilder = new DomBuilder($this->options, $cssParser);
@@ -392,6 +395,7 @@ class IvoPdf
                 $totalPages = 0; // no HTML content: output consists of the appended PDF pages only
             }
             for ($p = 0; $p < $totalPages; $p++) {
+                RenderLimits::check();
                 $geo = $plan->box($p, $paginator->getPageName($p));
                 $pageWidth = $geo['w'];
                 $pageHeight = $geo['h'];
@@ -451,6 +455,8 @@ class IvoPdf
             $this->composeApply($pdfDoc, $totalPages); // backgrounds, appended PDF pages, attachments
             $this->renderedPdf = $pdfDoc->compile();
         } finally {
+            RenderLimits::end();
+            ComputedStyle::$fontUnitResolver = null;
             $this->options->basePath = $savedBasePath;
             $this->options->title = $savedTitle;
             $this->options->lang = $savedLang;
@@ -617,33 +623,42 @@ class IvoPdf
             }
 
             $path = null;
+            $bytes = null;
             foreach ($urls as $url) {
-                $path = $this->materializeFontSource(trim($url));
-                if ($path !== null) {
+                [$path, $bytes] = $this->loadFontSource(trim($url));
+                if ($path !== null || $bytes !== null) {
                     break;
                 }
             }
-            if ($path === null) {
+            if ($path === null && $bytes === null) {
                 $this->options->addWarning("@font-face '{$family}': no usable TrueType (.ttf) source found");
                 continue;
             }
-            try {
-                new TtfParser($path);
-            } catch (\Throwable $e) {
-                $this->options->addWarning("@font-face '{$family}': " . $e->getMessage());
-                continue;
-            }
-
             $weight = strtolower(trim($face['font-weight'] ?? 'normal'));
             $style = strtolower(trim($face['font-style'] ?? 'normal'));
             $isBold = $this->fontManager->isBoldWeight($weight);
             $isItalic = $style === 'italic' || $style === 'oblique';
             $variant = $isBold ? ($isItalic ? 'bold_italic' : 'bold') : ($isItalic ? 'italic' : 'regular');
-            $this->fontManager->registerFontVariant($family, $variant, $path);
+            try {
+                if ($bytes !== null) {
+                    // data: URIs and downloaded fonts stay in memory: no temporary file to leak, pre-create or poison
+                    $this->fontManager->registerFontData($family, $variant, $bytes);
+                } else {
+                    new TtfParser((string) $path);
+                    $this->fontManager->registerFontVariant($family, $variant, (string) $path);
+                }
+            } catch (\Throwable $e) {
+                $this->options->addWarning("@font-face '{$family}': " . $e->getMessage());
+            }
         }
     }
 
-    private function materializeFontSource(string $url): ?string
+    /**
+     * Resolves one @font-face url(): an allowed local file path, or the font bytes of a data: / http(s) source.
+     *
+     * @return array{0: ?string, 1: ?string} [local path, bytes]
+     */
+    private function loadFontSource(string $url): array
     {
         $bytes = null;
         if (str_starts_with(strtolower($url), 'data:')) {
@@ -656,16 +671,9 @@ class IvoPdf
         } elseif (preg_match('/^https?:\/\//i', $url)) {
             $bytes = $this->options->fetchSafeRemoteUrl($url);
         } else {
-            return $this->options->resolveAllowedLocalFile($url);
+            return [$this->options->resolveAllowedLocalFile($url), null];
         }
-        if (!is_string($bytes) || strlen($bytes) < 12) {
-            return null;
-        }
-        $file = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'ivopdf-font-' . md5($bytes) . '.ttf';
-        if (!is_file($file) && @file_put_contents($file, $bytes) === false) {
-            return null;
-        }
-        return $file;
+        return is_string($bytes) && strlen($bytes) >= 12 ? [null, $bytes] : [null, null];
     }
 
     /**
@@ -701,17 +709,30 @@ class IvoPdf
     }
 
     /**
-     * Saves the generated PDF to a file on disk.
+     * Saves the generated PDF to a file on disk (missing directories are created).
+     *
+     * @throws RuntimeException when the file cannot be written (without emitting a PHP warning)
      */
     public function save(string $filePath): self
     {
         $pdfBytes = $this->output();
         $dir = dirname($filePath);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0775, true);
+        // Failures are reported through the exception only: PHP's own warnings are swallowed (even by custom error handlers)
+        $reason = '';
+        set_error_handler(static function (int $no, string $msg) use (&$reason): bool {
+            $reason = $msg;
+            return true;
+        });
+        try {
+            if (!is_dir($dir)) {
+                mkdir($dir, 0775, true);
+            }
+            $written = file_put_contents($filePath, $pdfBytes);
+        } finally {
+            restore_error_handler();
         }
-        if (file_put_contents($filePath, $pdfBytes) === false) {
-            throw new RuntimeException("Failed to write PDF file to: {$filePath}");
+        if ($written === false) {
+            throw new RuntimeException("Failed to write PDF file to: {$filePath}" . ($reason !== '' ? " ({$reason})" : ''));
         }
         return $this;
     }
@@ -948,22 +969,34 @@ class IvoPdf
         }
 
         if (isset($pageProps['size'])) {
-            $tokens = preg_split('/\s+/', trim($pageProps['size']), -1, PREG_SPLIT_NO_EMPTY) ?: [];
-            if (count($tokens) === 1) {
-                $t0 = strtolower($tokens[0]);
-                if ($t0 === 'landscape' || $t0 === 'portrait') {
-                    [$pageWidth, $pageHeight] = $this->options->getPageDimensions($this->options->paperSize, $t0);
+            // CSS Paged Media: auto | <length>{1,2} | [ <page-size> || [ portrait | landscape ] ]
+            $tokens = preg_split('/\s+/', strtolower(trim($pageProps['size'])), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $orient = null;
+            $lengths = [];
+            $named = null;
+            $valid = $tokens !== [];
+            foreach ($tokens as $tok) {
+                if ($tok === 'landscape' || $tok === 'portrait') {
+                    $orient = $tok;
+                } elseif ($tok === 'auto') {
+                    continue;
+                } elseif (preg_match('/^(?:\d*\.?\d+)(?:px|pt|mm|cm|in|pc|q|em|rem|ex|ch)?$/', $tok) === 1) {
+                    $lengths[] = $tok;
+                } elseif ($named === null && preg_match('/^[a-z0-9]+$/', $tok) === 1) {
+                    $named = $tok;
                 } else {
-                    [$pageWidth, $pageHeight] = $this->options->getPageDimensions($tokens[0], $this->options->orientation);
+                    $valid = false;
                 }
-            } elseif (count($tokens) >= 2) {
-                $t1 = strtolower($tokens[1]);
-                if ($t1 === 'landscape' || $t1 === 'portrait') {
-                    [$pageWidth, $pageHeight] = $this->options->getPageDimensions($tokens[0], $t1);
-                } else {
-                    $pageWidth = CssUnit::toPt($tokens[0], $pageWidth);
-                    $pageHeight = CssUnit::toPt($tokens[1], $pageHeight);
+            }
+            if ($valid && $lengths !== [] && count($lengths) <= 2 && $named === null) {
+                $w = max(10.0, CssUnit::toPt($lengths[0], $pageWidth));
+                $h = max(10.0, count($lengths) === 2 ? CssUnit::toPt($lengths[1], $pageHeight) : $w); // a single length is a square page
+                if ($orient === 'landscape' && $w < $h || $orient === 'portrait' && $w > $h) {
+                    [$w, $h] = [$h, $w];
                 }
+                [$pageWidth, $pageHeight] = [$w, $h];
+            } elseif ($valid && $lengths === []) {
+                [$pageWidth, $pageHeight] = $this->options->getPageDimensions($named ?? $this->options->paperSize, $orient ?? $this->options->orientation);
             }
         }
 

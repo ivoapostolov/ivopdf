@@ -50,6 +50,12 @@ class CssParser
     private ?array $ruleIndex = null;
     private int $ruleIndexCount = -1;
 
+    /** @var \WeakMap<ComputedStyle, array<string, ComputedStyle>>|null Per parent style: computed style prototypes of its children by tag + attributes */
+    private ?\WeakMap $styleMemo = null;
+    private int $styleMemoRules = -1;
+    /** @var array<int, bool> rule order => the rule's outcome does not depend on the subject's sibling position */
+    private array $positionFreeRules = [];
+
     /** Media viewport (the printable page area) used to evaluate width/height/orientation media features */
     private float $mediaWidthPt = 523.28;
     private float $mediaHeightPt = 769.89;
@@ -483,7 +489,32 @@ class CssParser
      */
     public function computeStyleForElement(DOMElement $el, ComputedStyle $parentStyle): ComputedStyle
     {
+        \IvoPdf\RenderLimits::tick();
         $tag = strtolower($el->tagName);
+
+        // Sibling elements with the same tag and attributes under one parent get the same style unless a selector
+        // looks at their position: the first result is kept as a prototype and cloned (clones share the property
+        // arrays until written to), so 10 000 identical <td>/<br>/<li> cost one cascade and almost no memory.
+        $memoKey = null;
+        if ($el->hasAttribute('dir') || $tag === 'bdi') {
+            // dir=auto reads the element's text
+        } else {
+            if ($this->styleMemoRules !== count($this->rules)) {
+                $this->styleMemo = new \WeakMap();
+                $this->styleMemoRules = count($this->rules);
+            }
+            $memoKey = $tag;
+            if ($el->hasAttributes()) {
+                foreach ($el->attributes as $attr) {
+                    $memoKey .= "\0" . $attr->nodeName . "\1" . $attr->nodeValue;
+                }
+            }
+            $hit = ($this->styleMemo[$parentStyle] ?? [])[$memoKey] ?? null;
+            if ($hit !== null) {
+                return clone $hit;
+            }
+        }
+
         $style = $parentStyle->inheritForElement($tag);
         if ($tag === 'input') {
             \IvoPdf\Layout\FormControls::applyDefaults($style, 'input', $el->getAttribute('type'));
@@ -539,7 +570,49 @@ class CssParser
 
         \IvoPdf\Text\DirAttribute::finish($style, $tag);
 
+        if ($memoKey !== null && $this->rulesIgnorePosition($el)) {
+            $entries = $this->styleMemo[$parentStyle] ?? [];
+            if (count($entries) < 256) {
+                $entries[$memoKey] = clone $style;
+                $this->styleMemo[$parentStyle] = $entries;
+            }
+        }
+
         return $style;
+    }
+
+    /**
+     * True when no rule that can apply to $el depends on the element's position among its siblings (sibling
+     * combinators, structural pseudo-classes on the subject), i.e. identical siblings always get identical styles.
+     */
+    private function rulesIgnorePosition(DOMElement $el): bool
+    {
+        foreach ($this->candidateRules($el) as $rule) {
+            $order = $rule['order'];
+            if (!isset($this->positionFreeRules[$order])) {
+                $free = true;
+                foreach ($rule['compiled'] as $i => $part) {
+                    if ($i % 2 === 1) {
+                        if ($part === '+' || $part === '~') {
+                            $free = false;
+                            break;
+                        }
+                    } elseif ($i === count($rule['compiled']) - 1) {
+                        foreach ($part['pseudos'] as [$name]) {
+                            if (!in_array($name, self::NEVER_MATCHING_PSEUDOS, true)) {
+                                $free = false;
+                                break 2;
+                            }
+                        }
+                    }
+                }
+                $this->positionFreeRules[$order] = $free;
+            }
+            if (!$this->positionFreeRules[$order]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -693,6 +766,10 @@ class CssParser
                 if ($tag === 'table' && $align === 'center') {
                     $style->set('margin-left', 'auto');
                     $style->set('margin-right', 'auto');
+                } elseif ($tag === 'table' && ($align === 'left' || $align === 'right')) {
+                    $style->set('float', $align); // like browsers: a legacy aligned table floats
+                } elseif ($align !== 'justify' && !in_array($tag, ['td', 'th', 'tr', 'thead', 'tbody', 'tfoot', 'caption', 'col', 'colgroup', 'img'], true)) {
+                    $style->set('text-align', '-webkit-' . $align); // block-level align=: also moves shrink-wrapped children (tables)
                 } else {
                     $style->set('text-align', $align);
                 }
