@@ -350,7 +350,7 @@ if ($nirmala) {
     $html = '<p style="font-family:Nirmala;font-size:20pt">हिन्दी क्षत्रिय र्क कर्म धर्म स्त्री द्वारा कि की</p>';
     $p = render($html, [], $registerAll);
     $pdfData = $p->output();
-    check('Indic runs carry /ActualText with the logical text', str_contains($pdfData, '/ActualText <FEFF0939093F0928094D09260940>'));
+    check('Indic runs carry /ActualText with the logical text', preg_match('~/ActualText <FEFF0939093F0928094D09260940(0020)?>~', $pdfData) === 1);
     check('no missing-font warning when the font covers the script', $p->getWarnings() === [], implode('; ', $p->getWarnings()));
 
     $py = trim((string) @shell_exec('python -c "import pymupdf as fitz; print(1)" 2>NUL'));

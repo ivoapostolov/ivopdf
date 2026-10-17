@@ -596,16 +596,13 @@ class PdfRenderer
             || $next->isWhitespace || $next->text === '' || strtolower($space->style->get('text-decoration', 'none')) !== 'none') {
             return false;
         }
-        $run = $line->runs[$runIdx];
         if ($this->bidiSpaceOwner($line, $runIdx + 1) !== null) {
             return false; // a space next to right-to-left text is drawn on its own (see bidiSpaceOwner())
         }
-        if (preg_match('/\p{S}$/u', $run->text) === 1 || preg_match('/^\p{S}/u', $next->text) === 1 || $next->actualText !== null
-            || ($next->glyphs !== null && in_array(0, array_column($next->glyphs, 0), true)) || $this->fontManager->hasMissingGlyphs($ttf, $run->text)) {
-            return true;
-        }
-        $nextTtf = $this->fontManager->resolveFont($next->style->get('font-family', 'DejaVu Sans'), $next->style->get('font-weight', 'normal'), $next->style->get('font-style', 'normal'));
-        return $nextTtf !== $ttf || $this->fontManager->hasMissingGlyphs($nextTtf, $next->text);
+        // Every inter-word space that is not drawn as part of a run (justified lines, letter- / word-spacing, style
+        // changes, fallback fonts) is written as a real space glyph after the word: extractors that only read the
+        // text operators (smalot/pdfparser, pypdf) otherwise glue the words together
+        return true;
     }
 
     /**
@@ -879,7 +876,18 @@ class PdfRenderer
                 }
             }
             if ($showOps !== '' && $spaceAfter && $ttf->getGlyphId(0x20) !== 0) {
-                $showOps .= ' <' . $this->fontManager->encodeTextToHexGids($ttf, ' ') . '> Tj';
+                // A space glyph (no ink) shown with the word itself: the next run is positioned on its own, so nothing
+                // visible moves. Keeping it inside the word's own string matters for extractors that estimate a string's
+                // width from its character count (smalot): a separate one-character Tj makes the gap to the next word
+                // look like a tab
+                $spaceHex = $this->fontManager->encodeTextToHexGids($ttf, ' ');
+                if (preg_match('/^(.*)> Tj$/s', $showOps, $m) === 1 && !str_contains($m[1], 'Tj')) {
+                    $showOps = $m[1] . $spaceHex . '> Tj';
+                } elseif (preg_match('/^(.*)\] TJ$/s', $showOps, $m) === 1 && !str_contains($m[1], 'TJ')) {
+                    $showOps = $m[1] . ' <' . $spaceHex . '>] TJ';
+                } else {
+                    $showOps .= ' <' . $spaceHex . '> Tj';
+                }
             }
             if ($showOps !== '' && $text === $run->text) {
                 // spaces beside right-to-left text are shown with the run that has their direction (bidiSpaceOwner())
