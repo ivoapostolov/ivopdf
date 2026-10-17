@@ -81,6 +81,9 @@ class IvoPdf
 
     public function __get(string $name): mixed
     {
+        if ($name === 'page') {
+            return $this->PageNo(); // mPDF: the current page number
+        }
         return $name === 'useActiveForms' ? $this->options->formFields : ($this->options->compat[$name] ?? null);
     }
 
@@ -162,6 +165,9 @@ class IvoPdf
      */
     public function loadHtmlFile(string $filePath): self
     {
+        if (Options::isNetworkPath($filePath)) {
+            throw new RuntimeException("Network / non-local path refused (UNC, protocol-relative or stream wrapper): {$filePath}");
+        }
         if (!empty($this->options->allowedPaths) || $this->options->basePath !== null) {
             $safe = $this->options->resolveAllowedLocalFile($filePath);
             if ($safe === null) {
@@ -238,12 +244,15 @@ class IvoPdf
     }
 
     /**
-     * Registers a custom TrueType (.ttf) font family.
+     * Registers a custom TrueType / OpenType font family ("file.ttc#n" selects a face of a collection). Missing bold /
+     * italic files are synthesized at render time (emboldened / slanted regular face), as browsers do.
      *
      * @param array{regular: string, bold?: string, italic?: string, bold_italic?: string} $variants
+     * @throws \InvalidArgumentException when a file does not exist / is not readable (or is a UNC / stream-wrapper path)
      */
     public function registerFontFamily(string $familyName, array $variants): self
     {
+        $this->fontManager->assertFontFiles($familyName, $variants);
         $this->fontManager->registerFamily($familyName, $variants);
         $this->renderedPdf = null;
         return $this;
@@ -259,6 +268,7 @@ class IvoPdf
         $this->fontManager->resetUsedFonts();
         $this->imageLoader->reset();
         $this->options->clearWarnings();
+        $this->options->getMaxMemoryBytes(); // reports a unit mistake in maxMemory again (render() read the budget before)
         foreach (array_reverse($this->options->fallbackFonts) as $fallbackFamily) {
             $this->fontManager->addFallbackFamily($fallbackFamily);
         }
@@ -465,6 +475,8 @@ class IvoPdf
 
             $this->composeApply($pdfDoc, $totalPages); // backgrounds, appended PDF pages, attachments
             $this->renderedPdf = $pdfDoc->compile();
+            // The decoded images are in the PDF now: only the layout tree (getLayoutTree()) stays after output()
+            $this->imageLoader->reset();
         } finally {
             RenderLimits::end();
             ComputedStyle::$fontUnitResolver = null;
@@ -678,6 +690,7 @@ class IvoPdf
     private function loadFontSource(string $url): array
     {
         $bytes = null;
+        $url = Options::normalizeProtocolRelativeUrl($url); // //host/f.ttf is remote, never a UNC path
         if (str_starts_with(strtolower($url), 'data:')) {
             $comma = strpos($url, ',');
             if ($comma !== false) {
@@ -855,10 +868,14 @@ class IvoPdf
      * @param list<string> $permissions allowed operations: print, modify, copy, annotate (annot-forms), fill-forms,
      *                                  extract, assemble, print-high (print-highres) or 'all'; others are denied
      * @param string|int $method 'aes256' (default), 'aes128', 'rc4' (RC4-128); mPDF key lengths 40/128 => rc4, 256 => aes256
+     *                          ('aes128' / 'rc4' convert passwords to PDFDocEncoding and refuse e.g. Cyrillic ones)
      */
     public function setProtection(array $permissions = ['print', 'copy'], string $userPassword = '', ?string $ownerPassword = null, string|int $method = 'aes256'): self
     {
-        PdfEncryption::normalizeMethod($method); // validate early
+        if (PdfEncryption::normalizeMethod($method) !== 'aes256') { // validate early
+            PdfEncryption::legacyPasswordBytes($userPassword);
+            PdfEncryption::legacyPasswordBytes((string) $ownerPassword);
+        }
         PdfEncryption::permissionValue($permissions);
         $this->options->encryption = [
             'permissions' => array_values($permissions),

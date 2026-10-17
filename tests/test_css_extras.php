@@ -245,7 +245,8 @@ check('grid item height: 50% of its grid area', abs(byId($pdf, 'gi')->height - 5
 check('aspect-ratio: 2/1 derives the height', abs(byId($pdf, 'ar')->height - 100.0) < 0.5, (string) byId($pdf, 'ar')->height);
 check('aspect-ratio with content-box sizing', abs(byId($pdf, 'ar2')->height - (90.0 / 1.5 + 10.0)) < 0.5, (string) byId($pdf, 'ar2')->height);
 [$pdf] = renderPdf('<div id="b1" style="width:100pt">Averyveryverylongwordwithoutbreaks here</div><div id="b2" style="width:100pt;word-break:break-all">abcdefghij klmnopqrstuvwxyz</div><div id="b3" style="width:100pt;overflow-wrap:anywhere">Averyveryverylongwordwithoutbreaks</div>');
-check('overflow-wrap / long words break', count(lineTexts(byId($pdf, 'b1'))) >= 3 && count(lineTexts(byId($pdf, 'b3'))) >= 2);
+// overflow-wrap: normal (b1): the long word overflows its box on its own line, as in browsers; anywhere (b3) breaks it
+check('overflow-wrap / long words break', count(lineTexts(byId($pdf, 'b1'))) === 2 && count(lineTexts(byId($pdf, 'b3'))) >= 2);
 $bl = lineTexts(byId($pdf, 'b2'));
 check('word-break: break-all fills lines mid-word', count($bl) >= 2 && mb_strlen($bl[0]) >= 12, implode('|', $bl));
 $imgSmall = dataUri($redPng, 'image/png');

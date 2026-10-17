@@ -31,6 +31,11 @@ final class Options
     public function __construct(?array $attributes = null)
     {
         $this->v['tempDir'] = sys_get_temp_dir();
+        // dompdf's defaults: rootDir = the library, fontDir / fontCache = its font folder (here: the bundled TTF fonts,
+        // read-only - IvoPDF never writes font caches there)
+        $this->v['rootDir'] = dirname(__DIR__, 3);
+        $this->v['fontDir'] = $this->v['rootDir'] . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'fonts';
+        $this->v['fontCache'] = $this->v['fontDir'];
         if ($attributes !== null) {
             $this->set($attributes);
         }

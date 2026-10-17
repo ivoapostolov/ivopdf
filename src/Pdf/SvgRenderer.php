@@ -1873,11 +1873,19 @@ class SvgRenderer
         if ($root->hasAttribute('id')) {
             $this->idMap[$root->getAttribute('id')] = $root;
         }
-        foreach ($root->getElementsByTagName('*') as $el) {
+        // Cursor walk in document order: iterating getElementsByTagName('*') is quadratic before PHP 8.3
+        $el = $root->firstElementChild;
+        while ($el !== null) {
             $id = $el->getAttribute('id');
             if ($id !== '' && !isset($this->idMap[$id])) {
                 $this->idMap[$id] = $el;
             }
+            $next = $el->firstElementChild;
+            while ($next === null && $el !== null && $el !== $root) {
+                $next = $el->nextElementSibling;
+                $el = $next === null ? $el->parentNode : $el;
+            }
+            $el = $next;
         }
     }
 

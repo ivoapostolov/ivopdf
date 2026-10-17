@@ -31,6 +31,18 @@ final class Dompdf
     private bool $dirtyInput = true;
     /** @var list<string> */
     private array $warnings = [];
+    /** @var array<string, list<callable>> setCallbacks(): event => callables */
+    private array $callbacks = [];
+    /** @var resource|array<string, mixed>|null */
+    private $httpContext = null;
+    private ?\DOMDocument $dom = null;
+    private bool $quirksmode = false;
+    private string $protocol = '';
+    private string $baseHost = '';
+    /** @var array<string, true> callback events already reported as unsupported */
+    private array $reportedEvents = [];
+    /** @var list<string> warnings raised before the next render */
+    private array $pendingWarnings = [];
 
     /** @param Options|array<string, mixed>|null $options */
     public function __construct($options = null)
@@ -38,6 +50,7 @@ final class Dompdf
         $this->options = $options instanceof Options ? $options : new Options(is_array($options) ? $options : null);
         $this->fontMetrics = new FontMetrics($this->options);
         $this->canvas = new Canvas($this->fontMetrics);
+        $this->canvas->bindDompdf($this);
         $this->syncCanvasSize();
     }
 
@@ -81,6 +94,7 @@ final class Dompdf
             $str = mb_convert_encoding($str, 'UTF-8', $encoding);
         }
         $this->html = $str;
+        $this->dom = null;
         $this->dirtyInput = true;
     }
 
@@ -91,9 +105,14 @@ final class Dompdf
 
     public function loadHtmlFile(string $file, ?string $encoding = null): void
     {
+        $file = \IvoPdf\Options::normalizeProtocolRelativeUrl($file); // //host/page.html is a remote URL
         $isUrl = preg_match('~^https?://~i', $file) === 1;
         if ($isUrl) {
-            $content = $this->options->isRemoteEnabled() ? @file_get_contents($file) : false;
+            // same SSRF guard (private / reserved addresses, size limit, DNS pinning) as every other remote resource
+            $fetched = $this->options->isRemoteEnabled() ? (new \IvoPdf\Options(['isRemoteEnabled' => true]))->fetchSafeRemoteUrl($file) : null;
+            $content = $fetched ?? false;
+        } elseif (\IvoPdf\Options::isNetworkPath($file)) {
+            throw new \Exception('File \'' . $file . '\' refused: UNC / network and stream-wrapper paths are not read.');
         } else {
             $chroot = $this->options->getChrootList();
             $real = realpath($file);
@@ -178,22 +197,252 @@ final class Dompdf
     /** Accepted for compatibility (protocol / host only matter for relative remote URLs). */
     public function setProtocol(string $protocol): self
     {
+        $this->protocol = $protocol;
         return $this;
     }
 
     public function setBaseHost(string $host): self
     {
+        $this->baseHost = $host;
         return $this;
     }
 
-    public function setHttpContext($context): self
+    /**
+     * Stored (getHttpContext()); remote resources are fetched by IvoPDF's own SSRF-guarded client (TLS verification,
+     * private / reserved addresses blocked, size limit), so a custom stream context is not applied.
+     *
+     * @param resource|array<string, mixed>|null $httpContext
+     */
+    public function setHttpContext($httpContext): self
     {
+        $this->httpContext = $httpContext;
         return $this;
     }
 
+    /** @return resource|array<string, mixed>|null */
+    public function getHttpContext()
+    {
+        return $this->httpContext;
+    }
+
+    /** @param resource|array<string, mixed>|null $httpContext */
+    public function set_http_context($httpContext): self
+    {
+        return $this->setHttpContext($httpContext);
+    }
+
+    /** @return resource|array<string, mixed>|null */
+    public function get_http_context()
+    {
+        return $this->httpContext;
+    }
+
+    /**
+     * dompdf callbacks: a list of ['event' => name, 'f' => callable]. Supported events:
+     *  - `end_document`: f($pageNumber, $pageCount, $canvas, $fontMetrics) for every page after rendering (= page_script())
+     *  - `end_page_render`: f($frame, $canvas, $fontMetrics) for every page, drawn above the page content
+     *  - `begin_page_render`: f($frame, $canvas, $fontMetrics) for every page, drawn below the page content
+     * For the page events `$frame` is null (IvoPDF has no dompdf frame tree), `$canvas->get_page_number()` is the page.
+     * `begin_frame`, `end_frame` and `begin_page_reflow` (per-frame layout hooks) are kept in getCallbacks() but never
+     * called (one warning per event).
+     *
+     * @param list<array{event?: string, f?: callable}> $callbacks
+     */
     public function setCallbacks(array $callbacks): self
     {
+        $this->callbacks = [];
+        foreach ($callbacks as $c) {
+            if (is_array($c) && isset($c['event'], $c['f']) && is_string($c['event']) && is_callable($c['f'])) {
+                $this->callbacks[$c['event']][] = $c['f'];
+            }
+        }
+        $this->dirtyInput = true;
         return $this;
+    }
+
+    /** @return array<string, list<callable>> event => callables */
+    public function getCallbacks(): array
+    {
+        return $this->callbacks;
+    }
+
+    /** @param list<array{event?: string, f?: callable}> $callbacks */
+    public function set_callbacks($callbacks): self
+    {
+        return $this->setCallbacks((array) $callbacks);
+    }
+
+    /** @return array<string, list<callable>> */
+    public function get_callbacks(): array
+    {
+        return $this->callbacks;
+    }
+
+    /**
+     * The loaded document as a DOMDocument (parsed like the engine parses it: HTML5 on PHP 8.4+, libxml's HTML parser
+     * below). Changes made to it are not rendered; use setDom() / loadDOM() to render a modified tree.
+     */
+    public function getDom(): \DOMDocument
+    {
+        if ($this->dom === null) {
+            $this->dom = \IvoPdf\Dom\Html5Parser::parse($this->html) ?? \IvoPdf\Dom\Html5Parser::parseLegacy($this->html);
+            foreach ((new \DOMXPath($this->dom))->query('//*[@id]') ?: [] as $el) {
+                if ($el instanceof \DOMElement) {
+                    $el->setIdAttribute('id', true); // getElementById() works as on dompdf's DOM
+                }
+            }
+        }
+        return $this->dom;
+    }
+
+    public function get_dom(): \DOMDocument
+    {
+        return $this->getDom();
+    }
+
+    /** Renders the given DOM tree (it is serialized to HTML and laid out by the engine). */
+    public function setDom(\DOMDocument $dom): self
+    {
+        $this->loadDOM($dom);
+        return $this;
+    }
+
+    /** dompdf loadDOM(): renders a DOMDocument built by the application. */
+    public function loadDOM($doc, $quirksmode = false): void
+    {
+        if (!$doc instanceof \DOMDocument) {
+            throw new \InvalidArgumentException('loadDOM() expects a DOMDocument');
+        }
+        $this->html = (string) $doc->saveHTML();
+        $this->dom = $doc;
+        $this->quirksmode = (bool) $quirksmode;
+        $this->dirtyInput = true;
+    }
+
+    /**
+     * dompdf returns its frame tree; IvoPDF has none and returns the engine's layout tree instead (the root
+     * IvoPdf\Layout\LayoutBox of the last render(), null before).
+     */
+    public function getTree(): ?\IvoPdf\Layout\LayoutBox
+    {
+        return $this->engine?->getLayoutTree();
+    }
+
+    public function get_tree(): ?\IvoPdf\Layout\LayoutBox
+    {
+        return $this->getTree();
+    }
+
+    /** Always false unless loadDOM() said otherwise: documents are parsed in standards mode (as dompdf's HTML5 parser does). */
+    public function getQuirksmode(): bool
+    {
+        return $this->quirksmode;
+    }
+
+    public function get_quirksmode(): bool
+    {
+        return $this->quirksmode;
+    }
+
+    /** dompdf set_options(array): applies option values to a copy of the current options. */
+    public function set_options(array $options): self
+    {
+        $new = clone $this->options;
+        $new->set($options);
+        return $this->setOptions($new);
+    }
+
+    /**
+     * Initial view of the viewer: 'Fit' / 'FitB' (whole page), 'FitH' / 'FitBH' (page width), 'XYZ' with
+     * [left, top, zoom] (zoom 1 = 100 %).
+     *
+     * @param array<int, mixed> $options
+     */
+    public function setDefaultView($defaultView, $options = []): self
+    {
+        $this->canvas->set_default_view($defaultView, (array) $options);
+        return $this;
+    }
+
+    /** @param array<int, mixed> $options */
+    public function set_default_view($defaultView, $options = []): self
+    {
+        return $this->setDefaultView($defaultView, $options);
+    }
+
+    /** dompdf caches parsed documents; IvoPDF renders from scratch (accepted and ignored). */
+    public function enableCaching($cacheId): void
+    {
+    }
+
+    public function enable_caching($cacheId): void
+    {
+    }
+
+    public function set_protocol(string $protocol): self
+    {
+        return $this->setProtocol($protocol);
+    }
+
+    public function get_protocol(): string
+    {
+        return $this->protocol;
+    }
+
+    public function set_host(string $host): self
+    {
+        return $this->setBaseHost($host);
+    }
+
+    public function get_host(): string
+    {
+        return $this->baseHost;
+    }
+
+    public function get_base_path(): ?string
+    {
+        return $this->basePath;
+    }
+
+    public function output_html(): string
+    {
+        return $this->outputHtml();
+    }
+
+    /** dompdf: parses a "dompdf.view" value ('Fit', 'FitH 0', 'XYZ 0 0 1.5') and makes it the initial view; false when invalid. */
+    public function parseDefaultView($value): bool
+    {
+        $parts = preg_split('/\s+/', trim((string) $value), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $view = array_shift($parts);
+        if ($view === null || !in_array(strtolower($view), ['xyz', 'fit', 'fith', 'fitv', 'fitr', 'fitb', 'fitbh', 'fitbv'], true)) {
+            return false;
+        }
+        $this->setDefaultView($view, $parts);
+        return true;
+    }
+
+    public function parse_default_view($value): bool
+    {
+        return $this->parseDefaultView($value);
+    }
+
+    /** Replaces the canvas (its page size follows the paper). */
+    public function setCanvas(Canvas $canvas): self
+    {
+        $this->canvas = $canvas;
+        $canvas->bindDompdf($this);
+        $this->syncCanvasSize();
+        return $this;
+    }
+
+    public function getProtocol(): string
+    {
+        return $this->protocol;
+    }
+
+    public function getBaseHost(): string
+    {
+        return $this->baseHost;
     }
 
     public function set_option(string $key, mixed $value): self
@@ -228,6 +477,10 @@ final class Dompdf
     /** Non-fatal problems of the last render (missing images, ignored PHP scripts, ...). */
     public function getWarnings(): array
     {
+        // canvas calls made after render() (unsupported CPDF methods) report here without forcing a re-render
+        foreach ($this->canvas->takeWarnings() as $warning) {
+            $this->warnings[] = $warning;
+        }
         return $this->warnings;
     }
 
@@ -235,6 +488,22 @@ final class Dompdf
     public function getEngine(): ?IvoPdf
     {
         return $this->engine;
+    }
+
+    /**
+     * Methods of dompdf's API that IvoPDF does not implement (setCss(), getCss(), setTree(), ...) do nothing, return null
+     * and add one warning per method to getWarnings() instead of failing with a fatal "undefined method" Error.
+     *
+     * @param list<mixed> $args
+     */
+    public function __call(string $method, array $args): mixed
+    {
+        if (!isset($this->reportedEvents['method:' . $method])) {
+            $this->reportedEvents['method:' . $method] = true;
+            $this->warnings[] = "Dompdf::{$method}() is not supported by IvoPDF and was ignored.";
+            $this->pendingWarnings[] = "Dompdf::{$method}() is not supported by IvoPDF and was ignored.";
+        }
+        return null;
     }
 
     public function render(): void
@@ -279,8 +548,10 @@ final class Dompdf
         FontMetrics::applyRegistered($engine->getFontManager());
         [$w, $h] = $this->pageSize();
         $engine->setPaper($this->paper ?? $this->options->getDefaultPaperSize(), $this->paper === null ? $this->options->getDefaultPaperOrientation() : $this->orientation);
-        $engine->loadHtml($this->html, $this->basePath);
-        foreach ($this->info as $label => $value) {
+        $canvas = $this->canvas;
+        // Canvas::new_page(): empty pages after the document
+        $engine->loadHtml(self::withExtraPages($this->html, $canvas->extraPages()), $this->basePath);
+        foreach ([...$this->info, ...$canvas->infoEntries()] as $label => $value) {
             match ($label) {
                 'title' => $engine->SetTitle($value),
                 'author' => $engine->SetAuthor($value),
@@ -290,22 +561,103 @@ final class Dompdf
                 default => null,
             };
         }
-        $canvas = $this->canvas;
+        if ($canvas->javascriptCode() !== '') {
+            $engine->SetJS($canvas->javascriptCode());
+        }
+        if (($view = $canvas->defaultView()) !== null) {
+            $engine->SetDisplayMode(self::zoomOf($view[0], $view[1]), 'default');
+        }
+        $this->applyCallbacks();
         if ($canvas->hasContent()) {
-            $engine->setPageOverlay(static fn(int $pageNumber, int $pageCount, float $pw, float $ph): string => $canvas->renderPage($pageNumber, $pageCount, $pw, $ph));
+            $engine->setPageOverlay(static fn(int $pageNumber, int $pageCount, float $pw, float $ph): string
+                => $canvas->renderPage($pageNumber, $pageCount, $pw, $ph, true) . $canvas->renderPage($pageNumber, $pageCount, $pw, $ph));
         }
         $engine->render();
         $this->engine = $engine;
         $this->warnings = $engine->getWarnings();
-        foreach ($canvas->takeWarnings() as $warning) {
+        foreach ([...$this->pendingWarnings, ...$canvas->takeWarnings()] as $warning) {
             $engine->getOptions()->addWarning($warning);
         }
+        $this->pendingWarnings = [];
         $this->warnings = $engine->getWarnings();
         $canvas->setPageSize($w, $h);
         $canvas->setPageCount($engine->getPageCount());
         $this->renderedVersion = $canvas->version();
         $this->renderedCompress = $compress;
         $this->dirtyInput = false;
+    }
+
+    /** Appends $n empty pages (Canvas::new_page()) before </body>. */
+    private static function withExtraPages(string $html, int $n): string
+    {
+        if ($n <= 0) {
+            return $html;
+        }
+        $pages = str_repeat('<div style="page-break-before:always;height:1pt;margin:0;padding:0"></div>', $n);
+        $pos = strripos($html, '</body');
+        return $pos === false ? $html . $pages : substr($html, 0, $pos) . $pages . substr($html, $pos);
+    }
+
+    /** Hands the callbacks set with setCallbacks() to the canvas for this render. */
+    private function applyCallbacks(): void
+    {
+        $over = [];
+        $under = [];
+        foreach ($this->callbacks as $event => $fs) {
+            foreach ($fs as $f) {
+                if ($event === 'end_document') {
+                    $over[] = $f;
+                } elseif ($event === 'end_page_render' || $event === 'begin_page_render') {
+                    if (!self::acceptsNull($f)) {
+                        $this->reportEvent($event, 'the callback requires a dompdf Frame as first argument, which IvoPDF cannot provide (declare it nullable, e.g. ?Frame $frame)');
+                        continue;
+                    }
+                    $page = static fn(int $pageNumber, int $pageCount, Canvas $canvas, FontMetrics $fontMetrics) => $f(null, $canvas, $fontMetrics);
+                    if ($event === 'end_page_render') {
+                        $over[] = $page;
+                    } else {
+                        $under[] = $page;
+                    }
+                } else {
+                    $this->reportEvent($event, 'IvoPDF has no dompdf frame tree, so per-frame / reflow events are not raised');
+                }
+            }
+        }
+        $this->canvas->setRenderCallbacks($over, $under);
+    }
+
+    private function reportEvent(string $event, string $why): void
+    {
+        if (!isset($this->reportedEvents[$event])) {
+            $this->reportedEvents[$event] = true;
+            $this->pendingWarnings[] = "Dompdf callback event '{$event}' is not supported: {$why}.";
+        }
+    }
+
+    /** True when the callable can be called with null as first argument (untyped, mixed, nullable or no parameter). */
+    private static function acceptsNull(callable $f): bool
+    {
+        try {
+            $r = is_array($f) ? new \ReflectionMethod($f[0], (string) $f[1])
+                : (is_object($f) && !$f instanceof \Closure ? new \ReflectionMethod($f, '__invoke') : new \ReflectionFunction(\Closure::fromCallable($f)));
+        } catch (\ReflectionException) {
+            return true;
+        }
+        $first = $r->getParameters()[0] ?? null;
+        return $first === null || !$first->hasType() || ($first->getType()?->allowsNull() ?? true);
+    }
+
+    /** @param list<mixed> $options */
+    private static function zoomOf(string $view, array $options): string
+    {
+        $v = strtolower($view);
+        if (in_array($v, ['fith', 'fitbh', 'fitr'], true)) {
+            return 'fullwidth';
+        }
+        if ($v === 'xyz' && isset($options[2]) && is_numeric($options[2]) && (float) $options[2] > 0) {
+            return (string) round((float) $options[2] * 100);
+        }
+        return 'fullpage';
     }
 
     /** @return array<string, mixed> IvoPDF constructor settings derived from the dompdf options */

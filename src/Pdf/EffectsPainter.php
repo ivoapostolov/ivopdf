@@ -103,7 +103,8 @@ final class EffectsPainter
         foreach (array_reverse($shadows) as $sh) {
             $built .= $this->shadowCopies($segment, $sh);
         }
-        return substr($out, 0, $at) . $built . $segment;
+        // The copies are decoration: marked as an artifact so that text extraction / search / copy see the text once
+        return substr($out, 0, $at) . "/Artifact << /ActualText <FEFF> >> BDC\n" . $built . "EMC\n" . $segment;
     }
 
     /**
@@ -114,7 +115,11 @@ final class EffectsPainter
         $color = $sh['color'];
         $alpha = $color !== null ? $color[3] : 1.0;
         $recolored = $color !== null
-            ? (string) preg_replace('/(?<![\d.])(?:-?[\d.]+ -?[\d.]+ -?[\d.]+ -?[\d.]+ k|-?[\d.]+ -?[\d.]+ -?[\d.]+ rg|\/Sp\d+ cs -?[\d.]+ scn)(?![\w])/', ColorOps::fillOp($color), $segment)
+            ? (string) preg_replace(
+                '/(?<![\d.])(?:-?[\d.]+ -?[\d.]+ -?[\d.]+ -?[\d.]+ K|-?[\d.]+ -?[\d.]+ -?[\d.]+ RG|\/Sp\d+ CS -?[\d.]+ SCN)(?![\w])/',
+                ColorOps::strokeOp($color), // synthetic bold strokes the glyphs: the shadow outline takes the shadow colour too
+                (string) preg_replace('/(?<![\d.])(?:-?[\d.]+ -?[\d.]+ -?[\d.]+ -?[\d.]+ k|-?[\d.]+ -?[\d.]+ -?[\d.]+ rg|\/Sp\d+ cs -?[\d.]+ scn)(?![\w])/', ColorOps::fillOp($color), $segment)
+            )
             : $segment;
         // Own alpha guards inside the segment would override ours; drop them
         $recolored = (string) preg_replace('/q \/GS\d+ gs /', 'q ', $recolored);

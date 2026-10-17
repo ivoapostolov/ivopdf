@@ -411,7 +411,7 @@ check('a 5 MB unbroken word (default guard): peak memory below 400 MB', $mb < 40
 check('... and below 40 s', $secs < 40.0, "{$secs} s");
 $parts = explode(' ', $res);
 check('... with the guard warning', ($parts[2] ?? '0') === '1', $res);
-$short = render('<div style="width:200pt;font-size:10pt">' . str_repeat('W', 200) . '</div>');
+$short = render('<div style="width:200pt;font-size:10pt;overflow-wrap:anywhere">' . str_repeat('W', 200) . '</div>');
 $tree = $short->getLayoutTree();
 check('forced character breaking still wraps a long word inside its box', $short->getPageCount() === 1 && $short->getWarnings() === []);
 if ($has) {

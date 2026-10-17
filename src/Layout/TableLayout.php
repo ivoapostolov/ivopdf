@@ -163,6 +163,16 @@ class TableLayout
             return $captionHeight + $bottomCaptionHeight;
         }
 
+        // Collapsed borders: the table's outer border is the widest of its own border and the outer cells' borders
+        // (CSS 2.1 17.6.2); like browsers, the table box holds all of it, so the grid starts half of it inside
+        $outer = null;
+        if ($borderCollapse) {
+            $outer = TableMetrics::collapsedOuterBorders($this->engine, $table, $cellPlacements, $numRows, $numCols, $contentWidth);
+            $contentX += ($outer['left'] - $table->borderLeft) / 2.0;
+            $contentY += ($outer['top'] - $table->borderTop) / 2.0;
+            $contentWidth = max(0.0, $contentWidth - ($outer['left'] - $table->borderLeft + $outer['right'] - $table->borderRight) / 2.0);
+        }
+
         // Resolve column widths
         // Separated borders: border-spacing between the columns and between the outer columns and the table edge
         $totalHorizontalSpacing = ($numCols + 1) * $spacingPt;
@@ -170,15 +180,23 @@ class TableLayout
         $colElementWidths = $this->readColumnWidths($table, $numCols, $usableWidth);
         $colWidths = TableMetrics::isFixed($table)
             ? TableMetrics::fixedColumnWidths($this->engine, $cellPlacements, $numCols, $usableWidth, $colElementWidths)
-            : $this->calculateColumnWidths($cellPlacements, $numCols, $usableWidth, $colElementWidths);
+            : $this->calculateColumnWidths($cellPlacements, $numCols, $usableWidth, $colElementWidths, $borderCollapse);
 
         // mPDF shrink_tables_to_fit: scale the content down (up to 1/factor) when the minimum content width overflows
         if (!TableMetrics::isFixed($table)) {
             $shrinkFactor = TableShrink::factorFor($table, $this->engine->getOptions()->shrinkTablesToFit);
             for ($pass = 0; $shrinkFactor > 1.0 && $pass < 3
                 && TableShrink::shrink($table, $this->lastRequiredWidth, $usableWidth, $shrinkFactor); $pass++) {
-                $colWidths = $this->calculateColumnWidths($cellPlacements, $numCols, $usableWidth, $colElementWidths);
+                $colWidths = $this->calculateColumnWidths($cellPlacements, $numCols, $usableWidth, $colElementWidths, $borderCollapse);
             }
+        }
+
+        // Columns never get narrower than their content minimum: a table whose words do not fit grows past its
+        // width (and its container), as in browsers, instead of letting the words overlap the next cells
+        $gridW = array_sum($colWidths) + $totalHorizontalSpacing;
+        if (!TableMetrics::isFixed($table) && $gridW > $contentWidth + 0.01) {
+            $table->width += $gridW - $contentWidth;
+            $contentWidth = $gridW;
         }
 
         // Compute X offset for each column
@@ -339,12 +357,13 @@ class TableLayout
             $totalHeight += $rowHeights[$r];
         }
         $totalHeight += ($numRows + 1) * $spacingPt;
-        $this->placeBottomCaptions($bottomCaptions, $table->x, $contentY + $totalHeight + $this->gridBottomEdge($table, $borderCollapse));
+        $this->placeBottomCaptions($bottomCaptions, $table->x, $contentY + $totalHeight + ($outer !== null ? $outer['bottom'] / 2.0 : $this->gridBottomEdge($table, $borderCollapse)));
         $totalHeight += $captionHeight + $bottomCaptionHeight;
 
-        if ($borderCollapse) {
-            // LayoutEngine adds the full vertical spacing; collapsed tables only own half of their border
-            return max(0.0, $totalHeight - ($table->borderTop + $table->borderBottom) / 2.0 - $table->paddingTop - $table->paddingBottom);
+        if ($outer !== null) {
+            // LayoutEngine adds the table's own padding and border; a collapsed table has no padding and its border
+            // box ends half of the outer collapsed border beyond the first and last grid lines
+            return max(0.0, $totalHeight + ($outer['top'] + $outer['bottom']) / 2.0 - $table->borderTop - $table->borderBottom - $table->paddingTop - $table->paddingBottom);
         }
         return max(0.0, $totalHeight);
     }
@@ -401,7 +420,7 @@ class TableLayout
      * @param list<CellPlacement> $cellPlacements
      * @return list<float>
      */
-    private function calculateColumnWidths(array $cellPlacements, int $numCols, float $usableWidth, array $colElementWidths = []): array
+    private function calculateColumnWidths(array $cellPlacements, int $numCols, float $usableWidth, array $colElementWidths = [], bool $collapse = false): array
     {
         $explicitWidths = array_fill(0, $numCols, null);
         foreach ($colElementWidths as $c => $w) {
@@ -420,9 +439,15 @@ class TableLayout
             $cell = $cp->cell;
 
             $this->engine->resolveBoxMetrics($cell, $usableWidth);
+            // Collapsed borders are shared by neighbouring columns: a column holds half of each side's border
+            $half = $collapse ? ($cell->borderLeft + $cell->borderRight) / 2.0 : 0.0;
             $wCss = strtolower(trim($cell->style->get('width', 'auto')));
             if ($wCss !== 'auto' && $wCss !== '') {
-                $wPt = $this->engine->resolveBoxHorizontalDimension($cell, $wCss, $usableWidth);
+                // A percentage is the share of the table that the whole column takes (padding and borders included,
+                // as in browsers); a length is the cell's content (or border-box) width
+                $wPt = str_ends_with($wCss, '%') && is_numeric(substr($wCss, 0, -1))
+                    ? max(0.0, (float) substr($wCss, 0, -1)) / 100.0 * $usableWidth
+                    : $this->engine->resolveBoxHorizontalDimension($cell, $wCss, $usableWidth) - $half;
                 if ($wPt > 0.0) {
                     $explicitWidths[$c] = max($explicitWidths[$c] ?? 0.0, $wPt);
                 }
@@ -435,6 +460,8 @@ class TableLayout
                 $intr['min'] = max($intr['min'], $cellMin);
                 $intr['max'] = max($intr['max'], $cellMin);
             }
+            $intr['min'] = max(0.0, $intr['min'] - $half);
+            $intr['max'] = max(0.0, $intr['max'] - $half);
             if ($intr['min'] > $minWidths[$c]) {
                 $minWidths[$c] = $intr['min'];
             }
@@ -449,6 +476,12 @@ class TableLayout
                 continue;
             }
             $intr = $this->engine->measureIntrinsicWidth($cp->cell, $usableWidth);
+            if ($collapse) {
+                $this->engine->resolveBoxMetrics($cp->cell, $usableWidth);
+                $half = ($cp->cell->borderLeft + $cp->cell->borderRight) / 2.0;
+                $intr['min'] = max(0.0, $intr['min'] - $half);
+                $intr['max'] = max(0.0, $intr['max'] - $half);
+            }
             $cols = range($cp->colIdx, min($numCols - 1, $cp->colIdx + $cp->colSpan - 1));
             $sumMin = 0.0;
             $sumMax = 0.0;
@@ -535,7 +568,7 @@ class TableLayout
             }
         } else {
             foreach ($autoCols as $c) {
-                $colWidths[$c] = $remainingForAuto * ($minWidths[$c] / max(1.0, $totalMinAuto));
+                $colWidths[$c] = $minWidths[$c]; // not enough room: the table grows (see layout())
             }
         }
 

@@ -180,6 +180,8 @@ final class FormAppearance
             $top = $box->borderTop + $box->paddingTop;
             if ($c->kind === FormControl::TEXTAREA) {
                 $text = $c->value !== '' ? $c->value : $c->placeholder;
+                // Only what the box can show is drawn: a 600 KB value would otherwise be measured and wrapped in full
+                $text = mb_substr($text, 0, (int) min((float) strlen($text), (ceil($h / max(1.0, $lineH)) + 1) * (ceil($cw / max(0.5, $fs * 0.1)) + 1)));
                 $rgb = $c->value !== '' ? $color : [0.46, 0.46, 0.46];
                 $i = 0;
                 foreach ($this->wrap($text, $cw, $measure) as $line) {

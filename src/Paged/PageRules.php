@@ -138,6 +138,17 @@ class PageRules
                 }
             }
         }
+        // Margin boxes inherit from the page context (CSS Paged Media 3): `@page { font-family: Arial; font-size: 9pt }`
+        // styles the text of every margin box that does not set the property itself, as in browsers
+        foreach ($boxes as $bn => $bp) {
+            $merged = [];
+            foreach ($props as $p => $v) {
+                if (!isset($bp[$p]) && preg_match('/^(font|color$|line-height$|letter-spacing$|word-spacing$|text-transform$|direction$|white-space$)/', $p) === 1) {
+                    $merged[$p] = $v;
+                }
+            }
+            $boxes[$bn] = $merged === [] ? $bp : $merged + $bp;
+        }
         return ['props' => $props, 'boxes' => $boxes];
     }
 

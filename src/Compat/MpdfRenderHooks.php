@@ -35,7 +35,7 @@ final class MpdfRenderHooks
         if ($el->hasAttribute('data-ivo-bookmark')) {
             $title = trim($el->getAttribute('data-ivo-bookmark'));
             if ($title !== '') {
-                $pdf->addOutline(max(0, (int) $el->getAttribute('data-ivo-level')) + 1, $title, $pageIndex, $pdfY);
+                $pdf->addOutline(\IvoPdf\Dom\InputGuards::intAttr($el->getAttribute('data-ivo-level'), 0, 8, 0) + 1, $title, $pageIndex, $pdfY);
             }
         }
         if ($el->hasAttribute('data-ivo-annot')) {

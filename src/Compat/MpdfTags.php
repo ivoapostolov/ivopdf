@@ -124,7 +124,7 @@ final class MpdfTags
                             return '';
                         }
                         $counters['bm']++;
-                        $level = max(0, (int) ($a['level'] ?? 0));
+                        $level = \IvoPdf\Dom\InputGuards::intAttr($a['level'] ?? '0', 0, 8, 0);
                         return self::marker($inline, 'ivo-bm-' . $counters['bm'], 'data-ivo-bookmark="' . self::e($a['content'] ?? '') . '" data-ivo-level="' . $level . '"');
 
                     case 'annotation':
@@ -188,7 +188,7 @@ final class MpdfTags
                         if ($closing) {
                             return $out;
                         }
-                        $count = (int) ($a['column-count'] ?? 1);
+                        $count = \IvoPdf\Dom\InputGuards::intAttr($a['column-count'] ?? '1', 0, 100, 0);
                         if ($count > 1) {
                             $gap = isset($a['column-gap']) && is_numeric($a['column-gap']) ? (float) $a['column-gap'] : 5.0;
                             $fill = in_array(strtoupper(trim($a['valign'] ?? $a['vertical-align'] ?? '')), ['J', 'JUSTIFY', 'BALANCE'], true) ? 'balance' : 'auto';

@@ -81,6 +81,9 @@ final class PdfX
         if (!empty($o->signature)) {
             throw new \LogicException('PDF/X forbids interactive signature fields: disable either the "pdfx" option or setSignature().');
         }
+        if ($o->pdfxIccProfile !== '' && \IvoPdf\Options::isNetworkPath($o->pdfxIccProfile)) {
+            throw new \LogicException('PDF/X ICC profile refused (UNC / network or stream-wrapper paths are not read): ' . $o->pdfxIccProfile);
+        }
         if ($o->pdfxIccProfile !== '' && !is_file($o->pdfxIccProfile)) {
             throw new \LogicException('PDF/X ICC profile not found: ' . $o->pdfxIccProfile);
         }

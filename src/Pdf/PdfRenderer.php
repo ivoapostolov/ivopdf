@@ -122,6 +122,11 @@ class PdfRenderer
 
         $stream = '';
 
+        // 0. Overlay parts marked data-ivo-underlay (dompdf begin_page_render drawing) go below everything else
+        foreach ($overlayBox !== null ? self::takeUnderlays($overlayBox, 0) : [] as $underBox) {
+            $stream .= $this->renderBoxTree($underBox, 0.0, 0.0, $this->pageHeight, true);
+        }
+
         // 1. Render optional running header
         if ($headerBox !== null) {
             $stream .= $this->renderBoxTree($headerBox, 0.0, 0.0, $this->pageHeight, true);
@@ -155,6 +160,31 @@ class PdfRenderer
         }
 
         $this->pdf->appendPageContent($pageIndex, $stream);
+    }
+
+    /**
+     * Detaches (and returns) the boxes of an overlay tree whose element carries data-ivo-underlay.
+     *
+     * @return list<LayoutBox>
+     */
+    private static function takeUnderlays(LayoutBox $box, int $depth): array
+    {
+        $found = [];
+        if ($depth > 4) {
+            return $found;
+        }
+        foreach ($box->children as $i => $child) {
+            if ($child->domElement !== null && $child->domElement->hasAttribute('data-ivo-underlay')) {
+                $found[] = $child;
+                unset($box->children[$i]);
+                continue;
+            }
+            array_push($found, ...self::takeUnderlays($child, $depth + 1));
+        }
+        if ($found !== [] && !array_is_list($box->children)) {
+            $box->children = array_values($box->children);
+        }
+        return $found;
     }
 
     /**
@@ -198,7 +228,10 @@ class PdfRenderer
             $z = is_numeric($zCss) ? (int) $zCss : 0;
             if ($pos === 'static') {
                 $rank = $z < 0 && is_numeric($zCss) ? -1 : 0;
-                $layer = [$rank, 0, $i];
+                // CSS 2.1 Appendix E: floats paint after the in-flow blocks they overlap (a float beside a block
+                // with a background stays visible)
+                $isFloat = $rank === 0 && in_array(strtolower(trim($child->style->get('float', 'none'))), ['left', 'right'], true);
+                $layer = [$rank, $isFloat ? 1 : 0, $i];
             } else {
                 $layer = $z < 0 ? [-1, $z, $i] : [1, $z, $i];
             }
@@ -270,6 +303,12 @@ class PdfRenderer
 
         $out = '';
         $needsGraphicsRestore = false;
+
+        // dompdf Canvas::add_named_dest(): a destination drawn in the page overlay (a fixed context, whose ids are
+        // otherwise not link targets because running content repeats on every page)
+        if ($isFixedContext && $box->domElement !== null && $box->domElement->hasAttribute('data-ivo-dest')) {
+            $this->pdf->registerDestination($box->domElement->getAttribute('data-ivo-dest'), $this->currentPageIndex, $this->pageHeight - $localY);
+        }
 
         // Named destinations (id / a[name]) and heading bookmarks
         // (a display: inline element has no box of its own: its anchors are registered at its line fragments or,
@@ -470,7 +509,7 @@ class PdfRenderer
             // above is painted (clipped) but its links, widgets and anchors belong to the previous page
             $wasOwned = $this->annotOwned;
             $this->annotOwned = $wasOwned && ($isFixedContext || $this->currentPageIndex === 0 || $lineTop >= $visibleVirtualTop - 0.5);
-            $out .= $this->renderLineBox($line, $yShift, $isFixedContext);
+            $out .= $this->renderLineBox($line, $yShift, $isFixedContext, $visibleVirtualTop, $visibleVirtualBottom, $wasOwned);
             $this->annotOwned = $wasOwned;
         }
 
@@ -543,7 +582,37 @@ class PdfRenderer
         return $out;
     }
 
-    private function renderLineBox(LineBox $line, float $yShift, bool $replacePageTokens): string
+    /**
+     * Inter-word spaces are separate whitespace runs that are not drawn; extractors infer them from the gap between
+     * glyphs. That fails next to a run in another (fallback) font, next to symbols (arrows, emoji) and with
+     * /ActualText (.notdef glyphs, Indic), so the run then gets an extractable space after its last glyph (a space
+     * glyph, or a trailing space in its /ActualText): nothing moves on the page.
+     */
+    private function needsExtractableSpace(LineBox $line, int $runIdx, \IvoPdf\Font\TtfParser $ttf): bool
+    {
+        $space = $line->runs[$runIdx + 1] ?? null;
+        $next = $line->runs[$runIdx + 2] ?? null;
+        if ($space === null || $next === null || !$space->isWhitespace || $space->inlineBox !== null || $next->inlineBox !== null
+            || $next->isWhitespace || $next->text === '' || strtolower($space->style->get('text-decoration', 'none')) !== 'none') {
+            return false;
+        }
+        $run = $line->runs[$runIdx];
+        if (preg_match('/\p{S}$/u', $run->text) === 1 || preg_match('/^\p{S}/u', $next->text) === 1 || $next->actualText !== null
+            || ($next->glyphs !== null && in_array(0, array_column($next->glyphs, 0), true)) || $this->fontManager->hasMissingGlyphs($ttf, $run->text)) {
+            return true;
+        }
+        $nextTtf = $this->fontManager->resolveFont($next->style->get('font-family', 'DejaVu Sans'), $next->style->get('font-weight', 'normal'), $next->style->get('font-style', 'normal'));
+        return $nextTtf !== $ttf || $this->fontManager->hasMissingGlyphs($nextTtf, $next->text);
+    }
+
+    /**
+     * @param float $sliceTop top of the page slice being painted: an inline-block taller than a page (20 000 `<br>` in
+     *        one inline-block) paints only its part on this page instead of its whole content on every page
+     * @param float $sliceBottom bottom of that slice
+     * @param bool|null $ownedOuter whether the page may own annotations before the line's own ownership test: the
+     *        lines inside such an inline-block are owned by the page that holds their top edge
+     */
+    private function renderLineBox(LineBox $line, float $yShift, bool $replacePageTokens, float $sliceTop = -INF, float $sliceBottom = INF, ?bool $ownedOuter = null): string
     {
         $out = $this->drawInlineDecorations($line, $yShift);
 
@@ -551,22 +620,27 @@ class PdfRenderer
             $this->registerInlineAnchors($line, $yShift);
         }
 
-        foreach ($line->runs as $run) {
+        foreach ($line->runs as $runIdx => $run) {
             if ($run->inlineBox !== null) {
-                $linked = $run->href !== null && $run->href !== '' && $this->annotOwned
+                $linked =$run->href !== null && $run->href !== '' && $this->annotOwned
                     && $run->inlineBox->tagName !== 'a' && $run->inlineBox->isInlineLevel();
                 if ($linked) {
                     // <a href><img></a> / <a href><svg></a> / inline-block content: the replaced box is the click target
                     $ib = $run->inlineBox;
                     $this->pdf->addLinkAnnotation($this->currentPageIndex, $ib->x, $this->pageHeight - ($ib->y - $yShift + $ib->height), $ib->width, $ib->height, (string) $run->href);
                 }
+                $ownedHere = $this->annotOwned;
+                if ($ownedOuter !== null && !$replacePageTokens) {
+                    $this->annotOwned = $ownedOuter;
+                }
                 $out .= $this->renderBoxTree(
                     $run->inlineBox,
                     $yShift,
-                    $run->inlineBox->y - 1.0,
-                    $run->inlineBox->y + $run->inlineBox->height + 1.0,
+                    max($run->inlineBox->y - 1.0, $sliceTop),
+                    min($run->inlineBox->y + $run->inlineBox->height + 1.0, $sliceBottom),
                     $replacePageTokens
                 );
+                $this->annotOwned = $ownedHere;
                 continue;
             }
 
@@ -618,33 +692,71 @@ class PdfRenderer
             }
 
             $textStartLen = strlen($out);
+            $spaceAfter = $text === $run->text && $this->needsExtractableSpace($line, $runIdx, $ttf);
             if ($run->glyphs !== null && $text === $run->text) {
                 // Shaped run (ligatures, kerning, Arabic forms, RTL): positioned glyph ids in visual order
                 // Reordered Indic glyphs carry /ActualText so that copy/paste and search see the logical text
-                $logical = $run->actualText ?? (preg_match('/[\x{0900}-\x{0D7F}]/u', $text) === 1 || in_array('', array_column($run->glyphs, 4), true) ? $text : null);
+                $notdef = $run->actualText === null && in_array(0, array_column($run->glyphs, 0), true);
+                $logical = $notdef ? null : ($run->actualText ?? (preg_match('/[\x{0900}-\x{0D7F}]/u', $text) === 1 || in_array('', array_column($run->glyphs, 4), true) ? $text : null));
+                if ($logical !== null && $spaceAfter) {
+                    $logical .= ' ';
+                    $spaceAfter = false;
+                }
                 $showOps = $this->fontManager->encodeShapedGlyphs($ttf, $run->glyphs, $run->fontSizePt, $logical);
+                if ($notdef && $showOps !== '') {
+                    // .notdef glyphs (no font has them): one /ActualText span over the run keeps the code points
+                    $actual = $text . ($spaceAfter ? ' ' : '');
+                    $spaceAfter = false;
+                    $showOps = '/Span << /ActualText <' . strtoupper(bin2hex("\xFE\xFF" . (string) mb_convert_encoding($actual, 'UTF-16BE', 'UTF-8'))) . '> >> BDC ' . $showOps . ' EMC';
+                }
             } else {
                 $hexGids = $this->fontManager->encodeTextToHexGids($ttf, $text);
                 $showOps = $hexGids !== '' ? '<' . $hexGids . '> Tj' : '';
-                if ($showOps !== '' && $run->actualText !== null && $text === $run->text) {
-                    $showOps = '/Span << /ActualText <' . strtoupper(bin2hex("\xFE\xFF" . (string) mb_convert_encoding($run->actualText, 'UTF-16BE', 'UTF-8'))) . '> >> BDC ' . $showOps . ' EMC';
+                $actual = $run->actualText !== null && $text === $run->text ? $run->actualText : null;
+                if ($actual === null && $this->fontManager->hasMissingGlyphs($ttf, $text)) {
+                    $actual = $text; // drawn as .notdef (no font has the glyph): /ActualText keeps the code points extractable
                 }
+                if ($showOps !== '' && $actual !== null) {
+                    if ($spaceAfter) {
+                        $actual .= ' ';
+                        $spaceAfter = false;
+                    }
+                    $showOps = '/Span << /ActualText <' . strtoupper(bin2hex("\xFE\xFF" . (string) mb_convert_encoding($actual, 'UTF-16BE', 'UTF-8'))) . '> >> BDC ' . $showOps . ' EMC';
+                }
+            }
+            if ($showOps !== '' && $spaceAfter && $ttf->getGlyphId(0x20) !== 0) {
+                $showOps .= ' <' . $this->fontManager->encodeTextToHexGids($ttf, ' ') . '> Tj';
             }
             if ($showOps !== '') {
                 $tcCmd = abs($run->letterSpacingPt) > 0.001 ? sprintf('%.3F Tc ', $run->letterSpacingPt) : '';
                 $tcReset = abs($run->letterSpacingPt) > 0.001 ? ' 0 Tc' : '';
+                // A family without a bold / italic face: synthesize it like browsers (fill + stroke, 14 degree slant)
+                $synth = $this->fontManager->syntheticStyle($fontFamily, $fontWeight, $fontStyle);
+                $posOp = $synth['oblique']
+                    ? sprintf('1 0 0.25 1 %.2F %.2F Tm', $runX, $baselinePdfY)
+                    : sprintf('%.2F %.2F Td', $runX, $baselinePdfY);
+                $boldOn = '';
+                $boldOff = '';
+                if ($synth['bold']) {
+                    $ratio = $run->fontSizePt <= 9.0 ? 1 / 24 : ($run->fontSizePt >= 36.0 ? 1 / 32 : 1 / 24 + (1 / 32 - 1 / 24) * ($run->fontSizePt - 9.0) / 27.0);
+                    $boldOn = sprintf('%.3F w %s 2 Tr ', $run->fontSizePt * $ratio, ColorOps::strokeOp($color));
+                    $boldOff = ' 0 Tr';
+                }
 
                 $out .= sprintf(
-                    "%sBT /%s %.2F Tf %s%s %.2F %.2F Td %s%s ET%s\n",
+                    "%s%sBT /%s %.2F Tf %s%s %s%s %s%s%s ET%s%s\n",
                     $alphaGuard,
+                    $boldOn !== '' ? 'q ' : '',
                     $fontId,
                     $run->fontSizePt,
                     $tcCmd,
                     ColorOps::fillOp($color),
-                    $runX,
-                    $baselinePdfY,
+                    $boldOn,
+                    $posOp,
                     $showOps,
                     $tcReset,
+                    $boldOff,
+                    $boldOn !== '' ? ' Q' : '',
                     $alphaRestore
                 );
             }
@@ -711,14 +823,21 @@ class PdfRenderer
      * Destinations of empty inline-level children (<a name="x"></a>, <span id="x"></span>) of a box without line boxes:
      * they take no space, so they point at the top of the next in-flow sibling (else the end of the previous one).
      */
+    /** @var array<int, list<int>> spl_object_id(box) => indices of the children registerEmptyInlineAnchors() looks at */
+    private array $anchorCandidates = [];
+
     private function registerEmptyInlineAnchors(LayoutBox $box, float $yShift, float $visTop, float $visBottom): void
     {
         $children = $box->children;
-        foreach ($children as $i => $child) {
+        // The candidates (empty elements with attributes) are found once per box, not on every page: a body with
+        // 20 000 headings would otherwise be scanned once per page
+        $candidates = $this->anchorCandidates[spl_object_id($box)] ??= array_keys(array_filter(
+            $children,
+            static fn(LayoutBox $c): bool => $c->domElement !== null && $c->lines === [] && !$c->isTextNode() && $c->domElement->hasAttributes()
+        ));
+        foreach ($candidates as $i) {
+            $child = $children[$i];
             $el = $child->domElement;
-            if ($el === null || $child->isTextNode() || !$el->hasAttributes()) {
-                continue;
-            }
             $names = [];
             foreach (['id', 'name'] as $attr) {
                 $anchor = trim($el->getAttribute($attr));
@@ -1056,7 +1175,15 @@ class PdfRenderer
         $color = CssColor::parse(($markerStyle ?? $liBox->style)->get('color', '#111827')) ?? [0.067, 0.094, 0.153, 1.0];
 
         $markerW = $this->fontManager->measureText($marker, $fontFamily, $fontWeight, 'normal', $fs);
-        $markerX = $localX - $markerW - 5.0;
+        if (in_array($marker, ['•', '◦', '▪'], true)) {
+            // Chromium's outside symbol marker: its box starts (ascent * 2/3 + 8) px before the content edge and the
+            // symbol, (ascent * 2/3 + 1) / 2 px wide, is drawn 1 px into it; the glyph is centred on that symbol
+            $offsetPx = intdiv((int) round($ttf->ascent / 1000.0 * $fs / 0.75) * 2, 3);
+            $markerX = $localX - ($offsetPx + 8) * 0.75 + (1 + intdiv($offsetPx + 1, 2) / 2.0) * 0.75 - $markerW / 2.0;
+        } else {
+            // "1. ": the marker text and a space end at the content edge
+            $markerX = $localX - $markerW - $this->fontManager->measureText(' ', $fontFamily, $fontWeight, 'normal', $fs);
+        }
         if (strtolower(trim($liBox->style->get('direction', 'ltr'))) === 'rtl') {
             // RTL list items keep the marker on the right side
             $markerX = $localX + $liBox->width + 5.0;

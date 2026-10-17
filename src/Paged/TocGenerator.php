@@ -59,13 +59,16 @@ final class TocGenerator
         $maxLevel = max(1, min(6, $maxLevel));
         $scanLevel = 6; // placeholders may ask for more levels than the default
         $zeroBased = preg_match('~<tocentry\b[^>]*\blevel\s*=\s*["\']?0\b~i', $masked_html) === 1;
+        // mPDF: a document that marks its entries with <tocentry> gets exactly those entries (headings are not added);
+        // the heading scan is the <toc> / setTableOfContents() mode of documents without <tocentry>
+        $manual = stripos($masked_html, '<tocentry') !== false;
         $masked_html = (string) preg_replace_callback(
             '~<h([1-6])\b([^>]*)>(.*?)</h\1\s*>|<tocentry\b([^>]*?)/?>(?:\s*</tocentry>)?~is',
-            static function (array $m) use (&$entries, &$counter, $scanLevel, $zeroBased): string {
+            static function (array $m) use (&$entries, &$counter, $scanLevel, $zeroBased, $manual): string {
                 if (($m[4] ?? '') !== '' || stripos($m[0], '<tocentry') === 0) {
                     $attrs = self::attrs($m[4] ?? '');
                     $text = trim(html_entity_decode($attrs['content'] ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                    $level = max(1, min(6, (int) ($attrs['level'] ?? ($zeroBased ? 0 : 1)) + ($zeroBased ? 1 : 0) ?: 1));
+                    $level = max(1, min(6, \IvoPdf\Dom\InputGuards::intAttr($attrs['level'] ?? null, -1, 99, $zeroBased ? 0 : 1) + ($zeroBased ? 1 : 0) ?: 1));
                     $id = 'ivo-toc-' . (++$counter);
                     if ($text !== '') {
                         $entries[] = ['id' => $id, 'level' => $level, 'text' => $text];
@@ -74,7 +77,7 @@ final class TocGenerator
                 }
 
                 $level = (int) $m[1];
-                if ($level > $scanLevel || $zeroBased) { // mPDF-style (0-based) <tocentry> lists replace the heading scan
+                if ($level > $scanLevel || $manual) { // <tocentry> lists replace the heading scan
                     return $m[0];
                 }
                 $attrString = $m[2];
@@ -100,7 +103,7 @@ final class TocGenerator
             static function (array $m) use (&$used, $entries, $title, $maxLevel): string {
                 $used = true;
                 $attrs = self::attrs($m[2]);
-                $levels = (int) ($attrs['levels'] ?? $attrs['maxlevel'] ?? $maxLevel);
+                $levels = \IvoPdf\Dom\InputGuards::intAttr($attrs['levels'] ?? $attrs['maxlevel'] ?? null, 0, 6, $maxLevel);
                 $ttl = array_key_exists('title', $attrs) ? $attrs['title'] : $title;
                 $pb = strtolower($m[1]) === 'tocpagebreak';
                 // mPDF: toc-preHTML / toc-postHTML (HTML before / after the entries), toc-bookmarkText (outline entry)

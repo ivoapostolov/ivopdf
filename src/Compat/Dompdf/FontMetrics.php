@@ -43,7 +43,7 @@ final class FontMetrics
     {
         $style = is_array($style) ? $style : ['family' => (string) $style];
         $family = (string) ($style['family'] ?? '');
-        if ($family === '' || !is_file($remoteFile)) {
+        if ($family === '' || \IvoPdf\Options::isNetworkPath($remoteFile) || !is_file($remoteFile)) {
             return false;
         }
         $bold = str_contains(strtolower((string) ($style['weight'] ?? 'normal')), 'bold') || (int) ($style['weight'] ?? 400) >= 600;
@@ -54,6 +54,150 @@ final class FontMetrics
             $this->fonts->registerFontVariant($family, $variant, $remoteFile);
         }
         return true;
+    }
+
+    /** @param array<string, string>|string $style */
+    public function register_font($style, string $remote_file, $context = null): bool
+    {
+        return $this->registerFont($style, $remote_file, $context);
+    }
+
+    /**
+     * dompdf: the font files of a family as ['normal' => file, 'bold' => .., 'italic' => .., 'bold_italic' => ..]
+     * (registered and bundled families, CSS aliases such as "arial" resolve to the bundled face), or null.
+     *
+     * @return array<string, string>|null
+     */
+    public function getFamily($family): ?array
+    {
+        $key = str_replace(["'", '"'], '', mb_strtolower(trim((string) $family), 'UTF-8'));
+        $variants = self::$registered[$key] ?? $this->manager()->getFamilyVariants($key);
+        if ($variants === null || $variants === []) {
+            return null;
+        }
+        $out = [];
+        foreach (['regular' => 'normal', 'bold' => 'bold', 'italic' => 'italic', 'bold_italic' => 'bold_italic'] as $ivo => $dompdf) {
+            if (isset($variants[$ivo]) && $variants[$ivo] !== '') {
+                $out[$dompdf] = $variants[$ivo];
+            }
+        }
+        return $out;
+    }
+
+    /** @return array<string, string>|null */
+    public function get_family($family): ?array
+    {
+        return $this->getFamily($family);
+    }
+
+    /**
+     * dompdf: defines a family from font files, $entry = ['normal' => file, 'bold' => .., 'italic' => .., 'bold_italic' => ..].
+     * dompdf stores the paths without extension; ".ttf" / ".otf" is appended when the bare path does not exist. Entries
+     * whose file does not exist are skipped (missing bold / italic faces are synthesized).
+     *
+     * @param array<string, string> $entry
+     */
+    public function setFontFamily($fontname, $entry): void
+    {
+        $family = (string) $fontname;
+        if ($family === '' || !is_array($entry)) {
+            return;
+        }
+        foreach (['normal' => 'regular', 'regular' => 'regular', 'bold' => 'bold', 'italic' => 'italic', 'bold_italic' => 'bold_italic'] as $dompdf => $variant) {
+            $file = isset($entry[$dompdf]) ? (string) $entry[$dompdf] : '';
+            if ($file === '' || \IvoPdf\Options::isNetworkPath($file)) {
+                continue;
+            }
+            foreach (['', '.ttf', '.otf', '.TTF', '.OTF'] as $ext) {
+                if (is_file($file . $ext)) {
+                    $this->registerFont(['family' => $family, 'weight' => str_contains($variant, 'bold') ? 'bold' : 'normal', 'style' => str_contains($variant, 'italic') ? 'italic' : 'normal'], $file . $ext);
+                    break;
+                }
+            }
+        }
+    }
+
+    /** @param array<string, string> $entry */
+    public function set_font_family($fontname, $entry): void
+    {
+        $this->setFontFamily($fontname, $entry);
+    }
+
+    /** @return array<string, array<string, string>> every family registered with registerFont() / setFontFamily() */
+    public function getFontFamilies(): array
+    {
+        $out = [];
+        foreach (array_keys(self::$registered) as $family) {
+            $out[$family] = (array) $this->getFamily($family);
+        }
+        return $out;
+    }
+
+    /** @return array<string, array<string, string>> */
+    public function get_font_families(): array
+    {
+        return $this->getFontFamilies();
+    }
+
+    /** dompdf compatibility: font families are kept in memory, nothing is written to fontDir. */
+    public function saveFontFamilies(): void
+    {
+    }
+
+    public function save_font_families(): void
+    {
+    }
+
+    public function loadFontFamilies(): void
+    {
+    }
+
+    public function load_font_families(): void
+    {
+    }
+
+    public function get_font(?string $family_raw = null, string $subtype_raw = 'normal'): string
+    {
+        return $this->getFont($family_raw, $subtype_raw);
+    }
+
+    public function getOptions(): ?Options
+    {
+        return $this->options;
+    }
+
+    /** dompdf: 'bold', 'italic', 'bold_italic' or 'normal' for a CSS weight / style string such as "bold italic". */
+    public function getType($type): string
+    {
+        $t = strtolower((string) $type);
+        $bold = str_contains($t, 'bold') || preg_match('/\b([6-9]00)\b/', $t) === 1;
+        $italic = str_contains($t, 'italic') || str_contains($t, 'oblique');
+        return $bold ? ($italic ? 'bold_italic' : 'bold') : ($italic ? 'italic' : 'normal');
+    }
+
+    public function get_type($type): string
+    {
+        return $this->getType($type);
+    }
+
+    /** dompdf keeps a JSON file of installed fonts; IvoPDF keeps them in memory (empty string). */
+    public function getUserFontsFilePath(): string
+    {
+        return '';
+    }
+
+    /** True when the font of the descriptor has a glyph for the (first) character of $char. */
+    public function supportsChar(string $font, string $char): bool
+    {
+        if ($char === '') {
+            return true;
+        }
+        [$family, $weight, $style] = self::parse($font, $this->options);
+        try {
+            return $this->manager()->resolveFont($family, $weight, $style)->hasGlyph(mb_ord($char, 'UTF-8') ?: 0);
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     /** @var array<string, array<string, string>> family => variant => file (applied to every engine created afterwards) */
@@ -97,9 +241,16 @@ final class FontMetrics
         }
     }
 
+    /** dompdf: distance from the top of a text() line to its baseline - the font height (ascent + descent). */
     public function getFontBaseline($font, float $size): float
     {
-        return $size * 0.9;
+        [$asc, $desc] = $this->ascentDescent($font, $size);
+        return $asc + $desc;
+    }
+
+    public function get_font_baseline($font, float $size): float
+    {
+        return $this->getFontBaseline($font, $size);
     }
 
     public function get_text_width(string $text, $font, float $size, float $wordSpacing = 0.0, float $charSpacing = 0.0): float
@@ -126,6 +277,12 @@ final class FontMetrics
             $family = (string) preg_replace('~[-_ ](bold)?(?:[-_ ]?(italic|oblique))?$~i', '', $family);
         }
         return [$family, $weight, $style];
+    }
+
+    /** @internal measures with the engine's own font manager (mPDF fontdata / registered families included). */
+    public function useFontManager(FontManager $fonts): void
+    {
+        $this->fonts = $fonts;
     }
 
     private function manager(): FontManager

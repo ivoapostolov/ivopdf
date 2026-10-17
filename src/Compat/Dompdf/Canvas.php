@@ -5,66 +5,96 @@ declare(strict_types=1);
 namespace IvoPdf\Compat\Dompdf;
 
 /**
- * Drop-in for the `Dompdf\Canvas` that `$dompdf->getCanvas()` returns. Everything drawn here becomes an overlay layer
- * of the page (absolutely positioned HTML / inline SVG laid out by the IvoPDF engine), coordinates are dompdf's:
- * points from the top-left corner of the page.
+ * Drop-in for the `Dompdf\Canvas` that `$dompdf->getCanvas()` returns (the CPDF adapter's public methods). Everything
+ * drawn here becomes an overlay layer of the page (absolutely positioned HTML / inline SVG laid out by the IvoPDF
+ * engine), coordinates are dompdf's: points from the top-left corner of the page.
  *
  *  - page_text() / page_line(): drawn on every page, `{PAGE_NUM}` / `{PAGE_COUNT}` substituted
  *  - page_script(callable): called once per page with ($pageNumber, $pageCount, $canvas, $fontMetrics); the drawing
- *    calls it makes (text(), line(), rect(), image() ...) land on that page. Strings of PHP code are NOT executed.
- *  - text() / line() / rect() / image() ... outside page_script draw on the current page. "Current" is the page number
- *    returned by get_page_number(): 1 before render(), the last page after render() (as in dompdf, whose canvas stays on
- *    the last page), or whatever set_page_number() chose.
+ *    calls it makes (text(), line(), rectangle(), image() ...) land on that page. Strings of PHP code are NOT executed.
+ *  - text() / line() / rectangle() / image() ... outside page_script draw on the current page. "Current" is the page
+ *    number returned by get_page_number(): 1 before render(), the last page after render() (as in dompdf, whose canvas
+ *    stays on the last page), the page added by new_page(), or whatever set_page_number() chose.
  *  - set_opacity($alpha, $mode) / save() / restore(): the opacity (and blend mode, for text and images) applies to the
  *    drawing calls that follow, until restore() returns to the saved state. The state starts fresh (opaque) for every
  *    page_script() call. Colors with an 'alpha' entry are multiplied with it.
+ *  - rotate() / scale() / skew() / translate() / transform() change the coordinate system of the drawing calls that
+ *    follow (same matrices as dompdf's CPDF adapter); clipping_rectangle() / clipping_roundrectangle() /
+ *    clipping_polygon() clip them until clipping_end(); save() / restore() include both, as in PDF.
  *  - open_object() / close_object() / add_object($id, $where): the drawing calls between open and close are recorded and
  *    replayed on the pages chosen by $where ('add' = current page only, 'all' = current and following pages, 'next' =
- *    following pages, 'even' / 'odd' = current and following pages of that parity, 'nexteven' / 'nextodd').
+ *    following pages, 'even' / 'odd' = current and following pages of that parity, 'nexteven' / 'nextodd');
+ *    stop_object() ends the repetition after the current page, reopen_object() records more calls into an object.
  *    page_text() is not recorded into objects (it already repeats on every page).
+ *  - add_link() / add_named_dest(): clickable areas (URL or '#name') and named destinations on the current page;
+ *    add_info(): document metadata; javascript(): document-level JavaScript; new_page(): appends an empty page.
+ *  - Methods of the CPDF adapter that have no equivalent here (serialize_object(), form fields select() / input() ...)
+ *    are accepted, do nothing and add one warning per method to Dompdf::getWarnings().
  *
  * page_text(): like dompdf, `$y` is the top of the text and the baseline lies one font height (ascent + descent of the
  * font at that size) below it; the text rotates around its baseline origin.
  */
 final class Canvas
 {
+    private const IDENTITY = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
     private float $width;
     private float $height;
     private int $pageCount = 0;
     private int $current = 1;
     private int $version = 0;
     private bool $rendering = false;
+    private ?Dompdf $dompdf = null;
 
     /** @var list<array<string, mixed>> operations repeated on every page */
     private array $everyPage = [];
     /** @var list<callable> */
     private array $scripts = [];
+    /** @var list<callable> callables drawn below the page content (dompdf begin_page_render callbacks) */
+    private array $underScripts = [];
+    /** @var list<callable> callables drawn above the page content (dompdf end_document / end_page_render callbacks) */
+    private array $callbackScripts = [];
     /** @var array<int, list<array<string, mixed>>> page number => operations */
     private array $perPage = [];
     /** @var list<array<string, mixed>> operations collected while a page is being built */
     private array $buffer = [];
     /** @var list<string> */
     private array $warnings = [];
-    /** @var array{opacity: float, mode: string} graphics state applied to the drawing calls that follow */
-    private array $gs = ['opacity' => 1.0, 'mode' => 'Normal'];
-    /** @var list<array{opacity: float, mode: string}> */
+    /** @var array{opacity: float, mode: string, ctm: list<float>, clips: list<list<float>>} graphics state of the calls that follow */
+    private array $gs = ['opacity' => 1.0, 'mode' => 'Normal', 'ctm' => self::IDENTITY, 'clips' => []];
+    /** @var list<array{opacity: float, mode: string, ctm: list<float>, clips: list<list<float>>}> */
     private array $gsStack = [];
     /** @var array<int, list<array<string, mixed>>> object id => recorded operations */
     private array $objects = [];
     private int $nextObject = 1;
     private ?int $objectTarget = null;
-    /** @var list<array{id: int, where: string, page: int}> add_object() calls made by the application */
+    /** @var list<array{id: int, where: string, page: int, until?: int}> add_object() calls made by the application */
     private array $placements = [];
-    /** @var list<array{id: int, where: string, page: int}> add_object() calls made by page_script() callbacks (this pass) */
+    /** @var list<array{id: int, where: string, page: int, until?: int}> add_object() calls made by page_script() callbacks (this pass) */
     private array $scriptPlacements = [];
     /** @var list<int> ids of objects created by page_script() callbacks (this pass) */
     private array $scriptObjects = [];
     private int $lastRendered = 0;
+    /** @var array<string, string> add_info() label (lower case) => value */
+    private array $info = [];
+    /** @var list<string> javascript() code */
+    private array $js = [];
+    private int $extraPages = 0;
+    /** @var array{0: string, 1: list<mixed>}|null set_default_view() */
+    private ?array $defaultView = null;
+    /** @var array<string, true> methods already reported by __call() */
+    private array $reported = [];
 
     public function __construct(private FontMetrics $metrics, float $width = 612.0, float $height = 792.0)
     {
         $this->width = $width;
         $this->height = $height;
+    }
+
+    /** @internal called by Dompdf */
+    public function bindDompdf(Dompdf $dompdf): void
+    {
+        $this->dompdf = $dompdf;
     }
 
     /** Changes whenever the application drew something (Dompdf re-renders when it changed after render()). */
@@ -75,7 +105,8 @@ final class Canvas
 
     public function hasContent(): bool
     {
-        return $this->everyPage !== [] || $this->scripts !== [] || $this->perPage !== [];
+        return $this->everyPage !== [] || $this->scripts !== [] || $this->underScripts !== [] || $this->callbackScripts !== []
+            || $this->perPage !== [] || $this->placements !== [];
     }
 
     /** @return list<string> problems found while building overlays (e.g. a PHP-code string passed to page_script) */
@@ -84,6 +115,43 @@ final class Canvas
         $w = $this->warnings;
         $this->warnings = [];
         return $w;
+    }
+
+    /** @internal @return array<string, string> metadata set with add_info() */
+    public function infoEntries(): array
+    {
+        return $this->info;
+    }
+
+    /** @internal document JavaScript added with javascript() */
+    public function javascriptCode(): string
+    {
+        return implode("\n", $this->js);
+    }
+
+    /** @internal number of pages added with new_page() */
+    public function extraPages(): int
+    {
+        return $this->extraPages;
+    }
+
+    /** @internal @return array{0: string, 1: list<mixed>}|null set_default_view() arguments */
+    public function defaultView(): ?array
+    {
+        return $this->defaultView;
+    }
+
+    /**
+     * @internal Dompdf::setCallbacks() callables of the current render (replacing those of the previous one), called like
+     * page_script() callables: $over above the page content (end_document, end_page_render), $under below it (begin_page_render).
+     *
+     * @param list<callable> $over
+     * @param list<callable> $under
+     */
+    public function setRenderCallbacks(array $over, array $under): void
+    {
+        $this->callbackScripts = $over;
+        $this->underScripts = $under;
     }
 
     public function setPageSize(float $w, float $h): void
@@ -96,6 +164,11 @@ final class Canvas
     {
         $this->pageCount = $count;
         $this->current = max(1, $count);
+    }
+
+    public function get_dompdf(): ?Dompdf
+    {
+        return $this->dompdf;
     }
 
     public function get_width(): float
@@ -118,14 +191,14 @@ final class Canvas
         return $this->pageCount;
     }
 
-    public function set_page_number(int $n): void
+    public function set_page_number($num): void
     {
-        $this->current = max(1, $n);
+        $this->current = max(1, (int) $num);
     }
 
-    public function set_page_count(int $n): void
+    public function set_page_count($count): void
     {
-        $this->pageCount = $n;
+        $this->pageCount = (int) $count;
     }
 
     public function getWidth(): float
@@ -143,6 +216,40 @@ final class Canvas
         return $this;
     }
 
+    /** dompdf CPDF::add_info(): document metadata (Title, Author, Subject, Keywords, Creator, Producer). */
+    public function add_info(string $label, string $value): void
+    {
+        $this->version++;
+        $this->info[strtolower($label)] = $value;
+    }
+
+    /** dompdf CPDF::javascript(): document-level JavaScript (run by the viewer when the document opens). */
+    public function javascript($code): void
+    {
+        $this->version++;
+        $this->js[] = (string) $code;
+    }
+
+    /**
+     * dompdf CPDF::new_page(): appends an empty page after the document and makes it the current page (the drawing
+     * calls that follow land on it). Returns its page number.
+     */
+    public function new_page(): int
+    {
+        $this->version++;
+        $this->extraPages++;
+        $this->pageCount = max($this->pageCount, $this->current) + 1;
+        $this->current = $this->pageCount;
+        return $this->current;
+    }
+
+    /** dompdf CPDF::set_default_view(): initial view ('Fit', 'FitH', 'FitV', 'FitB', 'FitBH', 'XYZ' with [left, top, zoom]). */
+    public function set_default_view($view, $options = []): void
+    {
+        $this->version++;
+        $this->defaultView = [(string) $view, array_values((array) $options)];
+    }
+
     // ------------------------------------------------------------------
     // every-page drawing
     // ------------------------------------------------------------------
@@ -151,16 +258,16 @@ final class Canvas
      * @param mixed $font    descriptor from FontMetrics::getFont() (or a plain family name)
      * @param mixed $color   [r, g, b] 0..1, [c, m, y, k] / ['c' => ..], '#rrggbb', optionally with 'alpha'
      */
-    public function page_text($x, $y, $text, $font, $size, $color = [0, 0, 0], $wordSpace = 0.0, $charSpace = 0.0, $angle = 0.0): void
+    public function page_text($x, $y, $text, $font, $size, $color = [0, 0, 0], $word_space = 0.0, $char_space = 0.0, $angle = 0.0): void
     {
         $this->version++;
-        $this->everyPage[] = $this->textOp($x, $y, (string) $text, $font, $size, $color, $wordSpace, $charSpace, $angle);
+        $this->everyPage[] = $this->textOp($x, $y, (string) $text, $font, $size, $color, $word_space, $char_space, $angle);
     }
 
     public function page_line($x1, $y1, $x2, $y2, $color = [0, 0, 0], $width = 1.0, $style = []): void
     {
         $this->version++;
-        $this->everyPage[] = ['op' => 'line', 'x1' => (float) $x1, 'y1' => (float) $y1, 'x2' => (float) $x2, 'y2' => (float) $y2, 'color' => $color, 'w' => (float) $width, 'dash' => (array) $style];
+        $this->everyPage[] = ['op' => 'line', 'x1' => (float) $x1, 'y1' => (float) $y1, 'x2' => (float) $x2, 'y2' => (float) $y2, 'color' => $color, 'w' => (float) $width, 'dash' => (array) $style, 'cap' => 'butt'];
     }
 
     /** dompdf: `$code` is PHP source when isPhpEnabled; IvoPDF only accepts a callable (security). */
@@ -178,29 +285,66 @@ final class Canvas
     // current-page drawing
     // ------------------------------------------------------------------
 
-    public function text($x, $y, $text, $font, $size, $color = [0, 0, 0], $wordSpace = 0.0, $charSpace = 0.0, $angle = 0.0): void
+    public function text($x, $y, $text, $font, $size, $color = [0, 0, 0], $word_space = 0.0, $char_space = 0.0, $angle = 0.0): void
     {
-        $this->add($this->textOp($x, $y, (string) $text, $font, $size, $color, $wordSpace, $charSpace, $angle));
+        $this->add($this->textOp($x, $y, (string) $text, $font, $size, $color, $word_space, $char_space, $angle));
     }
 
-    public function line($x1, $y1, $x2, $y2, $color = [0, 0, 0], $width = 1.0, $style = []): void
+    public function line($x1, $y1, $x2, $y2, $color = [0, 0, 0], $width = 1.0, $style = [], $cap = 'butt'): void
     {
-        $this->add(['op' => 'line', 'x1' => (float) $x1, 'y1' => (float) $y1, 'x2' => (float) $x2, 'y2' => (float) $y2, 'color' => $color, 'w' => (float) $width, 'dash' => (array) $style]);
+        $this->add(['op' => 'line', 'x1' => (float) $x1, 'y1' => (float) $y1, 'x2' => (float) $x2, 'y2' => (float) $y2, 'color' => $color, 'w' => (float) $width, 'dash' => (array) $style, 'cap' => (string) $cap]);
     }
 
+    /**
+     * dompdf Canvas::rectangle(): outline of the rectangle whose top-left corner is ($x1, $y1).
+     *
+     * @param array<int, float|int> $style dash pattern
+     */
+    public function rectangle($x1, $y1, $w, $h, $color = [0, 0, 0], $width = 1.0, $style = [], $cap = 'butt'): void
+    {
+        $this->add(['op' => 'rect', 'x' => (float) $x1, 'y' => (float) $y1, 'w' => (float) $w, 'h' => (float) $h, 'color' => $color, 'lw' => (float) $width, 'dash' => (array) $style, 'fill' => false, 'cap' => (string) $cap]);
+    }
+
+    /** Alias of rectangle() kept for code written against earlier IvoPDF versions. */
     public function rect($x, $y, $w, $h, $color = [0, 0, 0], $width = 1.0, $style = []): void
     {
-        $this->add(['op' => 'rect', 'x' => (float) $x, 'y' => (float) $y, 'w' => (float) $w, 'h' => (float) $h, 'color' => $color, 'lw' => (float) $width, 'dash' => (array) $style, 'fill' => false]);
+        $this->rectangle($x, $y, $w, $h, $color, $width, $style);
     }
 
-    public function filled_rectangle($x, $y, $w, $h, $color = [0, 0, 0]): void
+    public function filled_rectangle($x1, $y1, $w, $h, $color = [0, 0, 0]): void
     {
-        $this->add(['op' => 'rect', 'x' => (float) $x, 'y' => (float) $y, 'w' => (float) $w, 'h' => (float) $h, 'color' => $color, 'lw' => 0.0, 'dash' => [], 'fill' => true]);
+        $this->add(['op' => 'rect', 'x' => (float) $x1, 'y' => (float) $y1, 'w' => (float) $w, 'h' => (float) $h, 'color' => $color, 'lw' => 0.0, 'dash' => [], 'fill' => true]);
     }
 
     public function circle($x, $y, $r, $color = [0, 0, 0], $width = null, $style = [], $fill = false): void
     {
         $this->add(['op' => 'circle', 'x' => (float) $x, 'y' => (float) $y, 'r' => (float) $r, 'color' => $color, 'lw' => (float) ($width ?? 1.0), 'dash' => (array) $style, 'fill' => (bool) $fill]);
+    }
+
+    /**
+     * dompdf Canvas::arc(): elliptical arc around ($x, $y) with radii $r1 / $r2 from $astart to $aend degrees
+     * (counter-clockwise, 0 = 3 o'clock, as in the CPDF adapter).
+     */
+    public function arc($x, $y, $r1, $r2, $astart, $aend, $color = [0, 0, 0], $width = 1.0, $style = [], $cap = 'butt'): void
+    {
+        $r1 = (float) $r1;
+        $r2 = (float) $r2 != 0.0 ? (float) $r2 : $r1;
+        $a0 = (float) $astart;
+        $a1 = (float) $aend;
+        if ($r1 == 0.0) {
+            return;
+        }
+        if ($a1 < $a0) {
+            $a1 += 360.0 * ceil(($a0 - $a1) / 360.0);
+        }
+        $steps = max(2, (int) ceil(($a1 - $a0) / 5.0));
+        $pts = [];
+        for ($i = 0; $i <= $steps; $i++) {
+            $a = deg2rad($a0 + ($a1 - $a0) * $i / $steps);
+            $pts[] = (float) $x + $r1 * cos($a);
+            $pts[] = (float) $y - $r2 * sin($a);
+        }
+        $this->add(['op' => 'poly', 'pts' => $pts, 'color' => $color, 'lw' => (float) $width, 'dash' => (array) $style, 'fill' => false, 'open' => true, 'cap' => (string) $cap]);
     }
 
     /** @param array<int, float> $points flat list x1, y1, x2, y2, ... */
@@ -219,6 +363,141 @@ final class Canvas
         $this->image($img, $x, $y, $w, $h);
     }
 
+    /** dompdf Canvas::add_link(): a clickable area; `$url` is a URL or '#name' (a named destination / element id). */
+    public function add_link($url, $x, $y, $width, $height): void
+    {
+        $url = (string) $url;
+        if ($url === '' || $url === '#') {
+            return;
+        }
+        $this->add(['op' => 'link', 'url' => $url, 'x' => (float) $x, 'y' => (float) $y, 'w' => (float) $width, 'h' => (float) $height]);
+    }
+
+    /** dompdf Canvas::add_named_dest(): a destination named $anchorname at the top of the current page (target of '#name' links). */
+    public function add_named_dest($anchorname): void
+    {
+        $name = (string) $anchorname;
+        if ($name !== '') {
+            $this->add(['op' => 'dest', 'name' => $name]);
+        }
+    }
+
+    /**
+     * @internal HTML laid out in a box at ($x, $y) of size $w x $h pt (mPDF WriteFixedPosHTML()); $overflow 'hidden' clips it.
+     */
+    public function html(string $html, float $x, float $y, float $w, float $h, string $overflow = 'visible'): void
+    {
+        $this->add(['op' => 'html', 'html' => $html, 'x' => $x, 'y' => $y, 'w' => $w, 'h' => $h, 'overflow' => strtolower($overflow)]);
+    }
+
+    /** @internal a named destination at $y pt from the top of the current page (mPDF SetLink()). */
+    public function namedDestAt(string $name, float $y): void
+    {
+        if ($name !== '') {
+            $this->add(['op' => 'dest', 'name' => $name, 'y' => $y]);
+        }
+    }
+
+    /**
+     * @internal Overlay HTML of the given recorded objects for one page (mPDF imperative drawing, see MpdfDraw).
+     *
+     * @param list<int> $ids
+     */
+    public function renderObjectsHtml(array $ids, int $pageNumber, int $pageCount, float $w, float $h): string
+    {
+        $ops = [];
+        foreach ($ids as $id) {
+            array_push($ops, ...($this->objects[$id] ?? []));
+        }
+        return $ops === [] ? '' : $this->toHtml($ops, $pageNumber, $pageCount, $w, $h);
+    }
+
+    // ------------------------------------------------------------------
+    // clipping and transformations (affect the drawing calls that follow)
+    // ------------------------------------------------------------------
+
+    public function clipping_rectangle($x1, $y1, $w, $h): void
+    {
+        [$x1, $y1, $w, $h] = [(float) $x1, (float) $y1, (float) $w, (float) $h];
+        $this->clip([$x1, $y1, $x1 + $w, $y1, $x1 + $w, $y1 + $h, $x1, $y1 + $h]);
+    }
+
+    public function clipping_roundrectangle($x1, $y1, $w, $h, $rTL, $rTR, $rBR, $rBL): void
+    {
+        [$x1, $y1, $w, $h] = [(float) $x1, (float) $y1, (float) $w, (float) $h];
+        $max = min($w, $h) / 2;
+        $pts = [];
+        $corner = static function (float $cx, float $cy, float $r, float $from) use (&$pts): void {
+            for ($i = 0; $i <= 6; $i++) {
+                $a = deg2rad($from + 15.0 * $i);
+                $pts[] = $cx + $r * cos($a);
+                $pts[] = $cy + $r * sin($a);
+            }
+        };
+        $tl = max(0.0, min($max, (float) $rTL));
+        $tr = max(0.0, min($max, (float) $rTR));
+        $br = max(0.0, min($max, (float) $rBR));
+        $bl = max(0.0, min($max, (float) $rBL));
+        // clockwise on the page (y grows downwards): top-left, top-right, bottom-right, bottom-left
+        $corner($x1 + $tl, $y1 + $tl, $tl, 180.0);
+        $corner($x1 + $w - $tr, $y1 + $tr, $tr, 270.0);
+        $corner($x1 + $w - $br, $y1 + $h - $br, $br, 0.0);
+        $corner($x1 + $bl, $y1 + $h - $bl, $bl, 90.0);
+        $this->clip($pts);
+    }
+
+    /** @param array<int, float|int> $points flat list x1, y1, x2, y2, ... */
+    public function clipping_polygon(array $points): void
+    {
+        $this->clip(array_map('floatval', array_values($points)));
+    }
+
+    /** Ends the clipping started by the last clipping_*() call (it restores the state saved by that call). */
+    public function clipping_end(): void
+    {
+        $this->restore();
+    }
+
+    /** Rotates the coordinate system $angle degrees around ($x, $y), as dompdf's CPDF adapter. */
+    public function rotate($angle, $x, $y): void
+    {
+        $y = $this->height - (float) $y;
+        $a = deg2rad((float) $angle);
+        $cos = cos($a);
+        $sin = sin($a);
+        $this->transform($cos, -$sin, $sin, $cos, (float) $x - $sin * $y - $cos * (float) $x, $y - $cos * $y + $sin * (float) $x);
+    }
+
+    public function skew($angle_x, $angle_y, $x, $y): void
+    {
+        $y = $this->height - (float) $y;
+        $tx = tan(deg2rad((float) $angle_x));
+        $ty = tan(deg2rad((float) $angle_y));
+        $this->transform(1.0, -$ty, -$tx, 1.0, $tx * $y, $ty * (float) $x);
+    }
+
+    public function scale($s_x, $s_y, $x, $y): void
+    {
+        $y = $this->height - (float) $y;
+        $this->transform((float) $s_x, 0.0, 0.0, (float) $s_y, (float) $x * (1 - (float) $s_x), $y * (1 - (float) $s_y));
+    }
+
+    /** Moves the origin $t_x to the right and $t_y down. */
+    public function translate($t_x, $t_y): void
+    {
+        $this->transform(1.0, 0.0, 0.0, 1.0, (float) $t_x, -(float) $t_y);
+    }
+
+    /** Concatenates a PDF matrix (`a b c d e f cm`, PDF user space: origin bottom-left, y up), as dompdf's CPDF adapter. */
+    public function transform($a, $b, $c, $d, $e, $f): void
+    {
+        $this->gs['ctm'] = self::multiply([(float) $a, (float) $b, (float) $c, (float) $d, (float) $e, (float) $f], $this->gs['ctm']);
+    }
+
+    // ------------------------------------------------------------------
+    // objects and state
+    // ------------------------------------------------------------------
+
     /** Starts recording drawing calls into a reusable object; returns its id. */
     public function open_object(): int
     {
@@ -229,6 +508,15 @@ final class Canvas
         }
         $this->objectTarget = $id;
         return $id;
+    }
+
+    /** Records the drawing calls that follow into an existing object again (until close_object()). */
+    public function reopen_object($object): void
+    {
+        $id = (int) $object;
+        if (isset($this->objects[$id])) {
+            $this->objectTarget = $id;
+        }
     }
 
     public function close_object(): void
@@ -262,6 +550,22 @@ final class Canvas
         $this->placements[] = $placement;
     }
 
+    /** Stops repeating an object (added with 'all', 'next', ...) on the pages after the current one. */
+    public function stop_object($object): void
+    {
+        $id = (int) $object;
+        foreach (['placements', 'scriptPlacements'] as $list) {
+            foreach ($this->{$list} as $k => $p) {
+                if ($p['id'] === $id && !isset($p['until'])) {
+                    $this->{$list}[$k]['until'] = $this->current;
+                }
+            }
+        }
+        if (!$this->rendering) {
+            $this->version++;
+        }
+    }
+
     /** @param string $mode PDF blend mode name (Normal, Multiply, Screen, ...), applied to text and images */
     public function set_opacity($opacity, $mode = 'Normal'): void
     {
@@ -281,9 +585,12 @@ final class Canvas
         }
     }
 
-    /** @param array{id: int, where: string, page: int} $p */
+    /** @param array{id: int, where: string, page: int, until?: int} $p */
     private static function placed(array $p, int $page): bool
     {
+        if (isset($p['until']) && $page > $p['until']) {
+            return false;
+        }
         $from = $p['page'];
         return match ($p['where']) {
             'add' => $page === $from,
@@ -297,9 +604,13 @@ final class Canvas
         };
     }
 
-    public function get_text_width($text, $font, $size, $wordSpacing = 0.0, $charSpacing = 0.0): float
+    // ------------------------------------------------------------------
+    // fonts
+    // ------------------------------------------------------------------
+
+    public function get_text_width($text, $font, $size, $word_spacing = 0.0, $char_spacing = 0.0): float
     {
-        return $this->metrics->getTextWidth((string) $text, $font, (float) $size, (float) $wordSpacing, (float) $charSpacing);
+        return $this->metrics->getTextWidth((string) $text, $font, (float) $size, (float) $word_spacing, (float) $char_spacing);
     }
 
     public function get_font_height($font, $size): float
@@ -307,14 +618,59 @@ final class Canvas
         return $this->metrics->getFontHeight($font, (float) $size);
     }
 
+    /** Distance from the top of a text line drawn with text() to its baseline (ascent + descent of the font). */
+    public function get_font_baseline($font, $size): float
+    {
+        return $this->metrics->getFontBaseline($font, (float) $size);
+    }
+
+    public function font_supports_char(string $font, string $char): bool
+    {
+        return $this->metrics->supportsChar($font, $char);
+    }
+
+    /** dompdf CPDF::output(): the PDF of the bound Dompdf instance (renders it when needed). */
+    public function output($options = []): ?string
+    {
+        return $this->dompdf?->output((array) $options);
+    }
+
+    /** dompdf CPDF::stream(): sends the PDF of the bound Dompdf instance to the browser. */
+    public function stream($filename = 'document.pdf', $options = []): void
+    {
+        $this->dompdf?->stream($filename, (array) $options);
+    }
+
+    /** dompdf CPDF::get_messages(): diagnostics of the PDF backend (the warnings collected so far). */
+    public function get_messages(): string
+    {
+        return implode("\n", $this->warnings);
+    }
+
+    /**
+     * Other CPDF adapter methods (serialize_object(), reopen_serialized_object(), select(), textarea(), input(), ...) have
+     * no IvoPDF equivalent: they do nothing, return null and add one warning per method (Dompdf::getWarnings()).
+     *
+     * @param list<mixed> $args
+     */
+    public function __call(string $method, array $args): mixed
+    {
+        if (!isset($this->reported[$method])) {
+            $this->reported[$method] = true;
+            $this->warnings[] = "Dompdf Canvas::{$method}() is not supported by IvoPDF and was ignored.";
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------
     // engine side
     // ------------------------------------------------------------------
 
     /**
-     * Overlay HTML of one page (page-sized relative box); empty string when nothing is drawn on it.
+     * Overlay HTML of one page (page-sized relative box); empty string when nothing is drawn on it. With $under the
+     * HTML of the callbacks that draw below the page content (begin_page_render).
      */
-    public function renderPage(int $pageNumber, int $pageCount, float $w, float $h): string
+    public function renderPage(int $pageNumber, int $pageCount, float $w, float $h, bool $under = false): string
     {
         $this->width = $w;
         $this->height = $h;
@@ -323,10 +679,10 @@ final class Canvas
         $this->current = $pageNumber;
         $this->rendering = true;
         $this->buffer = [];
-        $this->gs = ['opacity' => 1.0, 'mode' => 'Normal'];
+        $this->gs = self::freshState();
         $this->gsStack = [];
         $this->objectTarget = null;
-        if ($pageNumber <= $this->lastRendered) {
+        if (!$under && $pageNumber <= $this->lastRendered) {
             // a new overlay pass: forget the objects the callbacks created during the previous one
             foreach ($this->scriptObjects as $id) {
                 unset($this->objects[$id]);
@@ -334,29 +690,38 @@ final class Canvas
             $this->scriptObjects = [];
             $this->scriptPlacements = [];
         }
-        $this->lastRendered = $pageNumber;
         try {
-            foreach ($this->everyPage as $op) {
-                $this->buffer[] = $op;
-            }
-            foreach ($this->placements as $p) {
-                if (self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
-                    array_push($this->buffer, ...$this->objects[$p['id']]);
+            if ($under) {
+                foreach ($this->underScripts as $cb) {
+                    $this->gs = self::freshState();
+                    $this->gsStack = [];
+                    $cb($pageNumber, $pageCount, $this, $this->metrics);
+                    $this->objectTarget = null;
                 }
-            }
-            foreach ($this->scriptPlacements as $p) {
-                if ($p['page'] < $pageNumber && self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
-                    array_push($this->buffer, ...$this->objects[$p['id']]);
+            } else {
+                $this->lastRendered = $pageNumber;
+                foreach ($this->everyPage as $op) {
+                    $this->buffer[] = $op;
                 }
-            }
-            foreach ($this->scripts as $cb) {
-                $this->gs = ['opacity' => 1.0, 'mode' => 'Normal'];
-                $this->gsStack = [];
-                $cb($pageNumber, $pageCount, $this, $this->metrics);
-                $this->objectTarget = null;
-            }
-            foreach ($this->perPage[$pageNumber] ?? [] as $op) {
-                $this->buffer[] = $op;
+                foreach ($this->placements as $p) {
+                    if (self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
+                        array_push($this->buffer, ...$this->objects[$p['id']]);
+                    }
+                }
+                foreach ($this->scriptPlacements as $p) {
+                    if ($p['page'] < $pageNumber && self::placed($p, $pageNumber) && isset($this->objects[$p['id']])) {
+                        array_push($this->buffer, ...$this->objects[$p['id']]);
+                    }
+                }
+                foreach ([...$this->scripts, ...$this->callbackScripts] as $cb) {
+                    $this->gs = self::freshState();
+                    $this->gsStack = [];
+                    $cb($pageNumber, $pageCount, $this, $this->metrics);
+                    $this->objectTarget = null;
+                }
+                foreach ($this->perPage[$pageNumber] ?? [] as $op) {
+                    $this->buffer[] = $op;
+                }
             }
             $ops = $this->buffer;
         } finally {
@@ -364,7 +729,18 @@ final class Canvas
             $this->buffer = [];
             [$this->current, $this->version, $this->gs, $this->gsStack, $this->objectTarget] = $saved; // drawing done by callbacks is not an application change
         }
-        return $ops === [] ? '' : $this->toHtml($ops, $pageNumber, $pageCount, $w, $h);
+        if ($ops === []) {
+            return '';
+        }
+        $html = $this->toHtml($ops, $pageNumber, $pageCount, $w, $h);
+        // the renderer paints a box marked data-ivo-underlay before the page content
+        return $under ? '<div data-ivo-underlay="1" style="position:absolute;left:0;top:0;margin:0;padding:0">' . $html . '</div>' : $html;
+    }
+
+    /** @return array{opacity: float, mode: string, ctm: list<float>, clips: list<list<float>>} */
+    private static function freshState(): array
+    {
+        return ['opacity' => 1.0, 'mode' => 'Normal', 'ctm' => self::IDENTITY, 'clips' => []];
     }
 
     /** @param array<string, mixed> $op */
@@ -375,6 +751,12 @@ final class Canvas
         }
         if ($this->gs['mode'] !== 'Normal') {
             $op['mode'] = $this->gs['mode'];
+        }
+        if ($this->gs['ctm'] !== self::IDENTITY) {
+            $op['m'] = $this->deviceMatrix($this->gs['ctm']);
+        }
+        if ($this->gs['clips'] !== []) {
+            $op['clips'] = $this->gs['clips'];
         }
         if ($this->objectTarget !== null) {
             $this->objects[$this->objectTarget][] = $op;
@@ -388,6 +770,57 @@ final class Canvas
         $this->perPage[$this->current][] = $op;
     }
 
+    /** Saves the state and intersects the clip with a polygon given in the current (transformed) coordinates. */
+    private function clip(array $points): void
+    {
+        $this->save();
+        if (count($points) < 6) {
+            return;
+        }
+        $m = $this->deviceMatrix($this->gs['ctm']);
+        $poly = [];
+        for ($i = 0; $i + 1 < count($points); $i += 2) {
+            $poly[] = $m[0] * $points[$i] + $m[2] * $points[$i + 1] + $m[4];
+            $poly[] = $m[1] * $points[$i] + $m[3] * $points[$i + 1] + $m[5];
+        }
+        $this->gs['clips'][] = $poly;
+    }
+
+    /**
+     * The CTM (PDF user space, y up) as a matrix of dompdf's top-left page coordinates (y down): F * CTM * F with
+     * F(x, y) = (x, H - y).
+     *
+     * @param list<float> $ctm
+     * @return list<float>
+     */
+    private function deviceMatrix(array $ctm): array
+    {
+        [$a, $b, $c, $d, $e, $f] = $ctm;
+        $h = $this->height;
+        return [$a, -$b, -$c, $d, $c * $h + $e, $h - $d * $h - $f];
+    }
+
+    /**
+     * Product of two PDF matrices: the result applies $first, then $second.
+     *
+     * @param list<float> $first
+     * @param list<float> $second
+     * @return list<float>
+     */
+    private static function multiply(array $first, array $second): array
+    {
+        [$a1, $b1, $c1, $d1, $e1, $f1] = $first;
+        [$a2, $b2, $c2, $d2, $e2, $f2] = $second;
+        return [
+            $a1 * $a2 + $b1 * $c2,
+            $a1 * $b2 + $b1 * $d2,
+            $c1 * $a2 + $d1 * $c2,
+            $c1 * $b2 + $d1 * $d2,
+            $e1 * $a2 + $f1 * $c2 + $e2,
+            $e1 * $b2 + $f1 * $d2 + $f2,
+        ];
+    }
+
     /** @return array<string, mixed> */
     private function textOp($x, $y, string $text, $font, $size, $color, $wordSpace, $charSpace, $angle): array
     {
@@ -399,42 +832,73 @@ final class Canvas
     {
         $html = '';
         $svg = '';
-        $svgMode = 'Normal';
-        $flush = function () use (&$svg, &$svgMode, &$html, $w, $h): void {
+        $svgKey = '';
+        $svgOp = [];
+        $flush = function () use (&$svg, &$svgOp, &$html, $w, $h): void {
             if ($svg !== '') {
-                $html .= sprintf('<svg xmlns="http://www.w3.org/2000/svg" width="%1$.2Fpt" height="%2$.2Fpt" viewBox="0 0 %1$.2F %2$.2F" style="position:absolute;left:0;top:0%4$s">%3$s</svg>', $w, $h, $svg, self::blend($svgMode));
+                $el = sprintf('<svg xmlns="http://www.w3.org/2000/svg" width="%1$.2Fpt" height="%2$.2Fpt" viewBox="0 0 %1$.2F %2$.2F" style="position:absolute;left:0;top:0%4$s">%3$s</svg>', $w, $h, $svg, self::blend((string) ($svgOp['mode'] ?? 'Normal')));
+                $html .= $this->wrapState($el, $svgOp, $w, $h);
                 $svg = '';
             }
         };
         foreach ($ops as $op) {
             if (in_array($op['op'], ['line', 'rect', 'circle', 'poly'], true)) {
-                $mode = (string) ($op['mode'] ?? 'Normal');
-                if ($svg !== '' && $mode !== $svgMode) {
+                $key = json_encode([$op['mode'] ?? 'Normal', $op['m'] ?? null, $op['clips'] ?? null]);
+                if ($svg !== '' && $key !== $svgKey) {
                     $flush();
                 }
-                $svgMode = $mode;
+                $svgKey = (string) $key;
+                $svgOp = $op;
             }
             switch ($op['op']) {
                 case 'text':
                     $flush();
-                    $html .= $this->textHtml($op, $pageNumber, $pageCount);
+                    $html .= $this->wrapState($this->textHtml($op, $pageNumber, $pageCount), $op, $w, $h);
                     break;
                 case 'image':
                     $flush();
-                    $html .= sprintf(
-                        '<img src="%s" style="position:absolute;left:%.2Fpt;top:%.2Fpt;width:%.2Fpt;height:%.2Fpt%s">',
+                    $html .= $this->wrapState(sprintf(
+                        '<img src="%s" style="position:absolute;left:%.2Fpt;top:%.2Fpt%s%s%s">',
                         htmlspecialchars($op['src'], ENT_QUOTES, 'UTF-8'),
                         $op['x'],
                         $op['y'],
-                        $op['w'],
-                        $op['h'],
+                        $op['w'] > 0 ? sprintf(';width:%.2Fpt', $op['w']) : '', // 0: natural size / keep the aspect ratio
+                        $op['h'] > 0 ? sprintf(';height:%.2Fpt', $op['h']) : '',
                         (isset($op['opacity']) ? sprintf(';opacity:%.3F', $op['opacity']) : '') . self::blend((string) ($op['mode'] ?? 'Normal'))
-                    );
+                    ), $op, $w, $h);
+                    break;
+                case 'link':
+                    $flush();
+                    $html .= $this->wrapState(sprintf(
+                        '<a href="%s" style="position:absolute;display:block;left:%.2Fpt;top:%.2Fpt;width:%.2Fpt;height:%.2Fpt;margin:0;padding:0"></a>',
+                        htmlspecialchars($op['url'], ENT_QUOTES, 'UTF-8'),
+                        $op['x'],
+                        $op['y'],
+                        max(0.0, $op['w']),
+                        max(0.0, $op['h'])
+                    ), $op, $w, $h);
+                    break;
+                case 'dest':
+                    $flush();
+                    $name = htmlspecialchars($op['name'], ENT_QUOTES, 'UTF-8');
+                    $html .= sprintf('<div data-ivo-dest="%s" style="position:absolute;left:0;top:%.2Fpt;width:1pt;height:1pt;margin:0;padding:0"></div>', $name, (float) ($op['y'] ?? 0.0));
+                    break;
+                case 'html':
+                    $flush();
+                    $html .= $this->wrapState(sprintf(
+                        '<div style="position:absolute;left:%.2Fpt;top:%.2Fpt;width:%.2Fpt;height:%.2Fpt;margin:0;padding:0%s">%s</div>',
+                        $op['x'],
+                        $op['y'],
+                        max(0.0, $op['w']),
+                        max(0.0, $op['h']),
+                        $op['overflow'] === 'hidden' ? ';overflow:hidden' : '',
+                        $op['html']
+                    ), $op, $w, $h);
                     break;
                 case 'line':
                     [$rgb, $alpha] = self::color($op['color']);
                     $alpha *= (float) ($op['opacity'] ?? 1.0);
-                    $svg .= sprintf('<line x1="%.2F" y1="%.2F" x2="%.2F" y2="%.2F" stroke="%s" stroke-opacity="%.3F" stroke-width="%.2F"%s/>', $op['x1'], $op['y1'], $op['x2'], $op['y2'], $rgb, $alpha, $op['w'], self::dash($op['dash']));
+                    $svg .= sprintf('<line x1="%.2F" y1="%.2F" x2="%.2F" y2="%.2F" stroke="%s" stroke-opacity="%.3F" stroke-width="%.2F"%s%s/>', $op['x1'], $op['y1'], $op['x2'], $op['y2'], $rgb, $alpha, $op['w'], self::dash($op['dash']), self::cap($op));
                     break;
                 case 'rect':
                     $svg .= sprintf('<rect x="%.2F" y="%.2F" width="%.2F" height="%.2F"%s/>', $op['x'], $op['y'], $op['w'], $op['h'], self::paint($op));
@@ -447,12 +911,35 @@ final class Canvas
                     for ($i = 0; $i + 1 < count($op['pts']); $i += 2) {
                         $pts[] = sprintf('%.2F,%.2F', $op['pts'][$i], $op['pts'][$i + 1]);
                     }
-                    $svg .= '<polygon points="' . implode(' ', $pts) . '"' . self::paint($op) . '/>';
+                    $svg .= '<' . (!empty($op['open']) ? 'polyline' : 'polygon') . ' points="' . implode(' ', $pts) . '"' . self::paint($op) . '/>';
                     break;
             }
         }
         $flush();
         return sprintf('<div style="position:relative;width:%.2Fpt;height:%.2Fpt;margin:0;padding:0;overflow:hidden">%s</div>', $w, $h, $html);
+    }
+
+    /**
+     * Wraps an element (positioned in page coordinates) in page-sized boxes that apply the clip polygons (outermost first)
+     * and the transformation matrix that were current when it was drawn.
+     *
+     * @param array<string, mixed> $op
+     */
+    private function wrapState(string $el, array $op, float $w, float $h): string
+    {
+        $box = sprintf('position:absolute;left:0;top:0;width:%.2Fpt;height:%.2Fpt;margin:0;padding:0', $w, $h);
+        if (isset($op['m'])) {
+            [$a, $b, $c, $d, $e, $f] = $op['m'];
+            $el = sprintf('<div style="%s;transform-origin:0 0;transform:translate(%.3Fpt, %.3Fpt) matrix(%.6F, %.6F, %.6F, %.6F, 0, 0)">%s</div>', $box, $e, $f, $a, $b, $c, $d, $el);
+        }
+        foreach (array_reverse($op['clips'] ?? []) as $poly) {
+            $pts = [];
+            for ($i = 0; $i + 1 < count($poly); $i += 2) {
+                $pts[] = sprintf('%.2Fpt %.2Fpt', $poly[$i], $poly[$i + 1]);
+            }
+            $el = sprintf('<div style="%s;clip-path:polygon(%s)">%s</div>', $box, implode(', ', $pts), $el);
+        }
+        return $el;
     }
 
     /** @param array<string, mixed> $op */
@@ -508,7 +995,14 @@ final class Canvas
         if ($op['fill']) {
             return sprintf(' fill="%s" fill-opacity="%.3F" stroke="none"', $rgb, $alpha);
         }
-        return sprintf(' fill="none" stroke="%s" stroke-opacity="%.3F" stroke-width="%.2F"%s', $rgb, $alpha, $op['lw'], self::dash($op['dash']));
+        return sprintf(' fill="none" stroke="%s" stroke-opacity="%.3F" stroke-width="%.2F"%s%s', $rgb, $alpha, $op['lw'], self::dash($op['dash']), self::cap($op));
+    }
+
+    /** @param array<string, mixed> $op */
+    private static function cap(array $op): string
+    {
+        $cap = strtolower((string) ($op['cap'] ?? 'butt'));
+        return in_array($cap, ['round', 'square'], true) ? ' stroke-linecap="' . $cap . '"' : '';
     }
 
     /** @param array<int, float|int> $dash */

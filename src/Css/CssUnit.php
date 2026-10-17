@@ -15,6 +15,22 @@ class CssUnit
     public const IN_TO_PT = 72.0;
     public const PC_TO_PT = 12.0;
 
+    /**
+     * Largest font size, border width, padding, line height and image size honoured: 14 400 pt (200 in), the largest
+     * page side a PDF can describe. Nothing bigger can be seen on a page; absurd values from untrusted input
+     * (`font-size: 1e9pt`, `border: 1e9px`) would otherwise only stretch one element over thousands of pages.
+     */
+    public const MAX_LENGTH_PT = 14400.0;
+
+    /** Clamps a resolved length to +-MAX_LENGTH_PT (NaN becomes 0). */
+    public static function clampLength(float $pt): float
+    {
+        if (is_nan($pt)) {
+            return 0.0;
+        }
+        return max(-self::MAX_LENGTH_PT, min(self::MAX_LENGTH_PT, $pt));
+    }
+
     private static float $dpi = 96.0;
 
     public static function setDpi(float $dpi): void

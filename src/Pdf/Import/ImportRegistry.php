@@ -50,6 +50,25 @@ final class ImportRegistry
         $this->backgrounds[$pageIndex] = $name;
     }
 
+    /**
+     * Output pages were rearranged (PdfDocument::setPageOrderResolver()): old index => new index; pages missing from
+     * the map were dropped.
+     *
+     * @param array<int, int> $map
+     */
+    public function remapPages(array $map): void
+    {
+        foreach (['backgrounds', 'appended'] as $list) {
+            $out = [];
+            foreach ($this->{$list} as $old => $name) {
+                if (isset($map[$old])) {
+                    $out[$map[$old]] = $name;
+                }
+            }
+            $this->{$list} = $out;
+        }
+    }
+
     /** Marks an output page as a whole imported page (its annotations are carried over). */
     public function markAppended(int $pageIndex, string $name): void
     {

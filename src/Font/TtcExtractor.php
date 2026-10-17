@@ -20,6 +20,9 @@ final class TtcExtractor
      */
     public static function splitReference(string $reference): array
     {
+        if (\IvoPdf\Options::isNetworkPath($reference)) {
+            return [$reference, 0]; // never stat()ed (UNC / stream wrapper); TtfParser refuses it
+        }
         if (preg_match('/^(.*)#(\d{1,3})$/s', $reference, $m) === 1 && !is_file($reference)) {
             return [$m[1], (int) $m[2]];
         }

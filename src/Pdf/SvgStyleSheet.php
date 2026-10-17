@@ -42,9 +42,17 @@ final class SvgStyleSheet
             return;
         }
 
+        // Cursor walk in document order: iterating getElementsByTagName('*') is quadratic before PHP 8.3
         $elements = [$root];
-        foreach ($root->getElementsByTagName('*') as $el) {
+        $el = $root->firstElementChild;
+        while ($el !== null) {
             $elements[] = $el;
+            $next = $el->firstElementChild;
+            while ($next === null && $el !== null && $el !== $root) {
+                $next = $el->nextElementSibling;
+                $el = $next === null ? $el->parentNode : $el;
+            }
+            $el = $next;
         }
         foreach ($elements as $el) {
             $matched = [];

@@ -201,7 +201,8 @@ final class PageRefResolver
         $pitch = $charW + $spacing;
         $gap = 3.0;
         $avail = $tailStart - $gap - $leader->x;
-        $n = (int) floor(($avail + $spacing) / $pitch);
+        // a leader is never wider than a page: absurd geometry (outdent="-1e20") must not build a giant string
+        $n = (int) max(0.0, min(2000.0, floor(($avail + $spacing) / $pitch)));
         if ($n < 1 || $spec === 'space') {
             $leader->text = $spec === 'space' ? "\u{00A0}" : '';
             $leader->width = max(0.0, $avail);

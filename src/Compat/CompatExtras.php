@@ -96,6 +96,10 @@ trait CompatExtras
                 $this->options->addWarning($w);
             }
         }
+        $drawn = $this->mpdfDrawHtml($pageNumber, $pageCount, (float) $geo['w'], (float) $geo['h']); // mPDF Image() / WriteFixedPosHTML() / Cell() ...
+        if ($drawn !== '') {
+            $layers[] = $this->layoutHtmlBox($drawn, $engine, 0.0, 0.0, (float) $geo['w']);
+        }
         if ($this->pageOverlay !== null) {
             $html = ($this->pageOverlay)($pageNumber, $pageCount, (float) $geo['w'], (float) $geo['h']);
             if (trim($html) !== '') {

@@ -48,7 +48,8 @@ trait PdfComposeApi
     public function attachFile(string $pathOrBytes, string $name, string $description = '', string $mime = 'application/octet-stream', string $relationship = 'Unspecified'): self
     {
         $modTime = null;
-        $isPath = strlen($pathOrBytes) <= 4096 && !str_contains($pathOrBytes, "\0") && !str_contains($pathOrBytes, "\n") && @is_file($pathOrBytes);
+        $isPath = strlen($pathOrBytes) <= 4096 && !str_contains($pathOrBytes, "\0") && !str_contains($pathOrBytes, "\n")
+            && !\IvoPdf\Options::isNetworkPath($pathOrBytes) && @is_file($pathOrBytes); // UNC / wrapper paths are never stat()ed
         if ($isPath) {
             $path = $this->composeResolvePath($pathOrBytes);
             $bytes = @file_get_contents($path);
@@ -58,6 +59,10 @@ trait PdfComposeApi
             $modTime = @filemtime($path) ?: null;
         } else {
             $bytes = $pathOrBytes;
+            if (\IvoPdf\Options::isNetworkPath($pathOrBytes) && strlen($pathOrBytes) < 1024 && !str_contains($pathOrBytes, "
+")) {
+                $this->options->addStickyWarning("attachFile('{$name}'): '{$pathOrBytes}' looks like a UNC / network path, which is never read; the string itself was attached (use a local path, or attachData() for content).");
+            }
         }
         return $this->composeAddAttachment($bytes, $name, $description, $mime, $relationship, $modTime);
     }
@@ -283,6 +288,9 @@ trait PdfComposeApi
     /** Applies the same containment rule as loadHtmlFile(): enforced as soon as basePath / allowedPaths is set. */
     private function composeResolvePath(string $path): string
     {
+        if (\IvoPdf\Options::isNetworkPath($path)) {
+            throw new RuntimeException("Network / non-local path refused (UNC, protocol-relative or stream wrapper): {$path}");
+        }
         if (!empty($this->options->allowedPaths) || $this->options->basePath !== null) {
             $safe = $this->options->resolveAllowedLocalFile($path);
             if ($safe === null) {

@@ -477,6 +477,9 @@ class CssParser
             if (!CssValidator::isValid($prop, $val)) {
                 continue;
             }
+            if ($prop === 'tab-size' && is_numeric($val) && (float) $val > 1000.0) {
+                $val = '1000'; // `tab-size: 1e9` from untrusted CSS: no tab stop is ever wider than a thousand spaces
+            }
 
             // A later normal declaration never overrides an earlier !important one of the same block
             if (isset($result[$prop]) && $result[$prop]['important'] && !$important) {
@@ -500,6 +503,7 @@ class CssParser
     public function computeStyleForElement(DOMElement $el, ComputedStyle $parentStyle): ComputedStyle
     {
         \IvoPdf\RenderLimits::tick();
+        $this->classSetElement = null; // an element's classes are read afresh for every cascade
         $tag = strtolower($el->tagName);
 
         // Sibling elements with the same tag and attributes under one parent get the same style unless a selector
@@ -702,15 +706,17 @@ class CssParser
             $this->ruleIndexCount = count($this->rules);
         }
         $ix = $this->ruleIndex;
-        $keys = $ix['any'];
+        // Lists are merged once at the end: merging per class would copy the growing list for every class
+        // (an element with 20 000 classes, each with a rule, was quadratic)
+        $parts = [$ix['any']];
         $tagKeys = $ix['tag'][strtolower($el->tagName)] ?? null;
         if ($tagKeys !== null) {
-            $keys = array_merge($keys, $tagKeys);
+            $parts[] = $tagKeys;
         }
         if ($ix['id'] !== []) {
             $elId = $el->getAttribute('id');
             if ($elId !== '' && isset($ix['id'][$elId])) {
-                $keys = array_merge($keys, $ix['id'][$elId]);
+                $parts[] = $ix['id'][$elId];
             }
         }
         if ($ix['class'] !== []) {
@@ -718,11 +724,12 @@ class CssParser
             if ($classAttr !== '') {
                 foreach (array_unique(preg_split('/\s+/', $classAttr, -1, PREG_SPLIT_NO_EMPTY) ?: []) as $cls) {
                     if (isset($ix['class'][$cls])) {
-                        $keys = array_merge($keys, $ix['class'][$cls]);
+                        $parts[] = $ix['class'][$cls];
                     }
                 }
             }
         }
+        $keys = count($parts) === 1 ? $parts[0] : array_merge(...$parts);
         $out = [];
         foreach ($keys as $i) {
             $out[] = $this->rules[$i];
@@ -857,7 +864,7 @@ class CssParser
                 $style->set('font-family', trim($el->getAttribute('face')));
             }
             if ($el->hasAttribute('size')) {
-                $sz = (int) $el->getAttribute('size');
+                $sz = \IvoPdf\Dom\InputGuards::intAttr($el->getAttribute('size'), -1000, 1000, 0);
                 $pt = match ($sz) {
                     1 => '8pt',
                     2 => '10pt',
@@ -957,6 +964,9 @@ class CssParser
      *
      * @return list<mixed>|null
      */
+    /** Deepest nesting of functional pseudo-classes (`:not(:is(...))`) a selector may have before it is ignored */
+    private const MAX_SELECTOR_NESTING = 32;
+
     private function compileSelector(string $sel): ?array
     {
         if (array_key_exists($sel, $this->compiledCache)) {
@@ -1010,7 +1020,11 @@ class CssParser
                 continue;
             }
             if ($ch === '(') {
-                $depthParen++;
+                if (++$depthParen > self::MAX_SELECTOR_NESTING) {
+                    // :not(:not(:not(... thousands deep: every level would re-parse and re-match the rest (quadratic);
+                    // no real stylesheet nests functional pseudo-classes this deep, so the rule is dropped
+                    return $this->compiledCache[$sel] = null;
+                }
             } elseif ($ch === ')') {
                 $depthParen = max(0, $depthParen - 1);
             } elseif ($ch === '[') {
@@ -1224,6 +1238,11 @@ class CssParser
      *
      * @param list<mixed> $parts
      */
+    /** element whose class set is in $classSet (see matchesCompound()) */
+    private ?DOMElement $classSetElement = null;
+    /** @var array<string, int> */
+    private array $classSet = [];
+
     private function matchesCompiled(DOMElement $el, array $parts, int $idx): bool
     {
         if (!$this->matchesCompound($el, $parts[$idx])) {
@@ -1283,13 +1302,18 @@ class CssParser
         }
 
         if (!empty($c['classes'])) {
-            $classAttr = trim($el->getAttribute('class'));
-            if ($classAttr === '') {
+            // The class set of the element is built once and looked up by key: reading, splitting and scanning a class
+            // attribute of 20 000 names for every rule that names one of them was quadratic. The element is held, so
+            // its object id cannot be reused by another element while it is the cached one.
+            if ($el !== $this->classSetElement) {
+                $this->classSetElement = $el;
+                $this->classSet = array_flip(preg_split('/\s+/', trim($el->getAttribute('class')), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            }
+            if ($this->classSet === []) {
                 return false;
             }
-            $elClasses = preg_split('/\s+/', $classAttr, -1, PREG_SPLIT_NO_EMPTY) ?: [];
             foreach ($c['classes'] as $reqClass) {
-                if (!in_array($reqClass, $elClasses, true)) {
+                if (!isset($this->classSet[$reqClass])) {
                     return false;
                 }
             }
@@ -1439,8 +1463,16 @@ class CssParser
                     $next = $next->nextSibling;
                 }
             } else {
-                foreach ($el->getElementsByTagName('*') as $desc) {
+                // Cursor walk in document order: iterating getElementsByTagName('*') is quadratic before PHP 8.3
+                $desc = $el->firstElementChild;
+                while ($desc !== null) {
                     $candidates[] = $desc;
+                    $next = $desc->firstElementChild;
+                    while ($next === null && $desc !== null && $desc !== $el) {
+                        $next = $desc->nextElementSibling;
+                        $desc = $next === null ? $desc->parentNode : $desc;
+                    }
+                    $desc = $next;
                 }
             }
             foreach ($candidates as $cand) {

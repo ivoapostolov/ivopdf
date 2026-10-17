@@ -433,8 +433,10 @@ class InlineLayout
                 }
             }
 
-            // A single word still wider than the line: break it by characters (unless nowrap)
-            if (!$isNoWrap && !$token->isWhitespace && $token->inlineBox === null && ($currentWidth + $tokenTotalWidth > $availW + 0.05) && $availW > 5.0 && $tokenTotalWidth > $availW + 0.05) {
+            // A single word still wider than the line: with `overflow-wrap: anywhere | break-word` (or `word-break:
+            // break-word | break-all`) it is broken by characters; otherwise it overflows the box, as in browsers
+            if (!$isNoWrap && !$token->isWhitespace && $token->inlineBox === null && ($currentWidth + $tokenTotalWidth > $availW + 0.05) && $availW > 5.0 && $tokenTotalWidth > $availW + 0.05
+                && self::breaksOverflowingWords($token->style)) {
                 $pieces = $this->splitOversizedWordToken($token, max(5.0, $availW - $currentWidth), $availW);
                 $pieceCount = count($pieces);
                 foreach ($pieces as $pi => $piece) {
@@ -482,6 +484,7 @@ class InlineLayout
         $lineTops = [];
 
         foreach ($rawLines as $lineIdx => $lineData) {
+            \IvoPdf\RenderLimits::tick(); // one LineBox per line: 30 000 lines of one paragraph
             $runs = $lineData['runs'];
             if ($reorder) {
                 $runs = $this->reorderLine($runs);
@@ -532,8 +535,10 @@ class InlineLayout
                 $halfLeading = $run->inlineBox !== null ? 0.0 : ($lhPt - ($run->ascent + $run->descent)) / 2.0; // may be negative (CSS 2.1 10.8.1)
                 $vOffset = $this->verticalOffset($run);
 
-                $asc = $run->ascent + $halfLeading + $run->paddingTop - $vOffset;
-                $desc = $run->descent + $halfLeading + $run->paddingBottom + $vOffset;
+                // Vertical padding and borders of inline (non-replaced) boxes do not enlarge the line box (CSS 2.1
+                // 10.8.1): a padded <span> badge overlaps the lines around it, as in browsers
+                $asc = $run->ascent + $halfLeading - $vOffset;
+                $desc = $run->descent + $halfLeading + $vOffset;
 
                 $maxAscent = max($maxAscent, $asc);
                 $maxDescent = max($maxDescent, $desc);
@@ -626,6 +631,17 @@ class InlineLayout
         }
 
         return $cursorY;
+    }
+
+    /** `overflow-wrap: anywhere | break-word` or `word-break: break-word | break-all`: an overlong word may break anywhere. */
+    private static function breaksOverflowingWords(ComputedStyle $style): bool
+    {
+        $wrap = strtolower(trim($style->get('overflow-wrap', 'normal')));
+        if ($wrap === 'anywhere' || $wrap === 'break-word') {
+            return true;
+        }
+        $wb = strtolower(trim($style->get('word-break', 'normal')));
+        return $wb === 'break-word' || $wb === 'break-all';
     }
 
     /** Whether the inline layout is collecting the floats of the block container being laid out. */
@@ -1250,6 +1266,7 @@ class InlineLayout
      */
     private function collectInlineTokens(LayoutBox $node, float $availableWidth, array &$tokens): void
     {
+        \IvoPdf\RenderLimits::tick(); // 100 000 <br> / links make 200 000 tokens before the first line is built
         if (!$node->isTextNode() && $node->parent !== null && $this->collectingFloats
             && in_array(strtolower(trim($node->style->get('float', 'none'))), ['left', 'right'], true)) {
             // A float of the block container met in its inline content (already sized by the block layout)
@@ -1345,6 +1362,7 @@ class InlineLayout
             $segmentCount = count($segments);
 
             foreach ($segments as $si => $segment) {
+                $this->tabLimit = $availableWidth;
                 $this->tokenizeStringIntoRuns(
                     $segment,
                     $style,
@@ -1647,6 +1665,9 @@ class InlineLayout
         }
     }
 
+    /** Width of the line box the text being tokenized is laid out in: the upper bound of one tab stop interval */
+    private float $tabLimit = 0.0;
+
     /** @var array{n: int, id: int, w: float}|null running width of the current line in the token list (tab stops) */
     private ?array $tabColumn = null;
 
@@ -1702,6 +1723,9 @@ class InlineLayout
                 $tabW = 8 * $spaceW;
             }
         }
+        // `tab-size: 1e9` must not build a gigabyte of spaces: a tab never advances further than the line width
+        // (the text after it overflows the line either way)
+        $tabW = min($tabW, max($this->tabLimit, 8 * $spaceW, 1.0));
         $col = $this->currentLineWidth($tokens);
         $start = $col;
         $text = '';
@@ -1709,7 +1733,7 @@ class InlineLayout
             if ($ch === "\t") {
                 $next = $tabW > 0.01 ? (floor(($col + 0.01) / $tabW) + 1) * $tabW : $col;
                 $adv = $next - $col;
-                $text .= str_repeat(' ', $spaceW > 0.01 ? max(1, (int) round($adv / $spaceW)) : 1);
+                $text .= str_repeat(' ', $spaceW > 0.01 ? max(1, min(1000, (int) round($adv / $spaceW))) : 1);
                 $col = $next;
             } else {
                 $text .= ' ';
@@ -1873,6 +1897,11 @@ class InlineLayout
     }
 
     private function resolveLineHeight(ComputedStyle $style, float $fontSizePt): float
+    {
+        return CssUnit::clampLength($this->resolveLineHeightRaw($style, $fontSizePt)); // `line-height: 1e9`
+    }
+
+    private function resolveLineHeightRaw(ComputedStyle $style, float $fontSizePt): float
     {
         $v = strtolower(trim($style->get('line-height', 'normal')));
         if ($v === '' || $v === 'normal') {

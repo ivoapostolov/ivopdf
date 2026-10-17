@@ -21,7 +21,7 @@ final class MpdfExtraTags
     public static function dotTab(array $a, ?MpdfState $s = null): string
     {
         $style = self::styleMap($a['style'] ?? '');
-        $outdent = self::length($a['outdent'] ?? ($style['outdent'] ?? ''), 12.0);
+        $outdent = min(10000.0, self::length($a['outdent'] ?? ($style['outdent'] ?? ''), 12.0)); // absurd values: no int-cast warning
         if ($outdent <= 0 || $s === null) {
             return '<span class="ivo-dottab"></span>';
         }

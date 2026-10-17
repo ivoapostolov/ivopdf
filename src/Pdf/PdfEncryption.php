@@ -146,9 +146,53 @@ final class PdfEncryption
         return '<< /Filter /Standard /V 2 /R 3 /Length 128 /O ' . $h($this->o) . ' /U ' . $h($this->u) . ' /P ' . $this->p . ' >>';
     }
 
+    /**
+     * Converts a password to the byte string the R2-R4 (RC4 / AES-128) handlers hash: ISO 32000-1 7.6.3.3 Algorithm 2 step (a)
+     * requires PDFDocEncoding, which is what Acrobat, qpdf and MuPDF do with a typed password. Strings that are not valid UTF-8
+     * are taken as already-encoded bytes (qpdf "auto" password mode). A password with characters outside PDFDocEncoding (e.g.
+     * Cyrillic, Greek, CJK) cannot be typed into any conforming reader for these methods, so - like qpdf - it is refused with an
+     * InvalidArgumentException instead of producing a file nobody can open; use 'aes256' (UTF-8/SASLprep, ISO 32000-2) instead.
+     */
+    public static function legacyPasswordBytes(string $password): string
+    {
+        if ($password === '' || !preg_match('//u', $password) || !preg_match('/[\x80-\xFF]/', $password)) {
+            return $password;
+        }
+        static $special = null;
+        $special ??= [
+            0x02D8 => 0x18, 0x02C7 => 0x19, 0x02C6 => 0x1A, 0x02D9 => 0x1B, 0x02DD => 0x1C, 0x02DB => 0x1D, 0x02DA => 0x1E,
+            0x02DC => 0x1F, 0x2022 => 0x80, 0x2020 => 0x81, 0x2021 => 0x82, 0x2026 => 0x83, 0x2014 => 0x84, 0x2013 => 0x85,
+            0x0192 => 0x86, 0x2044 => 0x87, 0x2039 => 0x88, 0x203A => 0x89, 0x2212 => 0x8A, 0x2030 => 0x8B, 0x201E => 0x8C,
+            0x201C => 0x8D, 0x201D => 0x8E, 0x2018 => 0x8F, 0x2019 => 0x90, 0x201A => 0x91, 0x2122 => 0x92, 0xFB01 => 0x93,
+            0xFB02 => 0x94, 0x0141 => 0x95, 0x0152 => 0x96, 0x0160 => 0x97, 0x0178 => 0x98, 0x017D => 0x99, 0x0131 => 0x9A,
+            0x0142 => 0x9B, 0x0153 => 0x9C, 0x0161 => 0x9D, 0x017E => 0x9E, 0x20AC => 0xA0,
+        ];
+        $out = '';
+        foreach (preg_split('//u', $password, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $ch) {
+            $cp = mb_ord($ch, 'UTF-8');
+            if ($cp < 0x18 || ($cp >= 0x20 && $cp <= 0x7E)) {
+                $out .= chr($cp);
+            } elseif ($cp >= 0xA1 && $cp <= 0xFF && $cp !== 0xAD) {
+                $out .= chr($cp);
+            } elseif (isset($special[$cp])) {
+                $out .= chr($special[$cp]);
+            } else {
+                throw new \InvalidArgumentException(sprintf(
+                    'The password contains the character U+%04X, which cannot be represented in PDFDocEncoding as RC4 / AES-128 '
+                    . 'encryption requires (ISO 32000-1 7.6.3.3); readers could not open the file. Use the "aes256" method for '
+                    . 'Unicode passwords.',
+                    $cp
+                ));
+            }
+        }
+        return $out;
+    }
+
     private function initLegacy(string $userPassword, string $ownerPassword, string $id0): void
     {
         $idBytes = $id0;
+        $userPassword = self::legacyPasswordBytes($userPassword);
+        $ownerPassword = self::legacyPasswordBytes($ownerPassword);
         $userPad = substr($userPassword . self::PAD, 0, 32);
         $ownerPad = substr($ownerPassword . self::PAD, 0, 32);
 

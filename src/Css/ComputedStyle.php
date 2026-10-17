@@ -100,6 +100,8 @@ class ComputedStyle
         'font-variant-caps',
         'font-variant-numeric',
         'text-shadow',
+        'orphans',
+        'widows',
     ];
 
     /**
@@ -497,8 +499,7 @@ class ComputedStyle
                 break;
             case 'caption':
                 $this->set('display', 'table-caption');
-                $this->set('text-align', 'center');
-                $this->set('padding-bottom', '4pt');
+                $this->set('text-align', 'center'); // no padding: browsers give captions none
                 break;
             case 'colgroup':
                 $this->set('display', 'table-column-group');
@@ -758,6 +759,9 @@ class ComputedStyle
     {
         $this->materialize();
         $key = strtolower(trim($prop));
+        if ($key === 'word-wrap') {
+            $key = 'overflow-wrap'; // legacy name, still common in templates (CSS Text 3: an alias)
+        }
         $val = trim($value);
         $val = trim((string) preg_replace('/!\s*important$/i', '', $val));
 
@@ -1081,13 +1085,13 @@ class ComputedStyle
             'larger' => $this->parentFontSizePt * 1.15,
             default => max(
                 1.0,
-                CssUnit::toPt(
+                CssUnit::clampLength(CssUnit::toPt(
                     $v,
                     $this->parentFontSizePt,
                     $this->parentFontSizePt,
                     $this->rootFontSizePt,
                     $this->parentFontSizePt
-                )
+                ))
             ),
         };
     }
@@ -1384,22 +1388,27 @@ class ComputedStyle
 
     private function expandListStyleShorthand(string $val): void
     {
-        $typeSet = false;
+        // A shorthand sets every longhand: those not given return to their initial values (`list-style: square`
+        // on an item of `ul { list-style-position: inside }` puts the marker outside again, as in browsers)
+        $type = null;
+        $position = 'outside';
+        $image = 'none';
+        $none = false;
         foreach ($this->splitSpaceTokens($val) as $tok) {
             $tl = strtolower($tok);
             if ($tl === 'inside' || $tl === 'outside') {
-                $this->props['list-style-position'] = $tl;
+                $position = $tl;
             } elseif (str_starts_with($tl, 'url(')) {
-                $this->props['list-style-image'] = $tok;
+                $image = $tok;
             } elseif ($tl === 'none') {
-                if (!$typeSet) {
-                    $this->props['list-style-type'] = 'none';
-                }
+                $none = true; // the type and / or the image, whichever is not given otherwise
             } else {
-                $this->props['list-style-type'] = $tl;
-                $typeSet = true;
+                $type = $tl;
             }
         }
+        $this->props['list-style-type'] = $type ?? ($none ? 'none' : 'disc');
+        $this->props['list-style-position'] = $position;
+        $this->props['list-style-image'] = $image;
     }
 
     /**

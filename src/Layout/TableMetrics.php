@@ -99,7 +99,7 @@ final class TableMetrics
             if (!$colEl instanceof \DOMElement || $col >= $numCols) {
                 break;
             }
-            $span = max(1, min(100, (int) ($colEl->getAttribute('span') ?: 1)));
+            $span = \IvoPdf\Dom\InputGuards::intAttr($colEl->getAttribute('span'), 1, 100, 1);
             $w = trim($colEl->getAttribute('width'));
             if (preg_match('/(?:^|;)\s*width\s*:\s*([^;]+)/i', $colEl->getAttribute('style'), $sm)) {
                 $w = trim($sm[1]);
@@ -111,6 +111,35 @@ final class TableMetrics
             }
         }
         return $widths;
+    }
+
+    /**
+     * Widths of a collapsed table's outer borders: on each side the widest of the table's own border and the
+     * borders of the cells on that edge of the grid.
+     *
+     * @param list<CellPlacement> $cellPlacements
+     * @return array{top: float, right: float, bottom: float, left: float}
+     */
+    public static function collapsedOuterBorders(LayoutEngine $engine, LayoutBox $table, array $cellPlacements, int $numRows, int $numCols, float $referenceWidth): array
+    {
+        $out = ['top' => $table->borderTop, 'right' => $table->borderRight, 'bottom' => $table->borderBottom, 'left' => $table->borderLeft];
+        foreach ($cellPlacements as $cp) {
+            $cell = $cp->cell;
+            $engine->resolveBoxMetrics($cell, $referenceWidth);
+            if ($cp->rowIdx === 0) {
+                $out['top'] = max($out['top'], $cell->borderTop);
+            }
+            if ($cp->rowIdx + $cp->rowSpan >= $numRows) {
+                $out['bottom'] = max($out['bottom'], $cell->borderBottom);
+            }
+            if ($cp->colIdx === 0) {
+                $out['left'] = max($out['left'], $cell->borderLeft);
+            }
+            if ($cp->colIdx + $cp->colSpan >= $numCols) {
+                $out['right'] = max($out['right'], $cell->borderRight);
+            }
+        }
+        return $out;
     }
 
     /**
@@ -137,6 +166,8 @@ final class TableMetrics
         $colMin = [];
         $colMax = [];
         $spans = [];
+        $collapse = strtolower($table->style->get('border-collapse', 'collapse')) === 'collapse';
+        $placements = [];
         foreach ($rows as $ri => $row) {
             $col = 0;
             foreach ($row->children as $cell) {
@@ -154,6 +185,13 @@ final class TableMetrics
                     }
                 }
                 $i = $engine->measureIntrinsicWidth($cell, $referenceWidth);
+                if ($collapse) {
+                    // a collapsed border is shared by the neighbouring columns: each holds half of it
+                    $engine->resolveBoxMetrics($cell, $referenceWidth);
+                    $half = ($cell->borderLeft + $cell->borderRight) / 2.0;
+                    $i = ['min' => max(0.0, $i['min'] - $half), 'max' => max(0.0, $i['max'] - $half)];
+                    $placements[] = new CellPlacement($cell, $ri, $col, $rs, $cs);
+                }
                 if ($cs === 1) {
                     $colMin[$col] = max($colMin[$col] ?? 0.0, $i['min']);
                     $colMax[$col] = max($colMax[$col] ?? 0.0, $i['max']);
@@ -194,6 +232,10 @@ final class TableMetrics
             $sp = $engine->resolveLength($table->style->get('border-spacing', '0'), $referenceWidth, $table->fontSizePt) * ($n + 1);
         }
         $edge = $table->getHorizontalSpacing();
+        if ($collapse && $n > 0) {
+            $outer = self::collapsedOuterBorders($engine, $table, $placements, count($rows), $n, $referenceWidth);
+            $edge = ($outer['left'] + $outer['right']) / 2.0; // no padding, half of the outer borders on each side
+        }
         $min = $sumMin + $edge + $sp;
         $max = max($sumMin, $sumMax) + $edge + $sp;
         // A caption never breaks inside a word: its min-content width widens the table (as in browsers)

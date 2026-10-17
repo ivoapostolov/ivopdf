@@ -248,6 +248,74 @@ class PdfDocument
         ];
     }
 
+    /** @var (\Closure(int): ?list<int>)|null page count => output order of the source page indexes (mPDF DeletePages / MovePages) */
+    private ?\Closure $pageOrderResolver = null;
+
+    /**
+     * Rearranges / drops pages at compile() time: the resolver receives the page count and returns the 0-based indexes
+     * of the pages to output, in order (null: unchanged). Links, named destinations, bookmarks, notes, form fields and
+     * imported page templates follow their pages; those of dropped pages are removed.
+     *
+     * @param \Closure(int): ?list<int> $resolver
+     */
+    public function setPageOrderResolver(\Closure $resolver): void
+    {
+        $this->pageOrderResolver = $resolver;
+    }
+
+    private function applyPageOrder(): void
+    {
+        $resolver = $this->pageOrderResolver;
+        $this->pageOrderResolver = null;
+        $order = $resolver !== null ? $resolver(count($this->pages)) : null;
+        if ($order === null || $order === array_keys($this->pages)) {
+            return;
+        }
+        $map = [];
+        $pages = [];
+        foreach ($order as $old) {
+            if (isset($this->pages[$old]) && !isset($map[$old])) {
+                $map[$old] = count($pages);
+                $pages[] = $this->pages[$old];
+            }
+        }
+        if ($pages === []) {
+            return;
+        }
+        $this->pages = $pages;
+        foreach ($this->destinations as $name => $d) {
+            if (isset($map[$d['page']])) {
+                $this->destinations[$name]['page'] = $map[$d['page']];
+            } else {
+                unset($this->destinations[$name]);
+            }
+        }
+        $outlines = [];
+        foreach ($this->outlines as $o) {
+            if (isset($map[$o['page']])) {
+                $o['page'] = $map[$o['page']];
+                $outlines[] = $o;
+            }
+        }
+        $this->outlines = $outlines;
+        $notes = [];
+        foreach ($this->textAnnots as $old => $list) {
+            if (isset($map[$old])) {
+                $notes[$map[$old]] = $list;
+            }
+        }
+        $this->textAnnots = $notes;
+        $widgets = [];
+        foreach ($this->formWidgets as $w) {
+            if (isset($map[$w->page])) {
+                $w->page = $map[$w->page];
+                $widgets[] = $w;
+            }
+        }
+        $this->formWidgets = $widgets;
+        $this->imports?->remapPages($map);
+    }
+
     /** Height in pt of an already added page (0.0 when unknown). */
     public function pageHeightOf(int $pageIndex): float
     {
@@ -387,10 +455,12 @@ class PdfDocument
      */
     public function compile(): string
     {
+        $this->applyPageOrder();
         $this->objects = [];
         $this->objectCounter = 0;
         ColorOps::configure($this->options);
         $pdfxActive = PdfX::level($this->options) !== '';
+        $pdfaPart = PdfFinisher::parsePdfa($this->options->pdfa)['part'] ?? null;
 
         $catalogObjId = $this->allocObj();
         $pagesObjId = $this->allocObj();
@@ -575,8 +645,18 @@ class PdfDocument
             }
             foreach ($pdfxActive ? [] : ($this->textAnnots[$pageIdx] ?? []) as $note) {
                 $noteObjId = $this->allocObj();
+                $apEntry = '';
+                if ($pdfaPart !== null) {
+                    // PDF/A (ISO 19005-2/3 6.3.3) requires a normal appearance stream; PDF/A-1 forbids /CA below 1
+                    $apObjId = $this->allocObj();
+                    $this->objects[$apObjId] = self::noteAppearanceStream($note['color']);
+                    $apEntry = " /AP << /N {$apObjId} 0 R >>";
+                    if ($pdfaPart === 1) {
+                        $note['opacity'] = 1.0;
+                    }
+                }
                 $this->objects[$noteObjId] = sprintf(
-                    '<< /Type /Annot /Subtype /Text /Rect [%.2F %.2F %.2F %.2F] /Contents %s /T %s /Name /%s /F 28 /Open false%s /CA %.2F >>',
+                    '<< /Type /Annot /Subtype /Text /Rect [%.2F %.2F %.2F %.2F] /Contents %s /T %s /Name /%s /F 28 /Open false%s /CA %.2F' . $apEntry . ' >>',
                     $note['x'],
                     $note['y'] - 20.0,
                     $note['x'] + 20.0,
@@ -1016,6 +1096,9 @@ class PdfDocument
         foreach ($res['fields'] as $fieldId) {
             $this->addAcroFormField($fieldId);
         }
+        if ($this->options->pdfa !== '') {
+            $this->options->addWarning('PDF/A: interactive form fields use the non-embedded standard fonts Helvetica / ZapfDingbats (and /NeedAppearances), so this document will not pass PDF/A validation; set formFields => false to print the fields as static content.');
+        }
         $fontEntries = [];
         foreach ($res['fonts'] as $name => $objId) {
             $fontEntries[] = "/{$name} {$objId} 0 R";
@@ -1078,6 +1161,33 @@ class PdfDocument
             $this->setAcroFormEntry('NeedAppearances', 'true');
         }
         return $res['annots'];
+    }
+
+    /**
+     * Normal appearance of a /Text (sticky note) annotation, 20 x 20 pt: a folded note in the annotation colour
+     * (yellow by default) with three text lines. Used under PDF/A, which requires /AP for every non-Link annotation.
+     *
+     * @param ?array{0: float, 1: float, 2: float} $rgb
+     */
+    private static function noteAppearanceStream(?array $rgb): string
+    {
+        [$r, $g, $b] = $rgb ?? [1.0, 0.86, 0.2];
+        $ops = sprintf("q 0.6 w %.3F %.3F %.3F rg 0.25 0.25 0.25 RG
+", $r, $g, $b)
+            . "1 1 m 1 19 l 19 19 l 19 6 l 14 1 l h B
+"
+            . "14 1 m 14 6 l 19 6 l S
+"
+            . "0.8 w 4 15 m 16 15 l S 4 11.5 m 16 11.5 l S 4 8 m 11 8 l S Q
+";
+        return sprintf(
+            "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 20 20] /Resources << >> /Length %d >>
+stream
+%s
+endstream",
+            strlen($ops),
+            $ops
+        );
     }
 
     private function createStreamObject(string $data, bool $compress): string

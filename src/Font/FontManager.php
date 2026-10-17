@@ -172,6 +172,7 @@ class FontManager
         $this->families[$key] = $variants;
         $this->aliases[$key] = $key;
         $this->fallbackCache = [];
+        $this->variantCache = [];
     }
 
     /**
@@ -205,6 +206,18 @@ class FontManager
         $variants = $this->families[$key] ?? [];
         $variants[$variant] = $filePath;
         $this->registerFamily($key, $variants);
+    }
+
+    /**
+     * Font files of a registered family or CSS alias ('arial' => Liberation Sans): variant => file, or null when unknown.
+     *
+     * @return array<string, string>|null
+     */
+    public function getFamilyVariants(string $familyName): ?array
+    {
+        $key = strtolower(trim($familyName, " \t\n\r\0\x0B'\""));
+        $key = isset($this->families[$key]) ? $key : ($this->aliases[$key] ?? null);
+        return $key !== null ? ($this->families[$key] ?? null) : null;
     }
 
     public function hasFamily(string $familyName): bool
@@ -271,13 +284,15 @@ class FontManager
                 continue;
             }
             $fk = strtolower(trim($family, " \t\n\r\0\x0B'\""));
-            if (!isset($this->families[$fk]) && is_file(TtcExtractor::splitReference($family)[0])) {
+            if (!isset($this->families[$fk]) && self::isLocalFontFile($family)) {
                 $this->registerFamily($family, ['regular' => $family]);
             }
             $this->scriptFonts[strtolower((string) $key)] = $fk;
         }
         $this->warningSink = $warningSink;
         $this->reportedScripts = [];
+        $this->reportedFonts = [];
+        $this->variantCache = [];
         $this->fallbackCache = [];
     }
 
@@ -328,6 +343,54 @@ class FontManager
      */
     public function resolveFont(string $fontFamilyCss, string|int $fontWeight = 'normal', string $fontStyle = 'normal'): TtfParser
     {
+        $filePath = $this->resolveVariant($fontFamilyCss, $fontWeight, $fontStyle)[0];
+        if (!isset($this->parsedFonts[$filePath])) {
+            try {
+                $this->parsedFonts[$filePath] = new TtfParser($filePath, $this->memoryFonts[$filePath] ?? null);
+            } catch (\Throwable $e) {
+                $this->reportUnusableFont($filePath, $e->getMessage());
+                $fallbackPath = $this->families['dejavu sans']['regular'];
+                if (!isset($this->parsedFonts[$fallbackPath])) {
+                    $this->parsedFonts[$fallbackPath] = new TtfParser($fallbackPath);
+                }
+                return $this->parsedFonts[$fallbackPath];
+            }
+        }
+
+        return $this->parsedFonts[$filePath];
+    }
+
+    /**
+     * Synthesized styles browsers apply when a family has no face for the requested weight / style: a family registered
+     * without a bold (or bold italic) file is emboldened, one without an italic file is slanted. Returns
+     * ['bold' => bool, 'oblique' => bool] for the face resolveFont() picks; both false when a real face exists.
+     *
+     * @return array{bold: bool, oblique: bool}
+     */
+    public function syntheticStyle(string $fontFamilyCss, string|int $fontWeight = 'normal', string $fontStyle = 'normal'): array
+    {
+        [, $bold, $oblique] = $this->resolveVariant($fontFamilyCss, $fontWeight, $fontStyle);
+        return ['bold' => $bold, 'oblique' => $oblique];
+    }
+
+    /** @var array<string, array{0: string, 1: bool, 2: bool}> "family|weight|style" => [file, synthetic bold, synthetic oblique] */
+    private array $variantCache = [];
+
+    /** @var array<string, true> font files already reported as missing / unusable */
+    private array $reportedFonts = [];
+
+    /**
+     * @return array{0: string, 1: bool, 2: bool} [font file / memory key, synthetic bold, synthetic oblique]
+     */
+    private function resolveVariant(string $fontFamilyCss, string|int $fontWeight, string $fontStyle): array
+    {
+        $cacheKey = $fontFamilyCss . '|' . $fontWeight . '|' . $fontStyle;
+        if (isset($this->variantCache[$cacheKey])) {
+            return $this->variantCache[$cacheKey];
+        }
+        if (count($this->variantCache) > 2000) {
+            $this->variantCache = [];
+        }
         $candidates = explode(',', $fontFamilyCss);
         $resolvedKey = 'inter';
 
@@ -362,8 +425,13 @@ class FontManager
         } else {
             $filePath = $variants['regular'];
         }
+        $boldFaces = array_filter([$variants['bold'] ?? null, $variants['bold_italic'] ?? null]);
+        $italicFaces = array_filter([$variants['italic'] ?? null, $variants['bold_italic'] ?? null]);
+        $synthBold = $isBold && !in_array($filePath, $boldFaces, true);
+        $synthOblique = $isItalic && !in_array($filePath, $italicFaces, true);
 
-        if (!isset($this->memoryFonts[$filePath]) && !is_file(TtcExtractor::splitReference($filePath)[0])) {
+        if (!isset($this->memoryFonts[$filePath]) && !self::isLocalFontFile($filePath)) {
+            $this->reportUnusableFont($filePath, 'file not found or not readable');
             $fallbackVariants = $this->families['dejavu sans'];
             if ($isBold && $isItalic) {
                 $filePath = $fallbackVariants['bold_italic'] ?? $fallbackVariants['regular'];
@@ -374,21 +442,59 @@ class FontManager
             } else {
                 $filePath = $fallbackVariants['regular'];
             }
+            $synthBold = false;
+            $synthOblique = false;
         }
 
-        if (!isset($this->parsedFonts[$filePath])) {
-            try {
-                $this->parsedFonts[$filePath] = new TtfParser($filePath, $this->memoryFonts[$filePath] ?? null);
-            } catch (\Throwable) {
-                $fallbackPath = $this->families['dejavu sans']['regular'];
-                if (!isset($this->parsedFonts[$fallbackPath])) {
-                    $this->parsedFonts[$fallbackPath] = new TtfParser($fallbackPath);
-                }
-                return $this->parsedFonts[$fallbackPath];
+        return $this->variantCache[$cacheKey] = [$filePath, $synthBold, $synthOblique];
+    }
+
+    /** A font reference ("file.ttf", "file.ttc#1") that is a readable local file; UNC / stream-wrapper paths never are. */
+    private static function isLocalFontFile(string $reference): bool
+    {
+        if ($reference === '' || \IvoPdf\Options::isNetworkPath($reference)) {
+            return false;
+        }
+        $path = TtcExtractor::splitReference($reference)[0];
+        return is_file($path) && is_readable($path);
+    }
+
+    /**
+     * Throws when a variant of a family to be registered is not a readable local font file (registerFontFamily() contract:
+     * a typo in a path must not silently fall back to DejaVu Sans). "memory:" keys and "file.ttc#n" references are accepted.
+     *
+     * @param array<array-key, mixed> $variants
+     * @throws \InvalidArgumentException
+     */
+    public function assertFontFiles(string $familyName, array $variants): void
+    {
+        if ($variants === []) {
+            throw new \InvalidArgumentException("registerFontFamily('{$familyName}'): no font files given (keys: regular, bold, italic, bold_italic)");
+        }
+        foreach ($variants as $variant => $file) {
+            if (!in_array($variant, ['regular', 'bold', 'italic', 'bold_italic'], true)) {
+                throw new \InvalidArgumentException("registerFontFamily('{$familyName}'): unknown variant '{$variant}' (use regular, bold, italic, bold_italic)");
+            }
+            $file = is_string($file) ? $file : '';
+            if (isset($this->memoryFonts[$file])) {
+                continue;
+            }
+            if (!self::isLocalFontFile($file)) {
+                throw new \InvalidArgumentException("registerFontFamily('{$familyName}'): {$variant} font file not found or not readable: {$file}");
             }
         }
+    }
 
-        return $this->parsedFonts[$filePath];
+    /** Reports (once per file, through the warning sink) a registered font that cannot be used, so DejaVu Sans is substituted. */
+    private function reportUnusableFont(string $filePath, string $reason): void
+    {
+        if (isset($this->reportedFonts[$filePath])) {
+            return;
+        }
+        $this->reportedFonts[$filePath] = true;
+        if ($this->warningSink !== null) {
+            ($this->warningSink)("Font '{$filePath}' cannot be used ({$reason}); DejaVu Sans is used instead.");
+        }
     }
 
     /**
@@ -408,6 +514,28 @@ class FontManager
     /**
      * Records characters used in a string for a specific font and returns the hex-encoded GID stream for PDF Tj.
      */
+    /**
+     * True when $text contains a visible character $font has no glyph for (it is drawn as .notdef, glyph 0, whose
+     * single ToUnicode entry cannot carry the code points): the renderer then adds /ActualText so that text
+     * extraction keeps the characters.
+     */
+    public function hasMissingGlyphs(TtfParser $font, string $text): bool
+    {
+        if ($text === '' || preg_match('/[^\x00-\x7F]/', $text) !== 1) {
+            return false; // every bundled / registered font covers ASCII; skip the per-character check
+        }
+        foreach (self::utf8ToCodepoints($text) as $cp) {
+            if ($cp < 0x20 || $cp === 0x00A0 || $cp === 0x00AD || ($cp >= 0x200B && $cp <= 0x200F) || ($cp >= 0x2028 && $cp <= 0x202E)
+                || ($cp >= 0x2060 && $cp <= 0x206F) || ($cp >= 0xFE00 && $cp <= 0xFE0F) || $cp === 0xFEFF || ($cp >= 0xE0100 && $cp <= 0xE01EF)) {
+                continue;
+            }
+            if ($font->getGlyphId($cp) === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public function encodeTextToHexGids(TtfParser $font, string $text): string
     {
         $this->markFontUsed($font);

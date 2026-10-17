@@ -22,6 +22,8 @@ use RuntimeException;
  */
 trait MpdfApi
 {
+    use MpdfDraw; // imperative mPDF API (Image, Cell, WriteFixedPosHTML, DeletePages, ...) and the __call fallback
+
     private ?MpdfState $mpdfState = null;
     /** @var array{ix: array<string, string>, blank: array<string, bool>} results of the previous render pass */
     private array $mpdfMem = ['ix' => [], 'blank' => []];
@@ -62,8 +64,10 @@ trait MpdfApi
     {
         $this->mpdfMem = ['ix' => [], 'blank' => []];
         $this->footnoteMem = [];
-        $this->footnoteState = ['push' => [], 'floor' => [], 'ratchet' => false, 'freeze' => false, 'changed' => false, 'last' => false, 'memo' => []];
+        $this->footnoteState = ['push' => [], 'floor' => [], 'ratchet' => false, 'freeze' => false, 'changed' => false, 'last' => false, 'memo' => [], 'futile' => []];
         $savedWm = [$this->options->watermarkText, $this->options->watermarkOpacity];
+        // One time / memory budget for the whole render() (all passes): every renderCore() nests inside it
+        \IvoPdf\RenderLimits::begin($this->options);
         try {
             // CSS footnotes may need more passes to settle; from the ninth on every page keeps the largest room it has needed, from the thirteenth on pushed calls stay pushed
             for ($pass = 0; $pass < 24; $pass++) {
@@ -71,6 +75,7 @@ trait MpdfApi
                 $this->footnoteState['freeze'] = $pass >= 12;
                 $this->footnoteState['changed'] = false;
                 $this->footnoteState['last'] = $pass === 23;
+                \IvoPdf\RenderLimits::check(); // the budget of render() covers every pass
                 $this->renderCore();
                 $again = false;
                 $next = $this->mpdfNextMem;
@@ -88,11 +93,12 @@ trait MpdfApi
                 }
             }
         } finally {
+            \IvoPdf\RenderLimits::end();
             [$this->options->watermarkText, $this->options->watermarkOpacity] = $savedWm;
         }
         if (!empty($this->options->compat['showImageErrors'])) {
             foreach ($this->options->getWarnings() as $w) {
-                if (str_starts_with($w, 'Image not found') || str_starts_with($w, 'Unsupported or corrupt image')) {
+                if (str_starts_with($w, 'Image not found') || str_starts_with($w, 'Unsupported or corrupt image') || str_starts_with($w, 'Image skipped')) {
                     throw new RuntimeException($w);
                 }
             }
@@ -309,6 +315,9 @@ trait MpdfApi
     /** Applies SetDisplayMode / SetJS to the catalog. */
     private function mpdfConfigureDocument(PdfDocument $pdf): void
     {
+        if ($this->mpdfPageOps !== []) {
+            $pdf->setPageOrderResolver(fn(int $count): ?array => $this->mpdfPageOrder($count)); // DeletePages / MovePages
+        }
         if ($this->mpdfZoom !== '' || $this->mpdfLayout !== '') {
             $pdf->setViewerPreferences($this->mpdfZoom, $this->mpdfLayout);
         }
@@ -341,6 +350,7 @@ trait MpdfApi
     private function mpdfWriteHtml(string $html, int $mode): self
     {
         $this->mpdfWritten = true;
+        $this->mpdfDrawBreak(); // imperative drawing after this lands where the new HTML ends
         if ($mode === 1) {
             $css = (string) preg_replace('~</?style\b[^>]*>~i', '', $html);
             $this->mpdfHeadCss .= $css . "\n";

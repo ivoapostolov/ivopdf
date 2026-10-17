@@ -27,6 +27,17 @@ class LayoutEngine
     /** @var array{0: float, 1: float}|null [topMargin, printableHeight] of the page grid, when known */
     private ?array $pageGeometry = null;
 
+    /**
+     * Floats of an enclosing block formatting context that intrude into the next block laid out by layoutElement()
+     * (a block that starts beside a float keeps its full width; only its line boxes are shortened, line by line):
+     * [left floats, right floats] in page coordinates. Consumed by the next layoutElement() call.
+     *
+     * @var array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}|null
+     */
+    private ?array $pendingFloats = null;
+    /** @var array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}|null pendingFloats handed to layoutBlockChildren() */
+    private ?array $inheritedFloats = null;
+
     private float $rootFontSizePt;
     private float $viewportWidthPt;
     private float $viewportHeightPt;
@@ -147,6 +158,8 @@ class LayoutEngine
     public function layoutElement(LayoutBox $box, float $x, float $y, float $containingWidth): void
     {
         \IvoPdf\RenderLimits::tick();
+        $outerFloats = $this->pendingFloats;
+        $this->pendingFloats = null;
         $box->lines = [];
         $box->collapsedMarginTop = 0.0;
         $box->collapsedMarginBottom = 0.0;
@@ -196,8 +209,11 @@ class LayoutEngine
         } elseif ($box->tagName === 'fieldset' && ($legend = $this->renderedLegend($box)) !== null) {
             $contentHeight = $this->layoutFieldset($box, $legend);
         } else {
-            $contentHeight = ($this->columnLayout->isMulticol($box) ? $this->columnLayout->layout($box) : null)
-                ?? $this->layoutBlockChildren($box);
+            $contentHeight = $this->columnLayout->isMulticol($box) ? $this->columnLayout->layout($box) : null;
+            if ($contentHeight === null) {
+                $this->inheritedFloats = $outerFloats;
+                $contentHeight = $this->layoutBlockChildren($box);
+            }
         }
 
         // Resolve final border-box height
@@ -316,23 +332,67 @@ class LayoutEngine
         $bottomOpen = $canCollapse && $container->borderBottom <= 0.0 && $container->paddingBottom <= 0.0
             && $container->forcedBorderBoxHeight === null && $this->hasAutoHeight($container);
 
-        /** @var list<array{left: float, right: float, top: float, bottom: float}> $leftFloats */
+        // Floats of the enclosing block formatting context beside this block: its lines wrap around them too.
+        // Floats are keyed by a stable id (the handles of $moveFloat refer to it). Floats that end above the point
+        // where the last float was placed are retired from the active lists (each query would otherwise scan every
+        // float: quadratic for thousands of floats); queries above $retireY still see them.
+        $inherited = $this->inheritedFloats;
+        $this->inheritedFloats = null;
+        $nextFloatId = 0;
+        /** @var array<int, array<string, mixed>> $leftFloats */
         $leftFloats = [];
-        /** @var list<array{left: float, right: float, top: float, bottom: float}> $rightFloats */
+        /** @var array<int, array<string, mixed>> $rightFloats */
         $rightFloats = [];
+        foreach ($inherited[0] ?? [] as $f) {
+            $f['id'] = $nextFloatId;
+            $leftFloats[$nextFloatId++] = $f;
+        }
+        foreach ($inherited[1] ?? [] as $f) {
+            $f['id'] = $nextFloatId;
+            $rightFloats[$nextFloatId++] = $f;
+        }
+        /** @var array<int, array<string, mixed>> $retired */
+        $retired = [];
+        $retireY = -INF;
+        // CSS 2.1 9.5.1 rule 5: a float's top may not be higher than the top of an earlier float of this context
+        $lastFloatTop = -INF;
+        $lastFloatId = -1;
+        foreach ([...$leftFloats, ...$rightFloats] as $f) {
+            $lastFloatTop = max($lastFloatTop, $f['top']);
+        }
 
-        $getBandAtY = static function (float $y, float $h) use ($contentX, $contentWidth, &$leftFloats, &$rightFloats): array {
+        // All floats that may still reach below $y, as [left, right] lists
+        $floatsBelow = static function (float $y) use (&$leftFloats, &$rightFloats, &$retired, &$retireY): array {
+            if ($y >= $retireY || $retired === []) {
+                return [$leftFloats, $rightFloats];
+            }
+            $l = $leftFloats;
+            $r = $rightFloats;
+            foreach ($retired as $id => $f) {
+                if (!isset($l[$id]) && !isset($r[$id])) {
+                    if ($f['side'] === 'left') {
+                        $l[$id] = $f;
+                    } else {
+                        $r[$id] = $f;
+                    }
+                }
+            }
+            return [$l, $r];
+        };
+
+        $getBandAtY = static function (float $y, float $h) use ($contentX, $contentWidth, &$leftFloats, &$rightFloats, &$retireY, $floatsBelow): array {
             $leftEdge = $contentX;
             $rightEdge = $contentX + $contentWidth;
             $yEnd = $y + max(1.0, $h);
-            foreach ($leftFloats as $lf) {
+            [$lfs, $rfs] = $y >= $retireY ? [$leftFloats, $rightFloats] : $floatsBelow($y);
+            foreach ($lfs as $lf) {
                 if ($lf['bottom'] > $y + 0.01 && $lf['top'] < $yEnd - 0.01) {
                     if ($lf['right'] > $leftEdge) {
                         $leftEdge = $lf['right'];
                     }
                 }
             }
-            foreach ($rightFloats as $rf) {
+            foreach ($rfs as $rf) {
                 if ($rf['bottom'] > $y + 0.01 && $rf['top'] < $yEnd - 0.01) {
                     if ($rf['left'] < $rightEdge) {
                         $rightEdge = $rf['left'];
@@ -343,8 +403,26 @@ class LayoutEngine
         };
 
         // Places a laid-out float at the first position at or below $placeY where it fits beside earlier floats and
-        // registers it for the line bands; returns a handle for $moveFloat: [side, index, y]
-        $placeFloat = static function (LayoutBox $child, float $placeY) use (&$leftFloats, &$rightFloats, &$maxFloatBottom, $getBandAtY, $contentX, $contentWidth): array {
+        // registers it for the line bands; returns a handle for $moveFloat: [side, id, y]
+        $placeFloat = static function (LayoutBox $child, float $placeY) use (&$leftFloats, &$rightFloats, &$retired, &$retireY, &$nextFloatId, &$lastFloatTop, &$lastFloatId, &$maxFloatBottom, $getBandAtY, $floatsBelow, $contentX, $contentWidth): array {
+            $placeY = max($placeY, $lastFloatTop);
+            if ($placeY > $retireY && count($leftFloats) + count($rightFloats) > 32) {
+                foreach ($leftFloats as $id => $f) {
+                    if ($f['bottom'] <= $placeY) {
+                        $f['side'] = 'left';
+                        $retired[$id] = $f;
+                        unset($leftFloats[$id]);
+                    }
+                }
+                foreach ($rightFloats as $id => $f) {
+                    if ($f['bottom'] <= $placeY) {
+                        $f['side'] = 'right';
+                        $retired[$id] = $f;
+                        unset($rightFloats[$id]);
+                    }
+                }
+                $retireY = $placeY;
+            }
             $outerW = $child->getOuterWidth();
             $outerH = $child->getOuterHeight();
             $isLeft = strtolower(trim($child->style->get('float', 'none'))) === 'left';
@@ -355,9 +433,11 @@ class LayoutEngine
                     break;
                 }
                 $nextY = null;
-                foreach (array_merge($leftFloats, $rightFloats) as $fl) {
-                    if ($fl['bottom'] > $placeY + 0.01 && ($nextY === null || $fl['bottom'] < $nextY)) {
-                        $nextY = $fl['bottom'];
+                foreach ($floatsBelow($placeY) as $list) {
+                    foreach ($list as $fl) {
+                        if ($fl['bottom'] > $placeY + 0.01 && ($nextY === null || $fl['bottom'] < $nextY)) {
+                            $nextY = $fl['bottom'];
+                        }
                     }
                 }
                 if ($nextY === null) {
@@ -368,30 +448,44 @@ class LayoutEngine
 
             [$bLeft, $bRight] = $getBandAtY($placeY, max(1.0, $outerH));
             $targetY = $placeY + $child->marginTop;
+            $id = $nextFloatId++;
             if ($isLeft) {
                 $targetX = $bLeft + $child->marginLeft;
-                $leftFloats[] = ['left' => $bLeft, 'right' => $bLeft + $outerW, 'top' => $placeY, 'bottom' => $placeY + $outerH, 'box' => $child];
-                $handle = ['left', count($leftFloats) - 1, $placeY];
+                $leftFloats[$id] = ['id' => $id, 'left' => $bLeft, 'right' => $bLeft + $outerW, 'top' => $placeY, 'bottom' => $placeY + $outerH, 'box' => $child];
+                $handle = ['left', $id, $placeY];
             } else {
                 $targetX = max($bLeft, $bRight - $child->marginRight - $child->width);
-                $rightFloats[] = ['left' => max($bLeft, $bRight - $outerW), 'right' => $bRight, 'top' => $placeY, 'bottom' => $placeY + $outerH, 'box' => $child];
-                $handle = ['right', count($rightFloats) - 1, $placeY];
+                $rightFloats[$id] = ['id' => $id, 'left' => max($bLeft, $bRight - $outerW), 'right' => $bRight, 'top' => $placeY, 'bottom' => $placeY + $outerH, 'box' => $child];
+                $handle = ['right', $id, $placeY];
             }
             $child->translate($targetX - $child->x, $targetY - $child->y);
+            $lastFloatTop = $placeY;
+            $lastFloatId = $id;
             if ($placeY + $outerH > $maxFloatBottom) {
                 $maxFloatBottom = $placeY + $outerH;
             }
             return $handle;
         };
         // Moves a float placed by the inline layout to the final top of its line
-        $moveFloat = static function (array $handle, float $dy) use (&$leftFloats, &$rightFloats, &$maxFloatBottom): void {
+        $moveFloat = static function (array $handle, float $dy) use (&$leftFloats, &$rightFloats, &$retired, &$lastFloatTop, &$lastFloatId, &$maxFloatBottom): void {
             [$side, $i] = $handle;
+            if ($i === $lastFloatId) {
+                $lastFloatTop += $dy;
+            }
             if ($side === 'left') {
+                if (!isset($leftFloats[$i]) && isset($retired[$i])) {
+                    $leftFloats[$i] = $retired[$i]; // back to the active list: it may now reach below the retired zone
+                    unset($retired[$i]);
+                }
                 $leftFloats[$i]['top'] += $dy;
                 $leftFloats[$i]['bottom'] += $dy;
                 $leftFloats[$i]['box']->translate(0.0, $dy);
                 $maxFloatBottom = max($maxFloatBottom, $leftFloats[$i]['bottom']);
             } else {
+                if (!isset($rightFloats[$i]) && isset($retired[$i])) {
+                    $rightFloats[$i] = $retired[$i];
+                    unset($retired[$i]);
+                }
                 $rightFloats[$i]['top'] += $dy;
                 $rightFloats[$i]['bottom'] += $dy;
                 $rightFloats[$i]['box']->translate(0.0, $dy);
@@ -402,7 +496,7 @@ class LayoutEngine
         /** @var list<LayoutBox> $inlineBuffer */
         $inlineBuffer = [];
 
-        $flushInlineBuffer = function () use (&$inlineBuffer, $container, &$cursorY, &$prevMarginBottom, $getBandAtY, &$topOpen, &$leftFloats, &$rightFloats, &$maxFloatBottom, $placeFloat, $moveFloat): void {
+        $flushInlineBuffer = function () use (&$inlineBuffer, $container, &$cursorY, &$prevMarginBottom, $getBandAtY, &$topOpen, &$leftFloats, &$rightFloats, &$retired, &$lastFloatTop, &$lastFloatId, &$maxFloatBottom, $placeFloat, $moveFloat): void {
             if (empty($inlineBuffer)) {
                 return;
             }
@@ -434,16 +528,16 @@ class LayoutEngine
                 }
             }
             if ($hasFloat) {
-                $snapshot = [$leftFloats, $rightFloats, $maxFloatBottom];
+                $snapshot = [$leftFloats, $rightFloats, $maxFloatBottom, $lastFloatTop, $lastFloatId];
                 $this->inlineLayout->floatHooks = [
                     'place' => $placeFloat,
                     'move' => $moveFloat,
-                    'reset' => static function () use (&$leftFloats, &$rightFloats, &$maxFloatBottom, $snapshot): void {
-                        [$leftFloats, $rightFloats, $maxFloatBottom] = $snapshot;
+                    'reset' => static function () use (&$leftFloats, &$rightFloats, &$maxFloatBottom, &$lastFloatTop, &$lastFloatId, $snapshot): void {
+                        [$leftFloats, $rightFloats, $maxFloatBottom, $lastFloatTop, $lastFloatId] = $snapshot;
                     },
                 ];
             }
-            if ($hasFloat || $leftFloats !== [] || $rightFloats !== []) {
+            if ($hasFloat || $leftFloats !== [] || $rightFloats !== [] || $retired !== []) {
                 // Lines below the end of a float widen again (per-line wrapping around floats)
                 $this->inlineLayout->bandProvider = static fn(float $y, float $h): array => $getBandAtY($y, $h);
             }
@@ -462,24 +556,34 @@ class LayoutEngine
             if ($clearCss !== 'none' && $clearCss !== '') {
                 $topOpen = false;
             }
-            if ($clearCss === 'left' || $clearCss === 'both') {
+            $isFloat = $floatCss === 'left' || $floatCss === 'right';
+            $clearance = false;
+            if ($clearCss === 'left' || $clearCss === 'right' || $clearCss === 'both') {
                 $flushInlineBuffer();
-                foreach ($leftFloats as $lf) {
-                    if ($lf['bottom'] > $cursorY) {
-                        $cursorY = $lf['bottom'];
-                    }
+                $clearTo = -INF;
+                [$clearLeft, $clearRight] = $floatsBelow($cursorY);
+                foreach ($clearCss === 'right' ? [] : $clearLeft as $lf) {
+                    $clearTo = max($clearTo, $lf['bottom']);
                 }
-            }
-            if ($clearCss === 'right' || $clearCss === 'both') {
-                $flushInlineBuffer();
-                foreach ($rightFloats as $rf) {
-                    if ($rf['bottom'] > $cursorY) {
-                        $cursorY = $rf['bottom'];
+                foreach ($clearCss === 'left' ? [] : $clearRight as $rf) {
+                    $clearTo = max($clearTo, $rf['bottom']);
+                }
+                if ($isFloat || $child->isInlineLevel()) {
+                    $cursorY = max($cursorY, $clearTo);
+                } else {
+                    // Clearance (CSS 2.1 9.5.2): when the block's border edge, after collapsing the margins above
+                    // it, would still be beside a float, it goes right below the float; the margins above it are
+                    // absorbed by the clearance instead of being added on top
+                    $this->resolveBoxMetrics($child, $contentWidth);
+                    if ($cursorY + self::collapseMargins($prevMarginBottom, $child->marginTop) < $clearTo - 0.01) {
+                        $cursorY = $clearTo;
+                        $prevMarginBottom = 0.0;
+                        $clearance = true;
                     }
                 }
             }
 
-            if ($floatCss === 'left' || $floatCss === 'right') {
+            if ($isFloat) {
                 // A float does not separate the container's top margin from its first in-flow child's: when that
                 // margin escapes, the whole container (float included) moves down with it, as in browsers
                 $this->resolveBoxMetrics($child, $contentWidth);
@@ -501,7 +605,9 @@ class LayoutEngine
                     $inlineBuffer[] = $child;
                     continue;
                 }
-                $placeFloat($child, $cursorY);
+                // Browsers place a float below the bottom margin of the block before it (that margin is not
+                // collapsed with the top margin of the block after the float, which may still move further down)
+                $placeFloat($child, $cursorY + ($topOpen ? 0.0 : $prevMarginBottom));
                 continue;
             }
 
@@ -519,10 +625,23 @@ class LayoutEngine
             if ($prevMarginBottom < 0.0 || $child->marginTop < 0.0) {
                 $collapsedMarginTop = $prevMarginBottom + $child->marginTop;
             }
+            if ($clearance) {
+                $collapsedMarginTop = 0.0; // the border edge sits at the bottom of the cleared floats
+            }
 
             $childY = $cursorY + $collapsedMarginTop;
-            [$bandLeft, $bandRight] = $getBandAtY($childY, 20.0);
-            $bandWidth = max(0.0, $bandRight - $bandLeft);
+            // A block beside a float keeps the full width (browsers: the float overlaps its box, only its line boxes
+            // are shortened, each by the floats beside that line); a box that establishes a new block formatting
+            // context (table, overflow != visible, flow-root, ...) is placed beside the floats instead
+            $beside = self::floatsFrom(...$floatsBelow($childY), y: $childY);
+            $wrapsFloats = $beside !== null && !$this->establishesFormattingContext($child);
+            if ($wrapsFloats) {
+                $bandLeft = $contentX;
+                $bandWidth = $contentWidth;
+            } else {
+                [$bandLeft, $bandRight] = $getBandAtY($childY, 20.0);
+                $bandWidth = max(0.0, $bandRight - $bandLeft);
+            }
 
             // Compute child width and handle horizontal `margin: auto` centering
             $child->forcedBorderBoxWidth = null;
@@ -551,6 +670,7 @@ class LayoutEngine
             }
 
             $childX = $bandLeft + $child->marginLeft;
+            $this->pendingFloats = $wrapsFloats ? $beside : null;
             $this->layoutElement($child, $childX, $childY, $bandWidth);
 
             // Margins that escaped from the child's own first / last children join the child's margins
@@ -564,7 +684,7 @@ class LayoutEngine
                 continue;
             }
 
-            $topMargin = self::collapseMargins($prevMarginBottom, $childTopEff);
+            $topMargin = $clearance ? 0.0 : self::collapseMargins($prevMarginBottom, $childTopEff);
             if ($topOpen) {
                 // The container has nothing above this child: the margin escapes through the container's top edge
                 $container->collapsedMarginTop = $topMargin;
@@ -572,6 +692,13 @@ class LayoutEngine
                 $topOpen = false;
             }
             $targetY = $cursorY + $topMargin;
+            if ($wrapsFloats && abs($targetY - $child->y) > 0.01) {
+                // The lines were wrapped around the floats at a provisional position (collapsed margins move the
+                // box): lay it out again where it ends up, so every line gets the band of its final y
+                $this->pendingFloats = self::floatsFrom(...$floatsBelow($targetY), y: $targetY);
+                $this->layoutElement($child, $childX, $targetY, $bandWidth);
+                $childBottomEff = self::collapseMargins($child->marginBottom, $child->collapsedMarginBottom);
+            }
             if (abs($targetY - $child->y) > 0.0001) {
                 $child->translate(0.0, $targetY - $child->y);
             }
@@ -592,6 +719,56 @@ class LayoutEngine
         $cursorY += $prevMarginBottom;
 
         return max(0.0, max($cursorY, $maxFloatBottom) - $contentY);
+    }
+
+    /**
+     * The floats that still extend below $y, as [left, right] lists for a nested block's line bands; null if none.
+     *
+     * @param list<array<string, mixed>> $left
+     * @param list<array<string, mixed>> $right
+     * @return array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}|null
+     */
+    private static function floatsFrom(array $left, array $right, float $y): ?array
+    {
+        $l = [];
+        foreach ($left as $f) {
+            if ($f['bottom'] > $y + 0.01) {
+                $l[] = $f;
+            }
+        }
+        $r = [];
+        foreach ($right as $f) {
+            if ($f['bottom'] > $y + 0.01) {
+                $r[] = $f;
+            }
+        }
+        return $l === [] && $r === [] ? null : [$l, $r];
+    }
+
+    /**
+     * Whether a block-level box establishes a new block formatting context (CSS 2.1 9.4.1): such a box does not
+     * overlap floats of its parent's context but is placed beside them, as a whole.
+     */
+    private function establishesFormattingContext(LayoutBox $box): bool
+    {
+        if ($box->isTextNode() || $box->formControl !== null || $box->columnFlow !== null || $box->isPositionedOutOfFlow()) {
+            return true;
+        }
+        $display = $box->getDisplay();
+        if (($display !== 'block' && $display !== 'list-item') || in_array($box->tagName, ['img', 'svg', 'hr', 'table', 'fieldset'], true)) {
+            return true; // Chromium's UA style gives <hr> overflow: hidden; <fieldset> is always a BFC root
+        }
+        $style = $box->style;
+        if (strtolower(trim($style->get('float', 'none'))) !== 'none') {
+            return true;
+        }
+        foreach (['overflow', 'overflow-x', 'overflow-y'] as $prop) {
+            $v = strtolower(trim($style->get($prop, 'visible')));
+            if ($v !== 'visible' && $v !== '') {
+                return true;
+            }
+        }
+        return $this->columnLayout->isMulticol($box);
     }
 
     /** Adjoining vertical margins collapse to the largest positive plus the most negative one. */
@@ -877,8 +1054,14 @@ class LayoutEngine
             }
         }
 
-        $box->width = max(0.0, $w);
-        $box->height = max(0.0, $h);
+        // `<img width="1e9">`: scaled down (keeping the aspect ratio) to CssUnit::MAX_LENGTH_PT
+        $over = max(is_finite($w) ? $w : INF, is_finite($h) ? $h : INF) / CssUnit::MAX_LENGTH_PT;
+        if ($over > 1.0) {
+            $w = is_finite($over) ? $w / $over : min(CssUnit::MAX_LENGTH_PT, $containingWidth);
+            $h = is_finite($over) ? $h / $over : min(CssUnit::MAX_LENGTH_PT, $w / max(1e-6, $ratio));
+        }
+        $box->width = max(0.0, is_nan($w) ? 0.0 : $w);
+        $box->height = max(0.0, is_nan($h) ? 0.0 : $h);
     }
 
     /**
@@ -1002,10 +1185,11 @@ class LayoutEngine
         $box->marginBottom = $this->resolveLength($box->style->get('margin-bottom', '0'), $referenceWidth, $fs);
         $box->marginLeft = $this->resolveLength($box->style->get('margin-left', '0'), $referenceWidth, $fs);
 
-        $box->paddingTop = max(0.0, $this->resolveLength($box->style->get('padding-top', '0'), $referenceWidth, $fs));
-        $box->paddingRight = max(0.0, $this->resolveLength($box->style->get('padding-right', '0'), $referenceWidth, $fs));
-        $box->paddingBottom = max(0.0, $this->resolveLength($box->style->get('padding-bottom', '0'), $referenceWidth, $fs));
-        $box->paddingLeft = max(0.0, $this->resolveLength($box->style->get('padding-left', '0'), $referenceWidth, $fs));
+        // Padding and borders are clamped to CssUnit::MAX_LENGTH_PT (`padding: 1e9%` must not make 5 000 pages)
+        $box->paddingTop = max(0.0, CssUnit::clampLength($this->resolveLength($box->style->get('padding-top', '0'), $referenceWidth, $fs)));
+        $box->paddingRight = max(0.0, CssUnit::clampLength($this->resolveLength($box->style->get('padding-right', '0'), $referenceWidth, $fs)));
+        $box->paddingBottom = max(0.0, CssUnit::clampLength($this->resolveLength($box->style->get('padding-bottom', '0'), $referenceWidth, $fs)));
+        $box->paddingLeft = max(0.0, CssUnit::clampLength($this->resolveLength($box->style->get('padding-left', '0'), $referenceWidth, $fs)));
 
         $box->borderTop = $this->resolveBorderWidth($box->style, 'top', $fs);
         $box->borderRight = $this->resolveBorderWidth($box->style, 'right', $fs);
@@ -1019,7 +1203,7 @@ class LayoutEngine
         if ($bs === 'none' || $bs === 'hidden' || $bs === '') {
             return 0.0;
         }
-        return max(0.0, $this->resolveLength($style->get("border-{$side}-width", '0'), 0.0, $fontSizePt));
+        return max(0.0, CssUnit::clampLength($this->resolveLength($style->get("border-{$side}-width", '0'), 0.0, $fontSizePt)));
     }
 
     /**

@@ -80,7 +80,7 @@ final class MpdfConfig
                 }
                 $path = self::locate($files[$mk], $dirs);
                 if ($path === null) {
-                    $options->addWarning("fontdata '{$family}': file not found: {$files[$mk]}");
+                    $options->addStickyWarning("fontdata '{$family}': file not found: {$files[$mk]}");
                     continue;
                 }
                 $variants[$vk] = $path;
@@ -94,6 +94,9 @@ final class MpdfConfig
     /** @param list<string> $dirs */
     private static function locate(string $file, array $dirs): ?string
     {
+        if (\IvoPdf\Options::isNetworkPath($file)) {
+            return null; // UNC / stream-wrapper font paths are never stat()ed
+        }
         if (is_file($file)) {
             return $file;
         }

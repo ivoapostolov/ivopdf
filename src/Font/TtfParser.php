@@ -61,6 +61,9 @@ class TtfParser
     {
         // "file.ttc#2" selects face 2 of a font collection (the reference stays the cache/identity key)
         [$realPath, $faceIndex] = TtcExtractor::splitReference($filePath);
+        if ($data === null && \IvoPdf\Options::isNetworkPath($realPath)) {
+            throw new RuntimeException("Font path refused (UNC / network or stream-wrapper paths are not read): {$filePath}");
+        }
         if ($data === null && !is_file($realPath)) {
             throw new RuntimeException("TTF font file not found: {$filePath}");
         }

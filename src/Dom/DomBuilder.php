@@ -27,8 +27,8 @@ class DomBuilder
     /** @var array<string, int> CSS counters (counter-reset / counter-increment / counter()) */
     private array $counters = [];
 
-    /** Table parts whose DOM element is dropped from the box when it has no attributes */
-    private const PLAIN_TABLE_PARTS = ['td' => true, 'th' => true, 'tr' => true, 'thead' => true, 'tbody' => true, 'tfoot' => true];
+    /** Elements whose box keeps its DOM element even without attributes (later passes read it); others only with attributes */
+    private const DOM_READERS = ['table' => true, 'svg' => true, 'math' => true, 'h1' => true, 'h2' => true, 'h3' => true, 'h4' => true, 'h5' => true, 'h6' => true];
 
     /** @var array<string, string> lower-cased tag names by their source spelling (shared by all boxes of that tag) */
     private array $tagNames = [];
@@ -180,6 +180,7 @@ class DomBuilder
         if ($href === '') {
             return null;
         }
+        $href = Options::normalizeProtocolRelativeUrl($href); // //host/x.css is remote, never a UNC path
         if (preg_match('/^https?:\/\//i', $href)) {
             return $this->options->fetchSafeRemoteUrl($href);
         }
@@ -194,6 +195,7 @@ class DomBuilder
     private function buildChildren(DOMNode $parentNode, LayoutBox $parentBox, ?string $inheritedHref = null): void
     {
         $listCounter = 1;
+        $textStyle = null;
         $listReversed = false;
         $mpdfSectionPage = null;
         $parentTag = $parentBox->tagName;
@@ -265,6 +267,10 @@ class DomBuilder
                 }
 
                 $textBox = new LayoutBox('#text', $parentBox->style); // the box derives its own (possibly shared) text style
+                // All text nodes of one parent share one (immutable) text style instead of a copy each: 30 000 lines of
+                // `x<br>` or 50 000 links held a ComputedStyle per text node
+                $textStyle ??= $textBox->style->isShared() ? $textBox->style : $textBox->style->share();
+                $textBox->style = $textStyle;
                 $textBox->textContent = $this->applyTextTransform($text, $textBox->style->get('text-transform', 'none'));
                 $textBox->href = $inheritedHref;
 
@@ -323,9 +329,10 @@ class DomBuilder
             }
             $this->applyCounterProperties($childStyle);
 
-            // A table part without attributes has nothing a later pass could look up in the DOM (anchors, bookmarks,
-            // attr() values, spans are read here); not keeping the element lets 10 000 cells free their DOM nodes
-            $keepElement = !isset(self::PLAIN_TABLE_PARTS[$tag]) || $child->hasAttributes()
+            // An element without attributes has nothing a later pass could look up in the DOM (anchors, bookmarks,
+            // attr() values, spans are read here): not keeping it saves the DOM wrapper of every plain cell, <br>, <span>,
+            // <li>... (tables, SVG and headings read the DOM later: <col> widths, the drawing, bookmark titles)
+            $keepElement = isset(self::DOM_READERS[$tag]) || $child->hasAttributes()
                 || strtolower(trim($childStyle->get('string-set', 'none'))) !== 'none';
             $childBox = new LayoutBox($tag, $childStyle, $keepElement ? $child : null);
             $currentHref = $inheritedHref;
@@ -341,7 +348,7 @@ class DomBuilder
             if ($tag === 'img' && $child->hasAttribute('src')) {
                 $src = trim($child->getAttribute('src'));
                 if ($child->hasAttribute('data-page') && !str_contains($src, '#page=') && preg_match('/\.pdf(?:\?.*)?$/i', $src)) {
-                    $src .= '#page=' . max(1, (int) $child->getAttribute('data-page')); // <img src="doc.pdf" data-page="2">
+                    $src .= '#page=' . InputGuards::intAttr($child->getAttribute('data-page'), 1, 1000000, 1); // <img src="doc.pdf" data-page="2">
                 }
                 $svgEl = $this->tryParseSvgImage($src, $child);
                 if ($svgEl !== null) {
@@ -362,10 +369,10 @@ class DomBuilder
 
             if ($tag === 'td' || $tag === 'th') {
                 if ($child->hasAttribute('colspan')) {
-                    $childBox->colspan = max(1, min(100, (int) $child->getAttribute('colspan')));
+                    $childBox->colspan = InputGuards::intAttr($child->getAttribute('colspan'), 1, 100, 1);
                 }
                 if ($child->hasAttribute('rowspan')) {
-                    $childBox->rowspan = max(1, min(500, (int) $child->getAttribute('rowspan')));
+                    $childBox->rowspan = InputGuards::intAttr($child->getAttribute('rowspan'), 1, 500, 1);
                 }
             }
 
@@ -673,7 +680,8 @@ class DomBuilder
     {
         $svgXml = null;
         $isMetafile = false;
-        $metaMime = preg_match('/^data:image\/(?:x-)?(?:wmf|emf|x-wmf|x-emf)(?![a-z])/i', $src) === 1;
+        $src = Options::normalizeProtocolRelativeUrl($src); // //host/x.svg is remote, never a UNC path
+        $metaMime =preg_match('/^data:image\/(?:x-)?(?:wmf|emf|x-wmf|x-emf)(?![a-z])/i', $src) === 1;
         if ($metaMime || preg_match('/\.(?:wmf|emf)(?:\?.*)?$/i', $src)) {
             // Windows metafiles (WMF / EMF) are converted to SVG markup and rendered as vectors
             $raw = null;

@@ -370,7 +370,19 @@ class Options
 
     public function clearWarnings(): void
     {
-        $this->warnings = [];
+        $this->warnings = $this->stickyWarnings;
+    }
+
+    /** @var list<string> warnings about the configuration (e.g. a missing mPDF fontdata file) that every render reports again */
+    private array $stickyWarnings = [];
+
+    /** A warning raised before render() (configuration, API calls) that survives the clearWarnings() at the start of each render. */
+    public function addStickyWarning(string $message): void
+    {
+        if (count($this->stickyWarnings) < 50 && !in_array($message, $this->stickyWarnings, true)) {
+            $this->stickyWarnings[] = $message;
+        }
+        $this->addWarning($message);
     }
 
     /**
@@ -418,12 +430,58 @@ class Options
     }
 
     /**
+     * True for references that must never reach the filesystem functions (is_file, realpath, fopen ...): UNC and
+     * protocol-relative paths (`\\host\share`, `//host/share`, `/\host`, `\\?\UNC\...`, `\\.\device`), which make Windows
+     * open an SMB session to an arbitrary host, and stream-wrapper URLs (`ftp://`, `phar://`, `file://`, `php://`,
+     * `compress.zlib://`, `smb:` ...). Windows drive paths (`C:\...`, `C:/...`) and ordinary absolute / relative paths are local.
+     * Use it for paths from untrusted input (HTML, CSS) and before any filesystem call on a configurable path.
+     */
+    public static function isNetworkPath(string $path): bool
+    {
+        $path = ltrim($path, " \t\r\n\f\v");
+        if (str_contains($path, "\0")) {
+            return true;
+        }
+        if (preg_match('#^[\\\\/]{2}#', $path) === 1) {
+            return true;
+        }
+        // scheme: (two or more characters - a single letter followed by ':' is a Windows drive)
+        return preg_match('#^[a-z][a-z0-9+.\-]+:#i', $path) === 1;
+    }
+
+    /**
+     * Protocol-relative URL (`//cdn.example.com/logo.png`, forward slashes only, as in web templates) => `https://...`, so
+     * it is fetched as a remote resource (subject to isRemoteEnabled and the SSRF guard) instead of being treated as a
+     * local / UNC path. Anything else is returned unchanged.
+     */
+    public static function normalizeProtocolRelativeUrl(string $src): string
+    {
+        $trimmed = ltrim($src, " \t\r\n\f\v");
+        if (preg_match('#^//[^/\\\\]#', $trimmed) === 1) {
+            return 'https:' . $trimmed;
+        }
+        return $src;
+    }
+
+    private static function shortPath(string $path): string
+    {
+        $path = preg_replace('/[\x00-\x1F\x7F]/', '?', $path) ?? '';
+        return strlen($path) > 120 ? substr($path, 0, 117) . '...' : $path;
+    }
+
+    /**
      * Validates if a local file path is allowed by basePath or allowedPaths (preventing LFI / directory traversal).
+     * UNC, protocol-relative and stream-wrapper paths are refused before any filesystem access (see isNetworkPath()).
      */
     public function resolveAllowedLocalFile(string $path, ?string $overrideBasePath = null): ?string
     {
         $path = trim($path);
         if ($path === '' || str_contains($path, "\0")) {
+            return null;
+        }
+        if (self::isNetworkPath($path)) {
+            // Never stat UNC / protocol-relative / stream-wrapper paths: on Windows is_file('//host/share') opens an SMB session
+            $this->addWarning('Network / non-local path refused (UNC, protocol-relative or stream wrapper): ' . self::shortPath($path));
             return null;
         }
 
@@ -441,7 +499,8 @@ class Options
         if (is_file($path)) {
             $candidates[] = $path;
         }
-        if ($effectiveBase !== null && $effectiveBase !== '') {
+        // a configured UNC base (\\server\share) is the operator's choice; a URL / stream-wrapper base is never stat()ed
+        if ($effectiveBase !== null && $effectiveBase !== '' && preg_match('#^[a-z][a-z0-9+.\-]+:#i', $effectiveBase) !== 1) {
             $joined = rtrim($effectiveBase, '/\\') . DIRECTORY_SEPARATOR . ltrim($path, '/\\');
             if (is_file($joined)) {
                 $candidates[] = $joined;

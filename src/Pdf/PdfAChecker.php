@@ -155,8 +155,8 @@ final class PdfAChecker
             if ($acro->has('XFA')) {
                 $this->add('AcroForm contains /XFA');
             }
-            if ($this->part === 1 && $this->reader->resolve($acro->get('NeedAppearances')) === true) {
-                $this->add('AcroForm /NeedAppearances true is not allowed in PDF/A-1');
+            if ($this->reader->resolve($acro->get('NeedAppearances')) === true) {
+                $this->add("AcroForm /NeedAppearances true is not allowed in PDF/A-{$this->part}");
             }
         }
         if ($this->part === 1 && $catalog->has('Perms')) {

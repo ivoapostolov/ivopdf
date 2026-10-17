@@ -175,11 +175,26 @@ final class Footnotes
         // Only a page whose notes are the ones it reserved room for (or the last pass of an unsettled document) is guarded;
         // in any other pass the document is laid out again anyway
         $guard = $this->state['last'] || $this->notesOnPage($this->assumed, $pageIndex) === $indices;
-        while ($guard && count($indices) > 1 && $this->outerHeight($area) + 6.0 > $reserved + 0.5) {
-            array_pop($indices);
-            $dropped++;
-            $area = $this->buildArea($indices, $this->actual);
-            $engine->layoutDocument($area, $x, 0.0, $width);
+        if ($guard && count($indices) > 1 && $this->outerHeight($area) + 6.0 > $reserved + 0.5) {
+            // Largest prefix of the notes that fits the room (at least one note): a galloping search lays the area out
+            // O(log n) times instead of once per dropped note (thousands of notes on a page would be quadratic)
+            $areas = [];
+            $best = max(1, $this->fittingPrefix(count($indices), function (int $n) use ($indices, $engine, $x, $width, $reserved, &$areas): bool {
+                $probe = $this->buildArea(array_slice($indices, 0, $n), $this->actual);
+                $engine->layoutDocument($probe, $x, 0.0, $width);
+                if ($this->outerHeight($probe) + 6.0 > $reserved + 0.5) {
+                    return false;
+                }
+                $areas = [$n => $probe]; // keep only the largest fitting area so far
+                return true;
+            }, true, $this->guessFit($indices, $this->actual, $reserved + 0.5)));
+            $dropped = count($indices) - $best;
+            $indices = array_slice($indices, 0, $best);
+            $area = $areas[$best] ?? null;
+            if ($area === null) {
+                $area = $this->buildArea($indices, $this->actual);
+                $engine->layoutDocument($area, $x, 0.0, $width);
+            }
         }
         $cut = $guard && $this->outerHeight($area) + 6.0 > $reserved + 0.5;
         if ($cut) {
@@ -317,15 +332,24 @@ final class Footnotes
         }
         // A push stays only while it is still justified: its note does not fit next to the notes before it on the page of
         // the previous note. (Frozen in late passes so the document converges.)
+        $this->state['futile'] ??= [];
         if (!$this->state['freeze']) {
             foreach (array_keys($this->state['push']) as $k) {
                 $prev = $this->actual[$k - 1] ?? null;
                 if ($prev === null) {
                     continue;
                 }
+                if ($prev === ($this->actual[$k] ?? null)) {
+                    // The page break before the line of this call did not separate it from the previous call (both sit
+                    // on one line): pushing it again would only make every later pass undo and redo the same push
+                    unset($this->state['push'][$k]);
+                    $this->state['futile'][$k] = true;
+                    $this->state['changed'] = true;
+                    continue;
+                }
                 $before = [];
-                foreach ($this->actual as $i => $p) {
-                    if ($i < $k && $p === $prev) {
+                foreach ($this->notesOnPage($this->actual, $prev) as $i) {
+                    if ($i < $k) {
                         $before[] = $i;
                     }
                 }
@@ -339,32 +363,139 @@ final class Footnotes
         foreach ($this->actual as $i => $p) {
             $byPage[$p][] = $i;
         }
-        foreach ($byPage as $page => $indices) {
-            $need = $this->measure($indices, $this->actual);
-            if ($this->state['ratchet']) {
-                $this->ratchet($page, $need);
+        ksort($byPage);
+        $cap = $this->cap() + 0.5;
+        // The notes that move off an overfull page land on the next one together with that page's own notes: the cascade
+        // is followed here in one go (a later pass checks every push again), so a long run of overfull pages settles in a
+        // few passes instead of one page per pass
+        $carry = [];
+        $page = array_key_first($byPage) ?? 0;
+        $lastPage = array_key_last($byPage) ?? -1;
+        while ($page <= $lastPage || $carry !== []) {
+            \IvoPdf\RenderLimits::tick();
+            $own = $byPage[$page] ?? [];
+            if ($own !== [] && $this->state['ratchet']) {
+                $this->ratchet($page, $this->measure($own, $this->actual));
             }
-            // Only the first note that does not fit moves: everything after it follows it to the next page anyway
-            if ($need <= $this->cap() + 0.5 || count($indices) < 2) {
+            $page++;
+            $indices = $carry === [] ? $own : array_merge($carry, $own);
+            $carry = [];
+            if (count($indices) < 2) {
                 continue;
             }
-            // largest prefix of the notes that fits (binary search: each probe lays the area out once)
-            $lo = 1;
-            $hi = count($indices) - 1;
-            while ($lo <= $hi) {
-                $mid = intdiv($lo + $hi + 1, 2);
-                if ($this->measure(array_slice($indices, 0, $mid), $this->actual) > $this->cap() + 0.5) {
-                    $hi = $mid - 1;
-                } else {
-                    $lo = $mid + 1;
-                }
+            // Only the first note that does not fit moves: everything after it follows it to the next page anyway
+            $fit = $this->fittingPrefix(count($indices), fn(int $n): bool => $this->measure(array_slice($indices, 0, $n), $this->actual) <= $cap, false, $this->guessFit($indices, $this->actual, $cap));
+            if ($fit >= count($indices)) {
+                continue; // all notes fit
             }
-            $first = $hi >= 1 ? ($indices[$hi] ?? null) : null; // the first note that no longer fits
-            if ($first !== null && !isset($this->state['push'][$first])) {
+            if ($fit < 1) {
+                continue; // even the first note alone is taller than the room: nothing to gain by moving it
+            }
+            $first = $indices[$fit]; // the first note that no longer fits
+            if (isset($this->state['futile'][$first])) {
+                continue; // its call cannot leave the line of the previous one: the notes stay (layer() drops what does not fit)
+            }
+            if (!isset($this->state['push'][$first])) {
                 $this->state['push'][$first] = true;
                 $this->state['changed'] = true;
             }
+            $carry = array_slice($indices, $fit);
         }
+    }
+
+    /**
+     * Longest prefix length k in [0, $n] for which $fits(k) holds ($fits is monotone, k = 0 always fits). Gallops
+     * 1, 2, 4, ... then bisects, so the probes cost about twice the size of the answer (not of $n): pages hold tens of
+     * notes while thousands may be waiting for room.
+     *
+     * With a $guess (an estimate of the answer) the gallop starts there, so a good estimate costs two probes.
+     *
+     * @param \Closure(int): bool $fits
+     */
+    private function fittingPrefix(int $n, \Closure $fits, bool $fullDoesNotFit = false, int $guess = 0): int
+    {
+        $good = 0;
+        $bad = $fullDoesNotFit ? $n : $n + 1;
+        if ($guess >= 1 && $guess < $bad) {
+            \IvoPdf\RenderLimits::tick();
+            if ($fits($guess)) {
+                // gallop upwards: guess+1, guess+2, guess+4, ...
+                $good = $guess;
+                $step = 1;
+                while ($good + $step < $bad) {
+                    \IvoPdf\RenderLimits::tick();
+                    if (!$fits($good + $step)) {
+                        $bad = $good + $step;
+                        break;
+                    }
+                    $good += $step;
+                    $step *= 2;
+                }
+            } else {
+                // gallop downwards: guess-1, guess-2, guess-4, ...
+                $bad = $guess;
+                $step = 1;
+                while ($bad - $step > $good) {
+                    \IvoPdf\RenderLimits::tick();
+                    if ($fits($bad - $step)) {
+                        $good = $bad - $step;
+                        break;
+                    }
+                    $bad -= $step;
+                    $step *= 2;
+                }
+            }
+        } else {
+            $k = 1;
+            while ($k < $bad) {
+                \IvoPdf\RenderLimits::tick();
+                if (!$fits($k)) {
+                    $bad = $k;
+                    break;
+                }
+                $good = $k;
+                $k = $k * 2 < $bad ? $k * 2 : ($k + 1 < $bad ? $bad - 1 : $bad);
+            }
+        }
+        while ($bad - $good > 1) {
+            \IvoPdf\RenderLimits::tick();
+            $mid = intdiv($good + $bad, 2);
+            if ($fits($mid)) {
+                $good = $mid;
+            } else {
+                $bad = $mid;
+            }
+        }
+        return $good;
+    }
+
+    /**
+     * Estimated number of leading notes of $indices that fit $limit, from the heights of the notes measured one by one
+     * (remembered across passes) and the fixed cost of the area (rule, gap): a starting point for fittingPrefix().
+     *
+     * @param list<int> $indices
+     * @param array<int, int> $pages
+     */
+    private function guessFit(array $indices, array $pages, float $limit): int
+    {
+        if (count($indices) < 2) {
+            return 0;
+        }
+        $h0 = $this->measure([$indices[0]], $pages);
+        $overhead = max(0.0, $h0 + $this->measure([$indices[1]], $pages) - $this->measure([$indices[0], $indices[1]], $pages));
+        $total = $h0;
+        if ($total > $limit) {
+            return 0;
+        }
+        $n = count($indices);
+        for ($k = 1; $k < $n; $k++) {
+            \IvoPdf\RenderLimits::tick();
+            $total += $this->measure([$indices[$k]], $pages) - $overhead;
+            if ($total > $limit) {
+                return $k;
+            }
+        }
+        return $n;
     }
 
     // ------------------------------------------------------------------
@@ -372,14 +503,25 @@ final class Footnotes
     /** @param array<int, int> $pages @return list<int> */
     private function notesOnPage(array $pages, int $pageIndex): array
     {
-        $out = [];
-        foreach ($pages as $i => $p) {
-            if ($p === $pageIndex) {
-                $out[] = $i;
+        // Grouped once per page map: scanning every note for every page would cost notes x pages per pass
+        foreach ($this->pageCache as [$forPages, $byPage]) {
+            if ($forPages === $pages) {
+                return $byPage[$pageIndex] ?? [];
             }
         }
-        return $out;
+        $byPage = [];
+        foreach ($pages as $i => $p) {
+            $byPage[$p][] = $i;
+        }
+        if (count($this->pageCache) >= 4) {
+            array_shift($this->pageCache);
+        }
+        $this->pageCache[] = [$pages, $byPage];
+        return $byPage[$pageIndex] ?? [];
     }
+
+    /** @var list<array{0: array<int, int>, 1: array<int, list<int>>}> page maps and the notes of each page */
+    private array $pageCache = [];
 
     /** Display number of note $i (continuous, or restarting on every page with `@page { counter-reset: footnote }`). */
     private function number(int $i, array $pages): int
@@ -387,14 +529,32 @@ final class Footnotes
         if (!$this->css['perPage'] || !isset($pages[$i])) {
             return $i + 1;
         }
-        $n = 1;
-        for ($k = 0; $k < $i; $k++) {
-            if (($pages[$k] ?? -1) === $pages[$i]) {
-                $n++;
+        // Rank of every note on its page, computed once per page map (counting per call would be quadratic)
+        $ranks = null;
+        foreach ($this->rankCache as [$forPages, $cached]) {
+            if ($forPages === $pages) {
+                $ranks = $cached;
+                break;
             }
         }
-        return $n;
+        if ($ranks === null) {
+            $ranks = [];
+            $seen = [];
+            $sorted = $pages;
+            ksort($sorted);
+            foreach ($sorted as $k => $p) {
+                $ranks[$k] = $seen[$p] = ($seen[$p] ?? 0) + 1;
+            }
+            if (count($this->rankCache) >= 4) {
+                array_shift($this->rankCache);
+            }
+            $this->rankCache[] = [$pages, $ranks];
+        }
+        return $ranks[$i] ?? 1;
     }
+
+    /** @var list<array{0: array<int, int>, 1: array<int, int>}> page maps and the per-page rank of each note */
+    private array $rankCache = [];
 
     /**
      * @param list<int> $indices

@@ -110,8 +110,8 @@ final class FormControl
         $c->required = $el->hasAttribute('required');
         $c->readonly = $el->hasAttribute('readonly');
         $c->disabled = $el->hasAttribute('disabled');
-        $c->maxLength = max(0, (int) $el->getAttribute('maxlength'));
-        $c->size = max(0, (int) $el->getAttribute('size'));
+        $c->maxLength = \IvoPdf\Dom\InputGuards::intAttr($el->getAttribute('maxlength'), 0, 1000000000, 0);
+        $c->size = \IvoPdf\Dom\InputGuards::intAttr($el->getAttribute('size'), 0, 100000, 0);
         $c->value = $el->getAttribute('value');
 
         $form = self::findForm($el);
@@ -160,8 +160,8 @@ final class FormControl
                 $text = (string) $el->textContent;
                 $text = str_starts_with($text, "\n") ? substr($text, 1) : $text;
                 $c->value = str_replace("\r\n", "\n", $text);
-                $c->rows = max(1, (int) $el->getAttribute('rows') ?: 2);
-                $c->cols = max(1, (int) $el->getAttribute('cols') ?: 20);
+                $c->rows = \IvoPdf\Dom\InputGuards::intAttr($el->getAttribute('rows'), 0, 10000, 0) ?: 2;
+                $c->cols = \IvoPdf\Dom\InputGuards::intAttr($el->getAttribute('cols'), 0, 10000, 0) ?: 20;
                 break;
             case 'button':
                 $type = strtolower(trim($el->getAttribute('type')));

@@ -56,7 +56,7 @@ class Paginator
             return $k + 1;
         }
         $totalContentSpan = max(1.0, $maxBottom - $this->topMargin);
-        $pages = (int) ceil(($totalContentSpan - 0.5) / $this->printableHeight);
+        $pages = (int) min(1.0e9, ceil(($totalContentSpan - 0.5) / $this->printableHeight)); // INF heights: no int-cast warning
 
         return max(1, $pages);
     }
@@ -162,7 +162,7 @@ class Paginator
             }
             return 4999;
         }
-        return (int) floor(($y - $this->topMargin + 0.01) / $this->printableHeight);
+        return (int) max(-1.0e9, min(1.0e9, floor(($y - $this->topMargin + 0.01) / $this->printableHeight)));
     }
 
     private function processBox(LayoutBox $box): void
@@ -259,10 +259,9 @@ class Paginator
 
                 $forced = $line->forceBreak && $line->y > $pageTop + 0.5;
                 if (($forced || $line->y + $line->height > $pageBottom + 0.5) && $line->y > $pageTop + 0.5) {
-                    // Avoid a single orphan line left at the bottom of the previous page
-                    if (!$forced && $i === 1 && $count > 2 && $box->lines[0]->y > $pageTop + 0.5 && $this->getPageIndexForY($box->lines[0]->y) === $startPage) {
-                        $i = 0;
-                        $line = $box->lines[0];
+                    if (!$forced && $i > 0) {
+                        $i = $this->adjustBreakForOrphansWidows($box, $i, $pageTop, $startPage);
+                        $line = $box->lines[$i];
                     }
                     $delta = $pageBottom - $line->y;
                     for ($j = $i; $j <= $applied; $j++) {
@@ -307,13 +306,53 @@ class Paginator
             $this->pushFollowingOnly($box, $this->getPageBounds($target)[0] - $bottomY);
         } elseif ($breakAfter === 'always' || $breakAfter === 'page') {
             $bottomY = $box->y + $box->height;
-            $curPage = $this->getPageIndexForY($bottomY);
+            // A box that ends exactly at the page bottom (a full-page label or cover) belongs to that page: its
+            // bottom edge is not the top of the next page, so no blank page follows (as in browsers). An empty
+            // carrier at the very top of a page still breaks after itself.
+            $curPage = $this->getPageIndexForY(max($this->topMargin, $box->y, $bottomY - 0.5));
             [$pageTop, $pageBottom] = $this->getPageBounds($curPage);
             if ($bottomY < $pageBottom - 1.0) {
                 $delta = $pageBottom - $bottomY;
                 $this->pushFollowingOnly($box, $delta);
             }
         }
+    }
+
+    /**
+     * `orphans` / `widows` (initial value 2, as in browsers): moves a break before line $i of $box up so at least
+     * `orphans` lines of the paragraph stay on the page before it and at least `widows` lines follow it; when both
+     * cannot hold, the whole paragraph goes to the next page if it starts on this page below its top, otherwise the
+     * break stays where it is. Returns the index of the first line of the next page.
+     */
+    private function adjustBreakForOrphansWidows(LayoutBox $box, int $i, float $pageTop, int $startPage): int
+    {
+        $lines = $box->lines;
+        $count = count($lines);
+        $first = $i; // first line of the paragraph on this page
+        while ($first > 0 && $lines[$first - 1]->y > $pageTop - 0.5) {
+            $first--;
+        }
+        $o = trim($box->style->get('orphans', '2'));
+        $w = trim($box->style->get('widows', '2'));
+        $orphans = ctype_digit($o) ? max(1, min(1000, (int) $o)) : 2;
+        $widows = ctype_digit($w) ? max(1, min(1000, (int) $w)) : 2;
+        $k = $i;
+        if ($count - $k < $widows && $count - $widows > $first) {
+            $tail = 0.0;
+            for ($j = $count - $widows; $j < $count; $j++) {
+                $tail += $lines[$j]->height;
+            }
+            if ($tail <= $this->printableHeight) {
+                $k = $count - $widows; // the last lines must not be left alone on the next page
+            }
+        }
+        if ($k - $first < $orphans) {
+            if ($first === 0 && $lines[0]->y > $pageTop + 0.5 && $this->getPageIndexForY($lines[0]->y) === $startPage) {
+                return 0;
+            }
+            return $i;
+        }
+        return $k;
     }
 
     /**
@@ -684,6 +723,14 @@ class Paginator
     /**
      * Shifts $target and all boxes located vertically at or below $target->y in its ancestor chain down by $delta.
      */
+    /** @var array<int, bool> spl_object_id => isPositionedOutOfFlow(): fixed during pagination, asked for every following sibling on every push */
+    private array $outOfFlowMemo = [];
+
+    private function outOfFlow(LayoutBox $box): bool
+    {
+        return $this->outOfFlowMemo[spl_object_id($box)] ??= $box->isPositionedOutOfFlow();
+    }
+
     private function pushBoxAndFollowing(LayoutBox $target, float $delta): void
     {
         if ($delta <= 0.01) {
@@ -704,8 +751,9 @@ class Paginator
                     $foundCurr = true;
                     continue;
                 }
-                if ($foundCurr && !$sibling->isPositionedOutOfFlow() && $sibling->y + $sibling->pendingDy >= $thresholdY
-                    && !($sibling->isInlineLevel() && !empty($parent->lines))) {
+                // numeric test first: the style lookups are the cost of this loop (it runs on every page)
+                if ($foundCurr && $sibling->y + $sibling->pendingDy >= $thresholdY && !$this->outOfFlow($sibling)
+                    && !($parent->lines !== [] && $sibling->isInlineLevel())) {
                     $sibling->pendingDy += $delta; // applied lazily: O(1) instead of re-translating the whole remaining document
                 }
             }
@@ -719,11 +767,9 @@ class Paginator
             // Expand parent height to enclose shifted children
             $maxChildBottom = $parent->y + $parent->height;
             foreach ($parent->children as $ch) {
-                if (!$ch->isPositionedOutOfFlow()) {
-                    $b = $ch->y + $ch->pendingDy + $ch->height + $ch->marginBottom + $parent->paddingBottom + $parent->borderBottom;
-                    if ($b > $maxChildBottom) {
-                        $maxChildBottom = $b;
-                    }
+                $b = $ch->y + $ch->pendingDy + $ch->height + $ch->marginBottom + $parent->paddingBottom + $parent->borderBottom;
+                if ($b > $maxChildBottom && !$this->outOfFlow($ch)) {
+                    $maxChildBottom = $b;
                 }
             }
             foreach ($parent->lines as $ln) {
@@ -771,8 +817,9 @@ class Paginator
                     $foundCurr = true;
                     continue;
                 }
-                if ($foundCurr && !$sibling->isPositionedOutOfFlow() && $sibling->y + $sibling->pendingDy >= $thresholdY
-                    && !($sibling->isInlineLevel() && !empty($parent->lines))) {
+                // numeric test first: the style lookups are the cost of this loop (it runs on every page)
+                if ($foundCurr && $sibling->y + $sibling->pendingDy >= $thresholdY && !$this->outOfFlow($sibling)
+                    && !($parent->lines !== [] && $sibling->isInlineLevel())) {
                     $sibling->pendingDy += $delta;
                 }
             }

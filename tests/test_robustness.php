@@ -207,7 +207,8 @@ $firstCellLines = static function (?LayoutBox $t): int {
     $td = $t !== null ? findBox($t, static fn(LayoutBox $b): bool => $b->tagName === 'td') : null;
     return $td !== null ? count($td->lines) : -1;
 };
-check('without shrinking, words are squeezed and broken inside the cells', $firstCellLines($tOff) > 1, (string) $firstCellLines($tOff));
+// Browsers never break a word inside a cell (overflow-wrap: normal): without shrinking the table grows past the page width
+check('without shrinking, words stay whole and the table grows past the content width', $firstCellLines($tOff) === 1 && $tOff !== null && $tOff->width > $printable, (string) $firstCellLines($tOff));
 check('with shrinking, every word stays on one line', $firstCellLines($tOn) === 1, (string) $firstCellLines($tOn));
 check('shrink-to-fit: no content overflows its cell', $tOn !== null && $overflow($tOn) <= 0.5, (string) ($tOn ? $overflow($tOn) : -1));
 check('shrink-to-fit: table stays within the content width', $tOn !== null && $tOn->x + $tOn->width <= 36.0 + $printable + 2.0);
