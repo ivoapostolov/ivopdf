@@ -73,7 +73,7 @@ function inspect(IvoPdf $pdf): ?array
     if ($script === null) {
         $script = $dir . 'ivopdf-probes6.py';
         file_put_contents($script, <<<'PY'
-import fitz, json, sys
+import pymupdf as fitz, json, sys
 d = fitz.open(sys.argv[1])
 out = []
 for p in d:

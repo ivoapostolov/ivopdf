@@ -135,7 +135,7 @@ function pdfWords(IvoPdf $pdf): ?array
 {
     $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-final-x-' . md5(uniqid('', true)) . '.pdf';
     file_put_contents($file, $pdf->output());
-    $script = "import fitz,json,sys\nd=fitz.open(sys.argv[1])\nprint(json.dumps([list(w[:5])+[i] for i,p in enumerate(d) for w in p.get_text('words')]))\n";
+    $script = "import pymupdf as fitz,json,sys\nd=fitz.open(sys.argv[1])\nprint(json.dumps([list(w[:5])+[i] for i,p in enumerate(d) for w in p.get_text('words')]))\n";
     $scriptFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-final-x-words.py';
     file_put_contents($scriptFile, $script);
     $json = @shell_exec('python ' . escapeshellarg($scriptFile) . ' ' . escapeshellarg($file) . ' 2>' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null'));
@@ -395,7 +395,7 @@ check('a fallback-font RTL word keeps its inner quote in that font: one run (was
 $fbFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-final-x-rtl.pdf';
 file_put_contents($fbFile, $fb->output());
 $fbScript = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-final-x-text.py';
-file_put_contents($fbScript, "import fitz,sys
+file_put_contents($fbScript, "import pymupdf as fitz,sys
 sys.stdout.buffer.write(fitz.open(sys.argv[1])[0].get_text().encode('utf8'))
 ");
 $fbText = @shell_exec('python ' . escapeshellarg($fbScript) . ' ' . escapeshellarg($fbFile) . ' 2>' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null'));

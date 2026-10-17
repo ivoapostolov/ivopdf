@@ -65,7 +65,7 @@ function py(string $pdf, string $python): mixed
     $file = $tmp . '/py-' . md5($python . $pdf) . '.pdf';
     file_put_contents($file, $pdf);
     $script = $tmp . '/py-' . md5($python) . '.py';
-    file_put_contents($script, "import sys, json\nsys.stdout.reconfigure(encoding='utf-8')\nimport fitz\nd = fitz.open(sys.argv[1])\n" . $python . "\n");
+    file_put_contents($script, "import sys, json\nsys.stdout.reconfigure(encoding='utf-8')\nimport pymupdf as fitz\nd = fitz.open(sys.argv[1])\n" . $python . "\n");
     $out = @shell_exec('python -I ' . escapeshellarg($script) . ' ' . escapeshellarg($file) . ' 2>' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null'));
     if (!is_string($out) || trim($out) === '') {
         return null;

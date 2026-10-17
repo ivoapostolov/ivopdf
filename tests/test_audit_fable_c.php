@@ -57,7 +57,7 @@ function py(string $pdfBytes, string $body, string ...$args): mixed
     static $ok = null;
     $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR;
     if ($ok === null) {
-        $probe = @shell_exec('python -c "import fitz; print(1)" 2>' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null'));
+        $probe = @shell_exec('python -c "import pymupdf as fitz; print(1)" 2>' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null'));
         $ok = is_string($probe) && trim($probe) === '1';
     }
     if (!$ok) {
@@ -66,7 +66,7 @@ function py(string $pdfBytes, string $body, string ...$args): mixed
     $file = $dir . 'ivopdf-fc-' . md5(uniqid('', true)) . '.pdf';
     $script = $dir . 'ivopdf-fc-' . md5($body) . '.py';
     file_put_contents($file, $pdfBytes);
-    file_put_contents($script, "import fitz, json, sys\nd = fitz.open(sys.argv[1])\nargs = [bytes.fromhex(a).decode() for a in sys.argv[2:]]\n" . $body . "\n");
+    file_put_contents($script, "import pymupdf as fitz, json, sys\nd = fitz.open(sys.argv[1])\nargs = [bytes.fromhex(a).decode() for a in sys.argv[2:]]\n" . $body . "\n");
     $cmd = 'python -X utf8 ' . escapeshellarg($script) . ' ' . escapeshellarg($file);
     foreach ($args as $a) {
         $cmd .= ' ' . bin2hex($a);

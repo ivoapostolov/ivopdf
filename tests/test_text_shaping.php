@@ -257,12 +257,12 @@ if ($otf === null) {
     check('embedded as /FontFile3 /Subtype /OpenType with CIDFontType0',
         str_contains($ob, '/FontFile3') && str_contains($ob, '/Subtype /OpenType') && str_contains($ob, '/CIDFontType0') && !str_contains($ob, '/CIDToGIDMap'));
     check('OTF GSUB/GPOS layout is applied (ligature/kerning via TJ)', $parser->getLayout() !== null && str_contains($ob, ' TJ'));
-    $py = trim((string) @shell_exec('python -c "import fitz;print(1)" 2>&1'));
+    $py = trim((string) @shell_exec('python -c "import pymupdf as fitz;print(1)" 2>&1'));
     if ($py === '1') {
         $tmp = tempnam(sys_get_temp_dir(), 'ivo') . '.pdf';
         file_put_contents($tmp, $ob);
         $script = tempnam(sys_get_temp_dir(), 'ivo') . '.py';
-        file_put_contents($script, "import fitz,sys\nd=fitz.open(sys.argv[1])\nt=d[0].get_text()\npx=d[0].get_pixmap(dpi=60)\n"
+        file_put_contents($script, "import pymupdf as fitz,sys\nd=fitz.open(sys.argv[1])\nt=d[0].get_text()\npx=d[0].get_pixmap(dpi=60)\n"
             . "ink=len(set(px.samples))>2\nprint('OK' if 'Office' in t.replace(chr(160),' ') and ink else 'BAD:'+ascii(t))\n");
         $res = trim((string) @shell_exec('python -I ' . escapeshellarg($script) . ' ' . escapeshellarg($tmp) . ' 2>&1'));
         @unlink($tmp);

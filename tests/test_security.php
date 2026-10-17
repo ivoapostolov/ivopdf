@@ -61,7 +61,7 @@ function inspect(string $bytes, string $password = ''): ?array
         file_put_contents($script, <<<'PY'
 import sys, json
 try:
-    import fitz
+    import pymupdf as fitz
 except Exception:
     print("{\"nofitz\": true}"); sys.exit(0)
 path, pw = sys.argv[1], sys.argv[2]

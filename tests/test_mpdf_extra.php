@@ -50,7 +50,7 @@ function inspectIt(IvoPdf $pdf): ?array
     $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-extra-' . md5(uniqid('', true)) . '.pdf';
     file_put_contents($file, $pdf->output());
     $script = <<<'PY'
-import fitz,json,sys
+import pymupdf as fitz,json,sys
 d=fitz.open(sys.argv[1]); pages=[]
 for p in d:
     lines=[]

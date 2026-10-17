@@ -69,7 +69,7 @@ function inspectPdf(IvoPdf $pdf): ?array
     $file = $dir . 'ivopdf-links5-' . md5(uniqid('', true)) . '.pdf';
     file_put_contents($file, $pdf->output());
     $script = <<<'PY'
-import fitz, json, sys
+import pymupdf as fitz, json, sys
 d = fitz.open(sys.argv[1])
 out = []
 for p in d:
@@ -106,7 +106,7 @@ function firstTarget(array $pages): ?array
 }
 
 if (inspectPdf(render('<p>x</p>')) === null) {
-    echo "PyMuPDF (python -c 'import fitz') is not available: PDF-side checks are skipped.\n";
+    echo "PyMuPDF (python -c 'import pymupdf as fitz') is not available: PDF-side checks are skipped.\n";
 }
 
 // ---------------------------------------------------------------------------

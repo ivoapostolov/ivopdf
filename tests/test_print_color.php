@@ -61,7 +61,7 @@ function pixel(string $pdfBytes, float $x, float $y): ?array
     static $script = null;
     static $available = null;
     if ($available === null) {
-        $probe = @shell_exec('python -I -c "import fitz;print(1)" 2>&1');
+        $probe = @shell_exec('python -I -c "import pymupdf as fitz;print(1)" 2>&1');
         $available = is_string($probe) && trim($probe) === '1';
     }
     if (!$available) {

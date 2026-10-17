@@ -64,7 +64,7 @@ function inspectPdf(string $bytes): ?array
     $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-c5-' . md5(uniqid('', true)) . '.pdf';
     file_put_contents($file, $bytes);
     $script = <<<'PY'
-import fitz, json, sys
+import pymupdf as fitz, json, sys
 d = fitz.open(sys.argv[1])
 out = []
 for p in d:

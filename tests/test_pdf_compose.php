@@ -130,7 +130,7 @@ function pyAvailable(): bool
 {
     static $ok = null;
     if ($ok === null) {
-        $out = @shell_exec('python -c "import fitz; print(\'OK\')" 2>&1');
+        $out = @shell_exec('python -c "import pymupdf as fitz; print(\'OK\')" 2>&1');
         $ok = is_string($out) && str_contains($out, 'OK');
     }
     return $ok;
@@ -474,7 +474,7 @@ if (pyAvailable()) {
 
     // external generator with object streams + xref streams + rotation + cropbox + incremental update
     $gen = <<<'PYC'
-import fitz
+import pymupdf as fitz
 doc = fitz.open()
 for i in range(3):
     p = doc.new_page(width=400, height=300)

@@ -84,7 +84,7 @@ function pdfWords(IvoPdf $pdf): ?array
     $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-css4-' . md5(uniqid('', true)) . '.pdf';
     file_put_contents($file, $pdf->output());
     $scriptFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-css4-words.py';
-    file_put_contents($scriptFile, "import fitz,json,sys\nd=fitz.open(sys.argv[1])\nprint(json.dumps([[list(w[:5]) for w in p.get_text('words')] for p in d]))\n");
+    file_put_contents($scriptFile, "import pymupdf as fitz,json,sys\nd=fitz.open(sys.argv[1])\nprint(json.dumps([[list(w[:5]) for w in p.get_text('words')] for p in d]))\n");
     $json = @shell_exec('python ' . escapeshellarg($scriptFile) . ' ' . escapeshellarg($file) . ' 2>' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null'));
     @unlink($file);
     if (!is_string($json) || $json === '' || $json[0] !== '[') {

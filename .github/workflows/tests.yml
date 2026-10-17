@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install PyMuPDF
-        run: pip install pymupdf
+        run: pip install "pymupdf==1.27.1"
       - name: Test suites
         run: bash .github/scripts/run-tests.sh
       - name: Examples
@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install PyMuPDF
-        run: pip install pymupdf
+        run: pip install "pymupdf==1.27.1"
       - name: Verify gd and intl are absent
         run: |
           php -r 'exit(extension_loaded("gd") || extension_loaded("intl") ? 1 : 0);'

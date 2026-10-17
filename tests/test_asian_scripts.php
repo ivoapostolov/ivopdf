@@ -353,12 +353,12 @@ if ($nirmala) {
     check('Indic runs carry /ActualText with the logical text', str_contains($pdfData, '/ActualText <FEFF0939093F0928094D09260940>'));
     check('no missing-font warning when the font covers the script', $p->getWarnings() === [], implode('; ', $p->getWarnings()));
 
-    $py = trim((string) @shell_exec('python -c "import fitz; print(1)" 2>NUL'));
+    $py = trim((string) @shell_exec('python -c "import pymupdf as fitz; print(1)" 2>NUL'));
     if ($py === '1') {
         $tmp = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-asian-' . getmypid() . '.pdf';
         file_put_contents($tmp, $pdfData);
         $script = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-asian-' . getmypid() . '.py';
-        file_put_contents($script, "import fitz,sys\nsys.stdout.buffer.write(''.join(p.get_text() for p in fitz.open(sys.argv[1])).replace(' ','').replace('\\n','').encode('utf-8'))\n");
+        file_put_contents($script, "import pymupdf as fitz,sys\nsys.stdout.buffer.write(''.join(p.get_text() for p in fitz.open(sys.argv[1])).replace(' ','').replace('\\n','').encode('utf-8'))\n");
         $out = (string) shell_exec('python -I ' . escapeshellarg($script) . ' ' . escapeshellarg($tmp));
         @unlink($tmp);
         @unlink($script);

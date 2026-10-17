@@ -52,7 +52,7 @@ function hasRaster(): bool
 {
     static $ok = null;
     if ($ok === null) {
-        $out = @shell_exec('python -c "import fitz; print(\'OK\')" 2>&1');
+        $out = @shell_exec('python -c "import pymupdf as fitz; print(\'OK\')" 2>&1');
         $ok = is_string($out) && str_contains($out, 'OK');
     }
     return $ok;

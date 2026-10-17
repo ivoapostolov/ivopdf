@@ -59,7 +59,7 @@ function pdfSpans(IvoPdf $pdf): ?array
     static $available = null;
     $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ivopdf-paged-' . md5(uniqid('', true)) . '.pdf';
     file_put_contents($file, $pdf->output());
-    $script = 'import fitz,json,sys' . "\n"
+    $script = 'import pymupdf as fitz,json,sys' . "\n"
         . 'd=fitz.open(sys.argv[1]); out=[]' . "\n"
         . 'for p in d:' . "\n"
         . '    s=[]' . "\n"

@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Tests for: real PDF/A-1b output (+ the heuristic PdfAChecker), links / annotations / form fields of imported
  * PDF pages, @page side margin boxes and running elements (position: running / element()).
  *
- * Checks that need PyMuPDF (python + `import fitz`) are skipped when it is not available.
+ * Checks that need PyMuPDF (python + `import pymupdf as fitz`) are skipped when it is not available.
  *
  * Run: php tests/test_finishing.php
  */
@@ -55,14 +55,14 @@ function py(string $code, array $args = []): mixed
     global $tmp;
     static $available = null;
     if ($available === null) {
-        $out = @shell_exec('python -c "import fitz; print(1)" 2>&1');
+        $out = @shell_exec('python -c "import pymupdf as fitz; print(1)" 2>&1');
         $available = $out !== null && trim($out) === '1';
     }
     if (!$available) {
         return null;
     }
     $file = $tmp . DIRECTORY_SEPARATOR . 'snippet_' . md5($code) . '.py';
-    file_put_contents($file, "import fitz, json, sys\n" . $code);
+    file_put_contents($file, "import pymupdf as fitz, json, sys\n" . $code);
     $cmd = 'python ' . escapeshellarg($file) . ' ' . implode(' ', array_map('escapeshellarg', $args)) . ' 2>&1';
     $out = (string) @shell_exec($cmd);
     $json = json_decode(trim($out), true);

@@ -309,7 +309,7 @@ if (str_starts_with($py, 'Python')) {
     $tmpPy = tempnam(sys_get_temp_dir(), 'frm') . '.py';
     file_put_contents($tmpPdf, $pdf);
     file_put_contents($tmpPy, <<<'PY'
-import fitz, sys, json
+import pymupdf as fitz, sys, json
 try:
     d = fitz.open(sys.argv[1])
 except Exception:
