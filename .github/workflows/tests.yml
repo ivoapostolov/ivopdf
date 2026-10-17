@@ -17,23 +17,19 @@ jobs:
       matrix:
         php: ['8.1', '8.2', '8.3', '8.4', '8.5']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
           extensions: dom, mbstring, zlib, gd, openssl, intl
           coverage: none
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install PyMuPDF
         run: pip install pymupdf
       - name: Test suites
-        run: |
-          for t in tests/*.php; do
-            echo "=== $t"
-            php "$t" || exit 1
-          done
+        run: bash .github/scripts/run-tests.sh
       - name: Examples
         run: php examples/generate.php
 
@@ -45,13 +41,13 @@ jobs:
       matrix:
         php: ['8.1', '8.5']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: dom, mbstring, zlib, openssl
+          extensions: dom, mbstring, zlib, openssl, :gd, :intl
           coverage: none
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install PyMuPDF
@@ -60,12 +56,7 @@ jobs:
         run: |
           php -r 'exit(extension_loaded("gd") || extension_loaded("intl") ? 1 : 0);'
       - name: Test suites (those that build GD fixtures are skipped)
-        run: |
-          for t in tests/*.php; do
-            if grep -q 'imagecreate' "$t"; then echo "--- skipped (needs gd): $t"; continue; fi
-            echo "=== $t"
-            php "$t" || exit 1
-          done
+        run: bash .github/scripts/run-tests.sh --skip-gd
       - name: Examples
         run: php examples/generate.php
 
@@ -77,7 +68,7 @@ jobs:
       matrix:
         php: ['8.2', '8.4']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
@@ -99,7 +90,7 @@ jobs:
       matrix:
         php: ['8.2', '8.4']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
