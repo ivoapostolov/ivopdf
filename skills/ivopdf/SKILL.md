@@ -37,16 +37,17 @@ print_r($pdf->getWarnings());                      // images not found / blocked
 - **Units:** use `pt` (1/72 in) or `mm` for print precision. `px` works (96 dpi → 0.75 pt) but mixing units makes alignment drift.
 - **Page setup belongs in CSS:** `@page { size: A4 portrait; margin: 20mm 18mm 22mm 18mm; }`. These override constructor margins. The running footer/header reserve space automatically.
 - **Box sizing:** the default is CSS-correct `content-box`; add `* { box-sizing: border-box; }` when you size boxes with padding (almost always what you want in documents).
+- **Defaults are the browser's:** `body` has `margin: 8px`, `line-height: normal` comes from the font metrics, tables are `border-collapse: separate` with 2px spacing and `padding: 1px` cells, `th` is centered, lists are indented 40px. Tables without `width` shrink to their content: write `width: 100%` for a full-width table. Templates that look right in Chrome/Edge come out the same; set your own margins/paddings for anything else.
 - **Fonts:** bundled families are `Inter` (default sans-serif) and `DejaVu Sans`, `DejaVu Serif`, `DejaVu Sans Mono` (full Cyrillic/Greek/Latin; DejaVu also covers Arabic/Hebrew and fills glyphs Inter lacks). Generic `sans-serif`, Roboto… map to Inter; Arial/Helvetica, Times New Roman and Courier New map to the metric-compatible Liberation Sans/Serif/Mono (same line breaks as in Word/browsers); generic `serif`/`monospace` to DejaVu Serif/Sans Mono. `Sofia Sans` and `Sofia Sans Semi Condensed` are bundled for Bulgarian letterforms (set `<html lang="bg">`; `lang` also selects Serbian/Macedonian/Russian forms where a font has them). For brand fonts use `.ttf` files via `registerFontFamily()` or CSS `@font-face` — see `references/api.md`. Only used glyphs are embedded, so files stay small (~40 KB for an invoice).
-- **Layout:** prefer Flexbox/Grid over floats and tables for structure; use real `<table>` for tabular data (it paginates row by row and repeats `<thead>` on every page).
-- **Page breaks:** `page-break-before/after: always` (or `break-before: page`, or `<pagebreak />`), `page-break-inside: avoid` on cards/blocks that must stay whole. Headings automatically stay with the following content.
+- **Layout:** prefer Flexbox/Grid over floats and tables for structure; use real `<table>` for tabular data (it paginates row by row and repeats `<thead>` on every page). Floats work like in browsers (text wraps line by line and returns to full width below the float; `float` on a `<span>` makes it a block).
+- **Page breaks:** `page-break-before/after: always | left | right` (or `break-before: page`, or `<pagebreak />`), `page-break-inside: avoid` on cards/blocks that must stay whole; `orphans`/`widows` (default 2) are honoured. Headings automatically stay with the following content. A box that exactly fills a page (labels, certificates) does not create an empty page.
 - **Images:** local files are only read from `basePath` / `allowedPaths` (security sandbox); remote URLs need `'isRemoteEnabled' => true`. Data URIs always work. If an image is missing, check `getWarnings()` before anything else.
 - **Page numbers:** `{PAGE_NUM}` / `{PAGE_COUNT}` in header/footer HTML, or CSS `content: counter(page) " / " counter(pages)` (dompdf style), or mPDF's `{PAGENO}` / `{nbpg}`.
 - **Links & navigation:** `<a href="#id">` becomes a clickable internal link; `h1–h6` become PDF bookmarks automatically.
 - **Barcodes:** `<barcode type="QR" value="…" />`, also `DATAMATRIX`, `PDF417`, `C128`, `EAN13`, `UPCA`, `C39`… (vector, Cyrillic-safe QR).
 - **Beyond layout:** fillable forms come from plain HTML controls; passwords, digital signatures, PDF/A, PDF/X/CMYK, attachments (Factur-X), letterhead backgrounds from existing PDFs and tables of contents are one method call each — see section 7 of `references/api.md`.
 - **Other scripts:** Arabic/Hebrew (RTL, `dir="rtl"`) work with the bundled fonts; Chinese/Japanese/Korean/Indic/Thai need a registered font (`scriptFonts`).
-- **Security:** never pass untrusted user HTML with `isRemoteEnabled` on; keep `allowedPaths` minimal.
+- **Security and limits:** never pass untrusted user HTML with `isRemoteEnabled` on; keep `allowedPaths` minimal. Every render has a time budget (`maxRenderTime`, 120 s) and a memory budget (`maxMemory` = `'auto'`, 90 % of `memory_limit`): exceeding one throws a catchable `IvoPdf\Exception\LimitExceededException` instead of a PHP fatal — catch it around `output()`/`save()` when the HTML is user-supplied. Oversized images are skipped with a warning.
 
 What is supported in detail (selectors, properties, SVG, tables, limitations) is in `references/css-support.md`. Read it when you need a feature you're unsure about, or when output differs from a browser.
 
@@ -80,3 +81,7 @@ The constructor accepts dompdf and mPDF option names (`format` like `'A4-L'`, `m
 | Footer overlaps content | Nothing to do — space is reserved automatically; if very tall, reduce footer height |
 | Table row split / lonely heading at page end | Rows never split; add `page-break-inside: avoid` to custom blocks |
 | Layout differs from Chrome | Check `references/css-support.md` limitations; simplify the CSS (avoid percentage heights) |
+| Table narrower than expected | Tables without `width` shrink to content like in browsers → `width: 100%` |
+| Extra space around everything | Browser defaults (`body` margin 8px, list indent, table spacing) → reset them in your CSS |
+| `LimitExceededException` | The document exceeds `maxRenderTime` / `maxMemory` → raise them for trusted large documents, keep them for user HTML |
+| Long word/URL sticks out of a box | Browser behaviour (`overflow-wrap: normal`) → `overflow-wrap: anywhere` or `word-break: break-all` |

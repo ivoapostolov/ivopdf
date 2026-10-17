@@ -303,7 +303,7 @@ Some checks use Python with PyMuPDF (`pip install pymupdf`), the `openssl` CLI o
 - Vertical writing (`writing-mode: vertical-*`), hanging punctuation, SVG filters and EMF+ records are not supported.
 - RTL does not mirror flex and grid layouts (tables are laid out right to left).
 - When `min-width` is larger than `max-width`, `min-width` wins (as in CSS and browsers).
-- PDF/A and PDF/X output is checked structurally, not with veraPDF or a commercial preflight tool.
+- PDF/A output (1b, 2b, 3b) is validated with veraPDF in development; `validatePdfA()` itself is a structural check. PDF/X output is checked structurally, not with a commercial preflight tool.
 - HTML form fields use the non-embedded standard fonts Helvetica / ZapfDingbats, so documents with forms do not pass PDF/A.
 - `.ttc` faces are not supported in CSS `@font-face` (use `registerFontFamily()`).
 - mPDF's imperative API draws over the page (see the mPDF table above): `Cell()` / `Write()` without `SetXY()` become HTML, `SetLink()` ignores its `$page`, `Rotate()` and the `transform*()` helpers use the default page height for their pivot when page sizes vary.

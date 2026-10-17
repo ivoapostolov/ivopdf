@@ -24,7 +24,16 @@
 | `basePath` | `null` | folder for relative local resources |
 | `allowedPaths` | `[]` | extra folders local files may be read from |
 | `isRemoteEnabled` | `false` | allow http(s) images/CSS/fonts (SSRF-protected, TLS verified, no redirects) |
-| `maxRemoteBytes` / `maxImagePixels` | 10 MB / 25 MP | |
+| `maxRemoteBytes` / `maxImagePixels` | 10 MB / 25 MP | images that would not fit the memory left are skipped with a warning |
+| `maxRenderTime` | 120 | seconds per `render()`/`output()` (all layout passes); `0` = unlimited |
+| `maxMemory` | `'auto'` | 90 % of `memory_limit`, or `'256M'` / bytes, `0` = off; both limits throw `IvoPdf\Exception\LimitExceededException` (`getLimit()` = `'time'` / `'memory'`) |
+| `maxHtmlBytes` / `maxNestingDepth` / `maxWordLength` / `maxPages` / `maxBarcodeLength` | 32 MB / 200 / 2000 / 5000 / 5000 | input guards |
+| `inputEncoding` | `'auto'` | BOM → `<meta charset>` → UTF-8 → Windows-1251 (Cyrillic-looking) / Windows-1252; or an explicit charset |
+| `html5Parser` | `true` | WHATWG parser on PHP ≥ 8.4; on PHP < 8.4 libxml with HTML5 normalisation |
+| `shrinkTablesToFit` | 1.4 | max shrink factor for too-wide tables, `0` = off |
+| `scriptFonts` | `[]` | font per script, e.g. `['Hani' => 'Noto Sans SC']` |
+| `formFields` | `true` | `false` draws form controls as static graphics (needed for PDF/A) |
+| `pdfa`, `pdfx`, `colorSpace`, `bleed`, `cropMarks` | | see section 7 |
 | `subsetFonts` | `true` | embed only used glyphs |
 | `bookmarks` | `true` | outline from h1–h6 |
 | `fallbackFonts` | `[]` | registered families tried for missing glyphs |
@@ -58,11 +67,13 @@ PHP method names are case-insensitive: `Output()` and `output()` are the same me
 
 ## 3. Fonts
 
-- Bundled: Inter (default) and DejaVu Sans / Serif / Sans Mono, each with regular, bold, italic, bold italic.
-- Aliases: `sans-serif`, Arial, Helvetica, Roboto, Open Sans… → Inter; `serif`, Times, Georgia… → DejaVu Serif; `monospace`, Courier, Consolas… → DejaVu Sans Mono.
+- Bundled (regular, bold, italic, bold italic each): Inter (default), Liberation Sans / Serif / Mono, Sofia Sans, Sofia Sans Semi Condensed, DejaVu Sans / Serif / Sans Mono.
+- Aliases: `sans-serif`, Roboto, Open Sans… → Inter; Arial, Helvetica → Liberation Sans; Times, Times New Roman → Liberation Serif; Courier, Courier New → Liberation Mono (metric-compatible: same line breaks as Word/browsers); `serif` → DejaVu Serif; `monospace`, Consolas… → DejaVu Sans Mono.
+- Language: `lang` (on `<html>` or any element) selects localized letterforms (OpenType `locl`): Sofia Sans draws Bulgarian Cyrillic by default and Russian forms under `lang="ru"`; `sr`/`mk` select Serbian/Macedonian forms in DejaVu and Liberation. Inter has no Bulgarian forms.
+- A family without a bold or italic face gets synthesized bold (stroke) / oblique (slant), like browsers.
 - Custom: `$pdf->registerFontFamily('Inter', ['regular' => '/fonts/Inter-Regular.ttf', 'bold' => '/fonts/Inter-Bold.ttf']);` then `font-family: 'Inter'`.
 - CSS: `@font-face { font-family: 'Brand'; src: url(fonts/Brand.ttf); font-weight: bold; }` — the file must be inside `basePath`/`allowedPaths` (or a data URI / remote URL with `isRemoteEnabled`).
-- Use TrueType (`.ttf`). Invalid font files are rejected and reported in `getWarnings()`.
+- Use TrueType/OpenType (`.ttf`, `.otf`, `.ttc#index`). `registerFontFamily()` throws `InvalidArgumentException` for a missing/unreadable file; an invalid `@font-face` font is reported in `getWarnings()` and falls back to DejaVu Sans. `data:` and downloaded fonts stay in memory (no temp files).
 
 ## 4. Header, footer, watermark
 
@@ -86,7 +97,9 @@ $pdf->render();
 $pdf->stream('doc.pdf', ['Attachment' => false]);
 ```
 
-Notes: dompdf's inline `<script type="text/php">` page scripts are not supported — use `setFooterHtml()` with `{PAGE_NUM}`/`{PAGE_COUNT}` or CSS counters. dompdf's `Options` object maps by key name. Flexbox/Grid layouts that were faked with tables in dompdf can now be written natively.
+Existing dompdf code also works unchanged: `use Dompdf\Dompdf; use Dompdf\Options;` resolve to IvoPDF when real dompdf is not installed (`Options` setters/getters, `setPaper`, `loadHtml($html, $encoding)`, `loadHtmlFile` with `chroot`, `render`, `output(['compress' => 0])`, `stream`, `getDom()`, `setCallbacks()`). `$dompdf->getCanvas()` offers the CPDF adapter API: `page_text()` with `{PAGE_NUM}`/`{PAGE_COUNT}`, `page_script(callable)`, `page_line()`, `text()`, `line()`, `rectangle()`, `filled_rectangle()`, `circle()`, `arc()`, `polygon()`, `image()`, `add_link()`, `add_named_dest()`, clipping, transforms, `set_opacity()`, `save()`/`restore()`, objects (`open_object`/`add_object`), `new_page()`, `set_page_number()`; `getFontMetrics()` offers `getFont()`, `getTextWidth()`, `registerFont()`. Unknown Canvas/Dompdf methods add a warning instead of a fatal error.
+
+Notes: dompdf's inline `<script type="text/php">` is never executed (one warning) — use `page_script(callable)`, `setFooterHtml()` with `{PAGE_NUM}`/`{PAGE_COUNT}` or CSS counters. Flexbox/Grid layouts that were faked with tables in dompdf can now be written natively.
 
 ## 6. mPDF → IvoPDF
 
@@ -104,15 +117,17 @@ $pdf->WriteHTML($html);
 $pdf->output('doc.pdf', 'D');
 ```
 
-`<pagebreak>` (with orientation/sheet-size/margins/header names), `<htmlpageheader>`/`<sethtmlpageheader>`, `<bookmark>`, `<tocpagebreak>`/`<tocentry>`, `<indexentry>`/`<indexinsert>`, `<annotation>`, `<watermarktext>`/`<watermarkimage>`, `<columns>`/`<columnbreak>`, `<barcode>` and `SetProtection()` work. `new \Mpdf\Mpdf()` resolves to IvoPDF when real mPDF is not installed. Not available: the imperative drawing API (`Cell`, `Rect`, `SetFont`…) and `mirrorMargins`.
+`<pagebreak>` (with orientation/sheet-size/margins/header names/`NEXT-ODD`), `<htmlpageheader>`/`<sethtmlpageheader>`, `SetHeader('L|C|R')`, `<bookmark>`, `<tocpagebreak>`/`<tocentry>` (a document with `<tocentry>` lists only those), `<indexentry>`/`<indexinsert>`, `<annotation>`, `<watermarktext>`/`<watermarkimage>`, `<columns>`/`<columnbreak>`, `<dottab>`, `<textcircle>`, `<barcode>`, `mirrorMargins`, `SetProtection()` work; CSS `float: footnote` (and the `<footnote>` tag as an extension) gives real footnotes. `new \Mpdf\Mpdf()` resolves to IvoPDF when real mPDF is not installed.
+
+The imperative API exists too: `SetAutoPageBreak`, `PageNo`, `DeletePages`/`MovePages`, `TOCpagebreak`, `SetFont`/`SetFontSize`, colours, `SetLineWidth`, `Image`, `WriteFixedPosHTML`, `Text`/`WriteText`, `Line`/`Rect`/`Circle`/`Ellipse`/`RoundedRect`/`Arrow`, `Link`, `Rotate`/`transform*`, `Cell`/`MultiCell`/`Write`/`Ln` with `SetXY` (drawn over the page at that position; without `SetXY` they flow as HTML). Any other mPDF method is accepted with a warning instead of a fatal error.
 
 ## 7. Advanced features
 
 | Need | API |
 |---|---|
-| Password / permissions | `setProtection(['print','copy'], $userPwd, $ownerPwd, 'aes256')` |
+| Password / permissions | `setProtection(['print','copy'], $userPwd, $ownerPwd, 'aes256')`; `aes128`/`rc4` accept only Latin-1/PDFDocEncoding passwords (Cyrillic → use `aes256`) |
 | Digital signature | `setSignature($certPemOrPath, $keyPemOrPath, $keyPwd, ['Name'=>…,'Reason'=>…], [page, x, y, w, h])` |
-| Archiving | `setPdfA('1b'\|'2b'\|'3b')`, `validatePdfA()` (heuristic) |
+| Archiving | `setPdfA('1b'\|'2b'\|'3b')`, `validatePdfA()` (structural check; outputs were validated with veraPDF); use `formFields => false` for documents with forms |
 | Print | `setPdfX('X-1a'\|'X-3'\|'X-4')`, `setColorSpace('cmyk')`, `setBleed($mm, true)`, `addSpotColor($name, c, m, y, k)`; CSS `cmyk()`, `spot(NAME, 80%)` |
 | E-invoice | `setPdfA('3b')->attachFacturX($xml, 'EN 16931')` |
 | Attachments | `attachFile($pathOrBytes, $name, $desc, $mime)` |
