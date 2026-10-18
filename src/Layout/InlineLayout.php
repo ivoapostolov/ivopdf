@@ -79,6 +79,8 @@ class InlineLayout
 
     /** Container currently being laid out in ::first-line probe passes */
     private ?LayoutBox $firstLineProbe = null;
+    /** The container whose copy the next layoutInlineSequenceCore() call lays out (::first-line trials), for its page-edge move */
+    private ?LayoutBox $edgeKey = null;
 
     /**
      * ::first-line: the first line box takes the pseudo-element's font/colour/text-transform. Because the style
@@ -101,6 +103,7 @@ class InlineLayout
                     ($hooks['reset'])(); // floats placed by an earlier trial pass
                     $this->floatHooks = $hooks;
                 }
+                $this->edgeKey = $container;
                 $y = $this->layoutInlineSequenceCore($probe, $inlineNodes, $startX, $startY, $availableWidth, $budget, $breakAt);
                 $chars = 0;
                 if (isset($probe->lines[0])) {
@@ -349,6 +352,18 @@ class InlineLayout
         }
         $textIndentPt = $this->engine->resolveLength($container->style->get('text-indent', '0'), $availableWidth, $container->fontSizePt);
 
+        // Options::$pageOverflowWrap: the page's content area in the coordinates of this layout (an earlier pass of the
+        // render may have seen this container moved after its layout, e.g. inside an inline-block); whether the
+        // container may break there (no clipping or transformed ancestor) is looked up when a word reaches the edge
+        $edgeKey = $this->edgeKey ?? $container; // ::first-line trials lay out a copy of the container
+        $this->edgeKey = null;
+        $edge = $this->engine->pageEdgeFor($edgeKey, $container);
+        $edgeL = $edge[0] ?? null;
+        $edgeR = $edge[1] ?? null;
+        $boxEdge = $edgeR !== null && $this->engine->boxEdgeDepth > 0; // a table cell narrowed to fit the page
+        $edgeOk = null;
+        $edgeUnit = false; // the current unbreakable word / no-wrap line was already broken at the page edge
+
         /** @var list<array{runs: list<TextRun>, forcedBreak: bool}> $rawLines */
         $rawLines = [];
         $currentRuns = [];
@@ -394,9 +409,43 @@ class InlineLayout
             $currentWidth = 0.0;
         };
 
+        // Room of the current line before its content would cross the page edge (the right one; in right-to-left
+        // paragraphs the left one: an overflowing line is start-aligned and overflows to the left)
+        $edgeRoom = static function () use (&$lineDx, &$availW, $startX, $edgeL, $edgeR, $baseLevel, $boxEdge): float {
+            $room = $baseLevel === 1 ? $startX + $lineDx + $availW - (float) $edgeL : (float) $edgeR - ($startX + $lineDx);
+            return $boxEdge ? min($room, $availW) : $room; // a narrowed table cell: at its own edge
+        };
+
+        // Ends the line before $next for the page edge. Runs of one character can meet there (a combining mark or an
+        // emoji ZWJ sequence drawn with several fonts): the line then ends at the nearest character boundary among the
+        // last few runs, and the runs after it go to the next line with $next
+        $edgeBreakLine = function (TextRun $next) use (&$currentRuns, &$currentWidth, $flushLine): void {
+            $n = count($currentRuns);
+            $cut = $n;
+            $text = static fn(TextRun $r): string => $r->inlineBox !== null ? "\u{FFFC}" : $r->text;
+            for ($k = $n; $k >= 1 && $k > $n - 6; $k--) {
+                $after = $k < $n ? $text($currentRuns[$k]) : $text($next);
+                $before = '';
+                for ($j = $k - 1; $j >= 0 && $j >= $k - 4; $j--) {
+                    $before = $text($currentRuns[$j]) . $before;
+                }
+                if (self::clusterBoundary($before, $after)) {
+                    $cut = $k;
+                    break;
+                }
+            }
+            $carry = $cut < $n ? array_splice($currentRuns, $cut) : [];
+            $flushLine(false);
+            foreach ($carry as $c) {
+                $currentRuns[] = $c;
+                $currentWidth += $c->width + $c->paddingLeft + $c->paddingRight;
+            }
+        };
+
         foreach ($tokens as $token) {
             \IvoPdf\RenderLimits::tick();
             if ($token->isLineBreak) {
+                $edgeUnit = false;
                 $flushLine(true);
                 continue;
             }
@@ -432,6 +481,9 @@ class InlineLayout
 
             $preserve = $this->preservesSpaces($token);
             $isNoWrap = $this->isNoWrap($token);
+            if ($token->breakBefore) {
+                $edgeUnit = false;
+            }
 
             if ($token->isWhitespace && !$preserve) {
                 // Collapse leading whitespace and whitespace sequences spanning element boundaries
@@ -500,15 +552,60 @@ class InlineLayout
                 }
             }
 
+            // Options::$pageOverflowWrap: a word (or no-wrap line) overflowing its box may do so up to the edge of the
+            // page, where it is broken - by characters (grapheme clusters) - and continues on the next line. A word that
+            // fits a line of its own there just starts the next line.
+            $wrapLimit = $availW;
+            if ($edgeR !== null && !$token->isWhitespace && $token->inlineBox === null && $token->text !== '') {
+                $room = $edgeRoom();
+                if ($currentWidth + $tokenTotalWidth > $room + 0.05 && $room >= 1.0 && ($edgeOk ??= self::breaksAtPageEdge($container))) {
+                    $this->engine->markEdgeUsed($edgeKey, $container, [(float) $edgeL, (float) $edgeR]);
+                    if ($tokenTotalWidth > $availW + 0.05 && !$isNoWrap && self::breaksOverflowingWords($token->style)) {
+                        $wrapLimit = min($availW, $room); // broken by the overflow-wrap below, at the box edge or the page edge before it
+                    } elseif (!empty($currentRuns) && $tokenTotalWidth <= $room + 0.05) {
+                        $edgeBreakLine($token);
+                        if ((!$token->breakBefore || $isNoWrap) && !$edgeUnit) {
+                            $token->edgeBreak = true; // a no-wrap line or a glued word was broken
+                            $edgeUnit = true;
+                        }
+                    } else {
+                        if (!empty($currentRuns) && $room - $currentWidth < $this->firstClusterWidth($token)) {
+                            $edgeBreakLine($token); // not even its first character fits before the edge
+                            $room = $edgeRoom();
+                        }
+                        $pieces = $room >= 1.0 ? $this->splitOversizedWordToken($token, max(1.0, $room - $currentWidth), $room) : [$token];
+                        if (count($pieces) > 1) {
+                            if (!$edgeUnit) {
+                                $pieces[0]->edgeBreak = true;
+                                $edgeUnit = true;
+                            }
+                            $pieceCount = count($pieces);
+                            foreach ($pieces as $pi => $piece) {
+                                $pieceWidth = $piece->width + $piece->paddingLeft + $piece->paddingRight;
+                                if (!empty($currentRuns) && ($currentWidth + $pieceWidth > $edgeRoom() + 0.05)) {
+                                    $flushLine(false);
+                                }
+                                $currentRuns[] = $piece;
+                                $currentWidth += $pieceWidth;
+                                if ($pi < $pieceCount - 1) {
+                                    $flushLine(false);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // A single word still wider than the line: with `overflow-wrap: anywhere | break-word` (or `word-break:
             // break-word | break-all`) it is broken by characters; otherwise it overflows the box, as in browsers
-            if (!$isNoWrap && !$token->isWhitespace && $token->inlineBox === null && ($currentWidth + $tokenTotalWidth > $availW + 0.05) && $availW > 5.0 && $tokenTotalWidth > $availW + 0.05
+            if (!$isNoWrap && !$token->isWhitespace && $token->inlineBox === null && ($currentWidth + $tokenTotalWidth > $wrapLimit + 0.05) && $wrapLimit > 5.0 && $tokenTotalWidth > $wrapLimit + 0.05
                 && self::breaksOverflowingWords($token->style)) {
-                $pieces = $this->splitOversizedWordToken($token, max(5.0, $availW - $currentWidth), $availW);
+                $pieces = $this->splitOversizedWordToken($token, max(5.0, $wrapLimit - $currentWidth), $wrapLimit);
                 $pieceCount = count($pieces);
                 foreach ($pieces as $pi => $piece) {
                     $pieceWidth = $piece->width + $piece->paddingLeft + $piece->paddingRight;
-                    if (!empty($currentRuns) && ($currentWidth + $pieceWidth > $availW + 0.05)) {
+                    if (!empty($currentRuns) && ($currentWidth + $pieceWidth > $wrapLimit + 0.05)) {
                         $flushLine(false);
                     }
                     $currentRuns[] = $piece;
@@ -660,7 +757,8 @@ class InlineLayout
             $lineBox->baselineOffset = $maxAscent;
 
             $indent = ($lineIdx === 0) ? $textIndentPt : 0.0;
-            $freeSpace = max(0.0, $lineData['w'] - $runsTotalWidth - $indent);
+            $rawFree = $lineData['w'] - $runsTotalWidth - $indent;
+            $freeSpace = max(0.0, $rawFree);
             $extraSpacePerGap = 0.0;
 
             $offsetX = $lineStartX + ($baseLevel === 1 ? 0.0 : $indent);
@@ -672,6 +770,11 @@ class InlineLayout
                 $extraSpacePerGap = $freeSpace / ($spaceCount + count($charGaps));
             } elseif ($textAlign === 'justify' && $baseLevel === 1) {
                 $offsetX += $freeSpace;
+            }
+            if ($baseLevel === 1 && $rawFree < -0.05) {
+                // Content wider than the line is start-aligned and overflows the end edge: the left one in right-to-left
+                // text (CSS Text 3 §7.1), as in browsers
+                $offsetX = $lineStartX + $rawFree;
             }
 
             $runCursorX = $offsetX;
@@ -724,6 +827,49 @@ class InlineLayout
         }
 
         return $cursorY;
+    }
+
+    /**
+     * Options::$pageOverflowWrap applies to the text of $container unless it or an ancestor clips its content (overflow
+     * hidden / clip / auto / scroll: the author cuts it there) or is transformed (its layout coordinates are not where
+     * it is painted).
+     */
+    private static function breaksAtPageEdge(LayoutBox $container): bool
+    {
+        for ($b = $container; $b !== null; $b = $b->parent) {
+            if ($b->isTextNode()) {
+                continue;
+            }
+            if (in_array(strtolower(trim($b->style->get('overflow', 'visible'))), ['hidden', 'clip', 'auto', 'scroll'], true)) {
+                return false;
+            }
+            $tf = strtolower(trim($b->style->get('transform', 'none')));
+            if ($tf !== 'none' && $tf !== '') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether text $a followed by text $b has a character (grapheme cluster) boundary between them. */
+    private static function clusterBoundary(string $a, string $b): bool
+    {
+        $tail = mb_substr($a, -4, null, 'UTF-8');
+        $head = mb_substr($b, 0, 4, 'UTF-8');
+        if ($tail === '' || $head === '') {
+            return true;
+        }
+        return preg_match_all('/\X/u', $tail . $head) === preg_match_all('/\X/u', $tail) + preg_match_all('/\X/u', $head);
+    }
+
+    /** Width of the first character (grapheme cluster) of a word token. */
+    private function firstClusterWidth(TextRun $token): float
+    {
+        if (preg_match('/^\X/u', $token->text, $m) !== 1) {
+            return 0.0;
+        }
+        $style = $token->style;
+        return $this->fontManager->measureText($m[0], $style->get('font-family', 'DejaVu Sans'), $style->get('font-weight', 'normal'), $style->get('font-style', 'normal'), $token->fontSizePt, $token->letterSpacingPt);
     }
 
     /** `overflow-wrap: anywhere | break-word` or `word-break: break-word | break-all`: an overlong word may break anywhere. */
@@ -1323,8 +1469,9 @@ class InlineLayout
      */
     private function splitOversizedWordToken(TextRun $token, float $firstMaxWidth, float $lineMaxWidth): array
     {
-        $chars = preg_split('//u', $token->text, -1, PREG_SPLIT_NO_EMPTY);
-        if (!$chars || count($chars) <= 1) {
+        // Grapheme clusters: a base letter keeps its combining marks, an emoji sequence stays whole
+        $chars = preg_match_all('/\X/u', $token->text, $m) !== false ? $m[0] : [];
+        if (count($chars) <= 1) {
             return [$token];
         }
 

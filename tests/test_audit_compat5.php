@@ -406,7 +406,7 @@ check('... and it produces pages', (int) $res > 1, $res);
 [$mb, $secs, $res] = runIsolated('$pdf = new IvoPdf\IvoPdf(["compress" => true, "maxWordLength" => 0]); $pdf->loadHtml("<p>" . str_repeat("a", 1000000) . "</p>"); $out = $pdf->output(); $result = $pdf->getPageCount() . " " . strlen($out);', '512M');
 check('a 1 MB unbroken word with the guard off (maxWordLength 0): peak memory below 150 MB', $mb < 150.0, "{$mb} MB, {$secs} s, {$res}");
 check('... and below 30 s', $secs < 30.0, "{$secs} s");
-[$mb, $secs, $res] = runIsolated('$pdf = new IvoPdf\IvoPdf(["compress" => true]); $pdf->loadHtml("<p>" . str_repeat("a", 5000000) . "</p>"); $out = $pdf->output(); $result = $pdf->getPageCount() . " " . strlen($out) . " " . count($pdf->getWarnings());', '1G');
+[$mb, $secs, $res] = runIsolated('$pdf = new IvoPdf\IvoPdf(["compress" => true]); $pdf->loadHtml("<p>" . str_repeat("a", 5000000) . "</p>"); $out = $pdf->output(); $result = $pdf->getPageCount() . " " . strlen($out) . " " . count(array_filter($pdf->getWarnings(), static fn(string $w): bool => str_contains($w, "maxWordLength")));', '1G');
 check('a 5 MB unbroken word (default guard): peak memory below 400 MB', $mb < 400.0, "{$mb} MB, {$secs} s, {$res}");
 check('... and below 40 s', $secs < 40.0, "{$secs} s");
 $parts = explode(' ', $res);

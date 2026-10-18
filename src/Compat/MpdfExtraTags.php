@@ -40,16 +40,23 @@ final class MpdfExtraTags
     public static function textCircle(array $a, MpdfState $s): string
     {
         $style = self::styleMap($a['style'] ?? '');
-        $r = self::length($a['r'] ?? '20mm', 12.0, 'mm');
-        if ($r <= 0) {
+        $r = min(10000.0, self::length($a['r'] ?? '20mm', 12.0, 'mm'));
+        // mPDF names the texts top-text / bottom-text; plain top / bottom (a common slip) are accepted too
+        $top = self::text($a['top-text'] ?? ($a['top'] ?? ''));
+        $bottom = self::text($a['bottom-text'] ?? ($a['bottom'] ?? ''));
+        if (trim($top) === '' && trim($bottom) === '') {
+            $s->warnings[] = '<textcircle> has no top-text or bottom-text: nothing was drawn.';
             return '';
         }
-        $top = self::text($a['top-text'] ?? '');
-        $bottom = self::text($a['bottom-text'] ?? '');
+        if (!($r > 0)) {
+            $s->warnings[] = '<textcircle> skipped: its radius r="' . mb_substr($a['r'] ?? '', 0, 40) . '" is not a positive length (e.g. r="30mm").';
+            return '';
+        }
         $divider = self::text($a['divider'] ?? '');
         $kerning = (float) (($a['space-width'] ?? '') !== '' ? $a['space-width'] : 120) / 100;
         $fontWidth = (float) (($a['char-width'] ?? '') !== '' ? $a['char-width'] : 100) / 100;
-        if ($kerning == 0.0 || $fontWidth == 0.0) {
+        if (!($kerning > 0) || !($fontWidth > 0)) {
+            $s->warnings[] = '<textcircle> skipped: space-width and char-width must be positive percentages (defaults 120 and 100).';
             return '';
         }
 

@@ -41,6 +41,8 @@ final class RunExtra
     /** `position: relative` offset of the enclosing inline elements (applied after the line is placed) */
     public float $relDx = 0.0;
     public float $relDy = 0.0;
+    /** First run of a word (or of a no-wrap line) broken at the edge of the page (Options::$pageOverflowWrap) */
+    public bool $edgeBreak = false;
     /** Text that copy / paste and search should see instead of the drawn glyphs (synthesized small capitals) */
     public ?string $actualText = null;
     // Optional inline box decorations (for <span style="background:...; padding:...; border-radius:...">, <code>, <mark>)

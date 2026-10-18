@@ -207,8 +207,11 @@ $firstCellLines = static function (?LayoutBox $t): int {
     $td = $t !== null ? findBox($t, static fn(LayoutBox $b): bool => $b->tagName === 'td') : null;
     return $td !== null ? count($td->lines) : -1;
 };
-// Browsers never break a word inside a cell (overflow-wrap: normal): without shrinking the table grows past the page width
-check('without shrinking, words stay whole and the table grows past the content width', $firstCellLines($tOff) === 1 && $tOff !== null && $tOff->width > $printable, (string) $firstCellLines($tOff));
+// Browsers never break a word inside a cell (overflow-wrap: normal): without shrinking the table grows past the page
+// width; with pageOverflowWrap (default) only up to the page edge, where the widest columns are narrowed
+$tOffRaw = $tableOf(renderDoc($wide, ['shrinkTablesToFit' => 0, 'pageOverflowWrap' => false]));
+check('without shrinking and pageOverflowWrap=false, words stay whole and the table grows past the content width', $firstCellLines($tOffRaw) === 1 && $tOffRaw !== null && $tOffRaw->width > $printable, (string) $firstCellLines($tOffRaw));
+check('without shrinking, the table stops at the page edge and its words break at the cell edges', $tOff !== null && $tOff->x + $tOff->width <= 36.0 + $printable + 0.5 && $firstCellLines($tOff) > 1 && $overflow($tOff) <= 0.5, (string) $firstCellLines($tOff));
 check('with shrinking, every word stays on one line', $firstCellLines($tOn) === 1, (string) $firstCellLines($tOn));
 check('shrink-to-fit: no content overflows its cell', $tOn !== null && $overflow($tOn) <= 0.5, (string) ($tOn ? $overflow($tOn) : -1));
 check('shrink-to-fit: table stays within the content width', $tOn !== null && $tOn->x + $tOn->width <= 36.0 + $printable + 2.0);
@@ -256,7 +259,7 @@ $t0 = microtime(true);
 $word = renderDoc('<p>' . str_repeat('A', 300000) . '</p>');
 check('300 KB single word: renders, split with a warning', $word->getPageCount() >= 1 && $word->getWarnings() !== [] && microtime(true) - $t0 < 30.0);
 $word2 = renderDoc('<p>' . str_repeat('B', 5000) . '</p>', ['maxWordLength' => 0]);
-check('maxWordLength=0 disables the word guard', $word2->getWarnings() === []);
+check('maxWordLength=0 disables the word guard', array_filter($word2->getWarnings(), static fn(string $w): bool => str_contains($w, 'maxWordLength')) === []);
 
 $threw = null;
 try {

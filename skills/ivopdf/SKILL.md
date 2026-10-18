@@ -84,4 +84,4 @@ The constructor accepts dompdf and mPDF option names (`format` like `'A4-L'`, `m
 | Table narrower than expected | Tables without `width` shrink to content like in browsers → `width: 100%` |
 | Extra space around everything | Browser defaults (`body` margin 8px, list indent, table spacing) → reset them in your CSS |
 | `LimitExceededException` | The document exceeds `maxRenderTime` / `maxMemory` → raise them for trusted large documents, keep them for user HTML |
-| Long word/URL sticks out of a box | Browser behaviour (`overflow-wrap: normal`) → `overflow-wrap: anywhere` or `word-break: break-all` |
+| Long word/URL sticks out of a box | Browser behaviour (`overflow-wrap: normal`; at the page edge it is broken, see `pageOverflowWrap`) → `overflow-wrap: anywhere` or `word-break: break-all` |

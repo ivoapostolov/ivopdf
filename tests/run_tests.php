@@ -292,7 +292,15 @@ $longWordPdf->loadHtml('<div id="narrow" style="width:100pt;overflow-wrap:break-
 $narrowBox = findBoxById($longWordPdf->getLayoutTree(), 'narrow');
 assertTrue($narrowBox !== null && count($narrowBox->lines) > 1, '80-char unbreakable word wrapped across multiple lines inside 100pt box (overflow-wrap: break-word)');
 $overBox = findBoxById($longWordPdf->getLayoutTree(), 'over');
-assertTrue($overBox !== null && count($overBox->lines) === 1, 'Without overflow-wrap the 80-char word overflows the box on one line, as in browsers');
+$overFits = $overBox !== null && count($overBox->lines) > 1;
+foreach ($overBox !== null ? $overBox->lines : [] as $overLine) {
+    $overFits = $overFits && $overLine->x + $overLine->width <= 595.28 - 36.0 + 0.5 && $overLine->width > 100.5;
+}
+assertTrue($overFits, 'Without overflow-wrap the 80-char word overflows the box as in browsers, but breaks at the page edge (pageOverflowWrap)');
+$browserPdf = new IvoPdf(['pageOverflowWrap' => false]);
+$browserPdf->loadHtml('<div id="over" style="width:100pt">' . str_repeat('W', 80) . '</div>')->render();
+$browserBox = findBoxById($browserPdf->getLayoutTree(), 'over');
+assertTrue($browserBox !== null && count($browserBox->lines) === 1, 'pageOverflowWrap=false: the 80-char word overflows the box (and the page) on one line, as in browsers');
 if ($narrowBox !== null && !empty($narrowBox->lines)) {
     assertTrue($narrowBox->lines[0]->width <= 100.5, 'First wrapped chunk fits inside 100pt width');
 }

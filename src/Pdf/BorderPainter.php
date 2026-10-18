@@ -129,9 +129,45 @@ final class BorderPainter
         }
 
         $wedges = $square ? $this->bands($x, $y, $w, $h, $widths) : $this->wedges($x, $y, $w, $h, $widths);
+        // Square corners, opaque solid / inset / outset sides (a <table border> cell has four): the same clip of the
+        // side's wedge and fill of the ring as below, written compactly - coordinates relative to the box corner (the
+        // same values: cells of one size repeat byte for byte, which the stream compression folds away), the ring
+        // without fillRing()'s zero-length corner segments, no inner q / Q, the colour set only when it changes.
+        // The painted pixels stay the same.
+        $flat = max($radii) <= 0.01;
+        $ring = null;
+        $origin = null;
+        $lastFill = null;
+        $open = false;
         foreach ($active as $i) {
             $style = $styles[$i];
             $color = $colors[$i];
+            if ($flat && $color[3] >= 0.999 && !in_array($style, ['double', 'groove', 'ridge', 'dashed', 'dotted'], true)) {
+                $origin ??= [self::hundredths($x), self::hundredths($this->pageHeight - ($y + $h))];
+                $ring ??= $this->rectRing($x, $y, $w, $h, $widths, $origin);
+                if ($ring === '') {
+                    continue; // degenerate box: fillRing() paints nothing either
+                }
+                if (!$open) {
+                    $out .= 'q 1 0 0 1 ' . self::fromHundredths($origin[0]) . ' ' . self::fromHundredths($origin[1]) . " cm\n";
+                    $open = true;
+                }
+                if ($style === 'inset' || $style === 'outset') {
+                    $color = $this->shade($color, ($style === 'inset') === ($i === 0 || $i === 3));
+                }
+                $fill = ColorOps::fillOp($color);
+                if ($fill !== $lastFill) {
+                    $out .= $fill . "\n"; // outside the side's q ... Q: it stays for the next sides
+                    $lastFill = $fill;
+                }
+                $out .= 'q ' . $this->relPath($wedges[$i], $origin) . "W n\n" . $ring . "f*\nQ\n";
+                continue;
+            }
+            if ($open) {
+                $out .= "Q\n";
+                $open = false;
+                $lastFill = null;
+            }
             $out .= "q\n" . $this->polygonPath($wedges[$i]) . "W n\n";
             switch ($style) {
                 case 'double':
@@ -164,7 +200,66 @@ final class BorderPainter
             }
             $out .= "Q\n";
         }
-        return $out;
+        return $open ? $out . "Q\n" : $out;
+    }
+
+    /**
+     * The border ring of a box with square corners (outer and inner rectangle, for f*): the path of fillRing() from
+     * 0 to 1 without its zero-length corner segments, relative to $origin ('' for a degenerate box, as there).
+     *
+     * @param list<float> $widths
+     * @param array{0: int, 1: int} $origin
+     */
+    private function rectRing(float $x, float $y, float $w, float $h, array $widths, array $origin): string
+    {
+        $rect = function (float $x0, float $y0, float $x1, float $y1) use ($origin): string {
+            if ($x1 - $x0 < 0.01 || $y1 - $y0 < 0.01) {
+                return '';
+            }
+            return $this->relPath([[$x0, $y0], [$x1, $y0], [$x1, $y1], [$x0, $y1]], $origin) . "\n";
+        };
+        $outer = $rect($x, $y, $x + $w, $y + $h);
+        if ($outer === '') {
+            return '';
+        }
+        return $outer . $rect($x + $widths[3], $y + $widths[0], $x + $w - $widths[1], $y + $h - $widths[2]);
+    }
+
+    /**
+     * A closed polygon on one line, for a fill or a clip (which imply the closing `h`): the coordinates polygonPath()
+     * writes, minus $origin (exact decimal subtraction in hundredths of a point).
+     *
+     * @param list<array{0: float, 1: float}> $pts
+     * @param array{0: int, 1: int} $origin
+     */
+    private function relPath(array $pts, array $origin): string
+    {
+        $s = '';
+        foreach ($pts as $i => [$px, $py]) {
+            $s .= self::fromHundredths(self::hundredths($px) - $origin[0]) . ' '
+                . self::fromHundredths(self::hundredths($this->pageHeight - $py) - $origin[1]) . ($i === 0 ? ' m ' : ' l ');
+        }
+        return $s;
+    }
+
+    /** The value polygonPath() writes (%.2F), as an integer number of hundredths. */
+    private static function hundredths(float $v): int
+    {
+        $s = sprintf('%.2F', $v);
+        $neg = $s[0] === '-';
+        $digits = str_replace(['-', '.'], '', $s);
+        return $neg ? -(int) $digits : (int) $digits;
+    }
+
+    private static function fromHundredths(int $h): string
+    {
+        $abs = abs($h);
+        $s = (string) intdiv($abs, 100);
+        $frac = $abs % 100;
+        if ($frac !== 0) {
+            $s .= '.' . rtrim(sprintf('%02d', $frac), '0');
+        }
+        return $h < 0 ? '-' . $s : $s;
     }
 
     /**

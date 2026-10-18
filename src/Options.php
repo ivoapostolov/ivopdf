@@ -37,6 +37,14 @@ class Options
     public int $maxNestingDepth = 200;
     /** Unbroken words longer than this many bytes get a space inserted (protects shaping/layout memory). 0 = off */
     public int $maxWordLength = 2000;
+    /**
+     * A word (or a `white-space: pre / nowrap` line) wider than its box overflows the box as in browsers, but never the
+     * page: where its glyphs would cross the right edge of the page's content area (the left edge in right-to-left
+     * text) it is broken there, at a character boundary, and continues on the next line, so no text is cut off.
+     * getWarnings() then says how many were broken. false = the browser behaviour everywhere (the part beyond the page
+     * is lost; a warning says how many words were cut). Default true.
+     */
+    public bool $pageOverflowWrap = true;
     /** Output is truncated (with a warning) after this many pages (runaway-layout guard). 0 = unlimited */
     public int $maxPages = 5000;
     /**
@@ -55,7 +63,8 @@ class Options
      * memory_limit). Exceeding it throws \IvoPdf\Exception\LimitExceededException while PHP still has room to unwind.
      * With a PHP memory_limit set, the budget never exceeds 90 % of it, so the exception always comes before PHP's own
      * fatal "Allowed memory size exhausted". Default 'auto'; 0 = off. Budgets below 1 MB are almost certainly a unit
-     * mistake (64 meaning 64 MB) and are ignored with a warning.
+     * mistake (64 meaning 64 MB), and negative numbers or strings that are no size ('64 megs') are errors: all of them
+     * are ignored - the 'auto' budget applies - with a warning in getWarnings().
      */
     public int|string $maxMemory = 'auto';
     /** Parse HTML with the WHATWG HTML5 algorithm (PHP >= 8.4, \Dom\HTMLDocument); false = libxml's HTML4 parser */
@@ -362,10 +371,17 @@ class Options
         }
         $bytes = RenderLimits::parseBytes($this->maxMemory);
         if ($bytes <= 0) {
-            return 0;
+            $raw = is_string($this->maxMemory) ? trim($this->maxMemory) : $this->maxMemory;
+            if ($raw === 0 || $raw === '0' || $raw === '') {
+                return 0; // documented: no budget of its own
+            }
+            // A negative number or a string that is not a size: never silently "no limit"
+            $shown = is_string($raw) ? "'" . mb_substr($raw, 0, 40) . "'" : (string) $raw;
+            $this->addWarning("maxMemory {$shown} is not a memory size and was ignored (the 'auto' budget applies): write it like '256M' or '1G'.");
+            return $ceiling;
         }
         if ($bytes < 1048576) {
-            $this->addWarning("maxMemory of {$bytes} bytes ignored: write the budget with a unit, e.g. '256M'.");
+            $this->addWarning("maxMemory of {$bytes} bytes ignored (the 'auto' budget applies): a number is in bytes, write the budget with a unit, e.g. '256M'.");
             return $ceiling;
         }
         return $ceiling > 0 ? min($bytes, $ceiling) : $bytes;

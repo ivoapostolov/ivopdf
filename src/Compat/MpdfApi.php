@@ -142,6 +142,9 @@ trait MpdfApi
         if ($css !== '') {
             $out = MpdfTags::injectStyle($out, $css);
         }
+        foreach ($state->warnings as $warning) {
+            $this->options->addWarning($warning);
+        }
         if ($state->watermarkText !== null) {
             $this->options->watermarkText = $state->watermarkText['content'];
             $this->options->watermarkOpacity = $state->watermarkText['alpha'];

@@ -122,6 +122,10 @@ class TableLayout
         $cellPlacements = [];
         $numCols = 0;
         $numRows = count($orderedRows);
+        $groupOfRow = [];
+        foreach ($orderedRows as $rowEntry) {
+            $groupOfRow[] = $rowEntry['groupBox'] === null ? -1 : spl_object_id($rowEntry['groupBox']);
+        }
 
         foreach ($orderedRows as $rIdx => $rowEntry) {
             $rowBox = $rowEntry['rowBox'];
@@ -137,7 +141,7 @@ class TableLayout
                 }
 
                 $cSpan = max(1, min(100, $cell->colspan));
-                $rSpan = max(1, min(500, $cell->rowspan));
+                $rSpan = CellPlacement::rowSpanOf($cell, $rIdx, $groupOfRow);
 
                 for ($rr = $rIdx; $rr < $rIdx + $rSpan; $rr++) {
                     for ($cc = $colCursor; $cc < $colCursor + $cSpan; $cc++) {
@@ -199,6 +203,10 @@ class TableLayout
             }
         }
 
+        // Options::$pageOverflowWrap: columns widen to their longest word only up to the edge of the page; the
+        // widest columns are narrowed so that the table ends there, and their words break at the cell edge
+        $narrowed = TableMetrics::isFixed($table) ? [] : $this->fitColumnsToPage($table, $colWidths, $contentX, $contentWidth, $totalHorizontalSpacing);
+
         // Columns never get narrower than their content minimum: a table whose words do not fit grows past its
         // width (and its container), as in browsers, instead of letting the words overlap the next cells
         $gridW = array_sum($colWidths) + $totalHorizontalSpacing;
@@ -216,6 +224,7 @@ class TableLayout
         }
 
         // Layout each cell inside its spanned column width to determine row heights
+        $rtl = strtolower(trim($table->style->get('direction', 'ltr'))) === 'rtl';
         $rowHeights = array_fill(0, $numRows, 0.0);
         foreach ($orderedRows as $rIdx => $rowEntry) {
             $rBox = $rowEntry['rowBox'];
@@ -243,7 +252,20 @@ class TableLayout
             $collapseExtraW = $borderCollapse ? ($cell->borderLeft + $cell->borderRight) / 2.0 : 0.0;
             $cell->forcedBorderBoxWidth = $cellW + $collapseExtraW;
             $cell->forcedBorderBoxHeight = null;
-            $this->engine->layoutElement($cell, 0.0, 0.0, $cellW);
+            // Laid out at x = 0, moved to its column below: the inline layout learns the move (page-edge breaking)
+            $frameDx = $this->cellX($cp, $colOffsets, $contentX, $contentWidth, $rtl, $borderCollapse) - $cell->marginLeft;
+            $narrow = false;
+            for ($c = $cIdx; $c < $cIdx + $cSpan; $c++) {
+                $narrow = $narrow || isset($narrowed[$c]);
+            }
+            $this->engine->frameDx += $frameDx;
+            $this->engine->boxEdgeDepth += $narrow ? 1 : 0;
+            try {
+                $this->engine->layoutElement($cell, 0.0, 0.0, $cellW);
+            } finally {
+                $this->engine->frameDx -= $frameDx;
+                $this->engine->boxEdgeDepth -= $narrow ? 1 : 0;
+            }
 
             if ($cp->rowSpan === 1) {
                 $rIdx = $cp->rowIdx;
@@ -319,19 +341,13 @@ class TableLayout
             $gBox->height = $gb['maxBottom'] - $gb['minY'];
         }
 
-        $rtl = strtolower(trim($table->style->get('direction', 'ltr'))) === 'rtl';
         // Position cells and apply vertical-align (top | middle | bottom)
         foreach ($cellPlacements as $cp) {
             $cell = $cp->cell;
-            $cIdx = $cp->colIdx;
             $rStart = $cp->rowIdx;
             $rSpan = $cp->rowSpan;
 
-            $cellX = $colOffsets[$cIdx] ?? $contentX;
-            if ($rtl) {
-                // direction: rtl: the first column is the rightmost one
-                $cellX = $contentX + $contentWidth - ($cellX - $contentX) - $cp->cellWidth;
-            }
+            $cellX = $this->cellX($cp, $colOffsets, $contentX, $contentWidth, $rtl, false);
             $cellY = $rowOffsets[$rStart] ?? $contentY;
 
             $targetHeight = ($rSpan - 1) * $spacingPt;
@@ -385,6 +401,75 @@ class TableLayout
             return max(0.0, $totalHeight + ($outer['top'] + $outer['bottom']) / 2.0 - $table->paddingTop - $table->paddingBottom);
         }
         return max(0.0, $totalHeight);
+    }
+
+    /**
+     * Left edge of a cell's column span (direction: rtl: the first column is the rightmost one); a collapsed-border cell
+     * starts half of its left border before it.
+     *
+     * @param array<int, float> $colOffsets
+     */
+    private function cellX(CellPlacement $cp, array $colOffsets, float $contentX, float $contentWidth, bool $rtl, bool $collapseShift): float
+    {
+        $cellX = $colOffsets[$cp->colIdx] ?? $contentX;
+        if ($rtl) {
+            $cellX = $contentX + $contentWidth - ($cellX - $contentX) - $cp->cellWidth;
+        }
+        return $collapseShift ? $cellX - $cp->cell->borderLeft / 2.0 : $cellX;
+    }
+
+    /**
+     * Options::$pageOverflowWrap: when the columns (widened to their longest words) would carry the table past the
+     * right edge of the page, the widest columns are narrowed - never below the table's own width - so that it ends
+     * there. Returns the narrowed column indexes (their cells then break overlong words at the cell edge).
+     *
+     * @param array<int, float> $colWidths
+     * @return array<int, true>
+     */
+    private function fitColumnsToPage(LayoutBox $table, array &$colWidths, float $contentX, float $contentWidth, float $spacing): array
+    {
+        $edge = $this->engine->pageEdgeFor($table, $table);
+        if ($edge === null || $colWidths === []) {
+            return [];
+        }
+        $sum = array_sum($colWidths);
+        $gridW = $sum + $spacing;
+        if ($gridW <= $contentWidth + 0.01) {
+            return []; // the columns fit the table's own width
+        }
+        $this->engine->markEdgeUsed($table, $table, $edge); // PageOverflow checks that the table ends up where expected
+        $outside = max(0.0, $table->x + $table->width - ($contentX + $contentWidth)); // right padding + border
+        $room = $edge[1] - $contentX - $outside;
+        if ($gridW <= $room + 0.5) {
+            return [];
+        }
+        $target = max($contentWidth, $room) - $spacing;
+        if ($target <= 1.0 || $target >= $sum) {
+            return [];
+        }
+        // The widest columns give up width first: all columns wider than the level $c are cut to $c
+        $lo = 0.0;
+        $hi = max($colWidths);
+        for ($i = 0; $i < 50; $i++) {
+            $c = ($lo + $hi) / 2.0;
+            $s = 0.0;
+            foreach ($colWidths as $w) {
+                $s += min($w, $c);
+            }
+            if ($s > $target) {
+                $hi = $c;
+            } else {
+                $lo = $c;
+            }
+        }
+        $narrowed = [];
+        foreach ($colWidths as $i => $w) {
+            if ($w > $lo + 0.01) {
+                $colWidths[$i] = $lo;
+                $narrowed[$i] = true;
+            }
+        }
+        return $narrowed;
     }
 
     /**

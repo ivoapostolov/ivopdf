@@ -38,6 +38,59 @@ class LayoutEngine
     /** @var array{0: list<array<string, mixed>>, 1: list<array<string, mixed>>}|null pendingFloats handed to layoutBlockChildren() */
     private ?array $inheritedFloats = null;
 
+    /**
+     * @internal Options::$pageOverflowWrap: [left, right] of the page's content area while IvoPdf lays out the main
+     * document (null otherwise: running headers, margin boxes and measuring layouts keep the browser behaviour).
+     * edgeAnchors: for a box that an earlier pass of the render saw moved after its layout by an amount the layout did
+     * not know (inside an inline-block, a flex item, ...), the page edges relative to the box's own x. edgeUsed: the
+     * edges (relative to the box's x) that each box fitted to the page edge was laid out with.
+     *
+     * @var array{0: float, 1: float}|null
+     */
+    public ?array $pageEdge = null;
+    /** @var \WeakMap<LayoutBox, array{0: float, 1: float}>|null */
+    public ?\WeakMap $edgeAnchors = null;
+    /** @var \WeakMap<LayoutBox, array{0: float, 1: float}>|null */
+    public ?\WeakMap $edgeUsed = null;
+
+    /**
+     * @internal The page edges [left, right] in the coordinates $box is being laid out in (Options::$pageOverflowWrap),
+     * null outside the main document.
+     *
+     * @return array{0: float, 1: float}|null
+     */
+    public function pageEdgeFor(LayoutBox $key, LayoutBox $box): ?array
+    {
+        if ($this->pageEdge === null) {
+            return null;
+        }
+        if ($this->edgeAnchors !== null && isset($this->edgeAnchors[$key])) {
+            $rel = $this->edgeAnchors[$key];
+            return [$box->x + $rel[0], $box->x + $rel[1]];
+        }
+        return [$this->pageEdge[0] - $this->frameDx, $this->pageEdge[1] - $this->frameDx];
+    }
+
+    /**
+     * @internal Records the page edges $box was laid out with when its content was fitted to them.
+     *
+     * @param array{0: float, 1: float} $edge
+     */
+    public function markEdgeUsed(LayoutBox $key, LayoutBox $box, array $edge): void
+    {
+        $this->edgeUsed ??= new \WeakMap();
+        $this->edgeUsed[$key] = [$edge[0] - $box->x, $edge[1] - $box->x];
+    }
+
+    /**
+     * @internal Horizontal move that the box being laid out will get afterwards from an enclosing layout that already
+     * knows it (a table cell is laid out at x = 0 and then moved to its column): layout x + frameDx = page x
+     * (Options::$pageOverflowWrap).
+     */
+    public float $frameDx = 0.0;
+    /** @internal > 0 while a table cell narrowed to fit the page is laid out: its words break at the cell's edge */
+    public int $boxEdgeDepth = 0;
+
     private float $rootFontSizePt;
     private float $viewportWidthPt;
     private float $viewportHeightPt;

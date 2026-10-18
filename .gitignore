@@ -1,5 +1,7 @@
 /vendor/
 /composer.lock
+# stray test output in the repository root
+/*.pdf
 /tests/output/
 .DS_Store
 Thumbs.db

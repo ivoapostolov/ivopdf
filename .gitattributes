@@ -24,3 +24,5 @@
 # Also keeps nested integrations/*/vendor out of Composer path-repo copies.
 /integrations export-ignore
 /.gitignore export-ignore
+/CLA.md export-ignore
+/CONTRIBUTING.md export-ignore

@@ -46,6 +46,9 @@ final class MpdfState
     /** @var (\Closure(string, string, string, string, float): float)|null (text, family, weight, style, sizePt) => width in pt */
     public ?\Closure $measure = null;
 
+    /** @var list<string> problems found by the pre-pass (e.g. a <textcircle> that cannot be drawn), for getWarnings() */
+    public array $warnings = [];
+
     /** CSS (`@page ivo-pgN { ... }`) generated for pagebreak geometry */
     public string $pageCss = '';
 

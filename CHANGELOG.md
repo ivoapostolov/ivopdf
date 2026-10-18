@@ -2,6 +2,20 @@
 
 All notable changes to IvoPDF are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] – 2026-10-19
+
+Fixes from the sixth audit.
+
+### Fixed
+- Long unbreakable words were silently cut off at the page edge (a 300-character token kept 82 visible characters, an 8 000-character base64 line in `<pre>` kept 77). New option `pageOverflowWrap` (default `true`): a word, or a `white-space: pre` / `nowrap` line, still overflows its box as in browsers, but where its glyphs would cross the edge of the page's content area (the left edge in right-to-left text) it is broken at a grapheme-cluster boundary and continues on the next line; one warning per document says how many words / lines were broken. Covers table cells, inline-blocks, flex / grid items, floats, multi-column and positioned boxes (a box positioned after its layout is laid out again with the position learned, at most three more passes); text clipped by `overflow: hidden | clip | auto | scroll` or inside a `transform` is left alone. Table columns widen to their longest word only up to the page edge (the widest columns are narrowed and break their words at the cell edge). `pageOverflowWrap = false` keeps the browser behaviour everywhere and warns how many pieces of text are cut off. Right-to-left lines wider than their box now overflow to the left (start-aligned, as in browsers). Running headers and footers follow the same rule.
+- `<table border="1">` (inset / outset cell borders) wrote each side as a clip plus a fill of the whole border ring with zero-length corner segments: 1 000 cells took 100 KB (1.6 MB uncompressed). Square opaque solid / inset / outset sides are now written relative to their box (a `cm` per box, so equal cells repeat byte for byte), with the ring as two plain rectangles, no inner `q`/`Q` and the colour set only when it changes: 25 KB (708 KB uncompressed), smaller than the same table with CSS collapsed borders (27 KB); the pixels are the same at 72 and 144 dpi.
+- `rowspan="0"` spans the remaining rows of its row group (it was treated as 1); a negative `rowspan` is 1.
+- `maxMemory`: negative numbers and strings that are no size (`'64 megs'`) silently turned the memory budget off; they are now ignored with a warning (the `'auto'` budget applies), like values under 1 MB. Setting `$pdf->maxMemory` (and the other IvoPDF-only limit options) on the `IvoPdf` object now sets the option instead of being kept, unused, among the mPDF properties.
+- `<textcircle>` with `top=` / `bottom=` (instead of mPDF's `top-text=` / `bottom-text=`) drew nothing without a warning: both spellings are accepted now, and a circle that cannot be drawn (no text, a radius that is no positive length, zero `space-width` / `char-width`) says so in `getWarnings()`.
+
+### Package
+- Removed a stray 659 KB test PDF (`x.pdf`) from the repository root and git-ignored root-level PDFs; `CLA.md` and `CONTRIBUTING.md` are no longer exported to the Composer package. `git archive` size: 20 049 920 → 19 425 280 bytes as tar (9 402 710 → 9 379 331 bytes as the zip Composer downloads); the 48 bundled fonts (16 MB, 8.6 MB zipped) are all registered and none is a duplicate, so they stay.
+
 ## [1.0.0] – 2026-10-17
 
 First public release: a pure-PHP HTML/CSS to PDF engine meant as a drop-in replacement for dompdf and mPDF.

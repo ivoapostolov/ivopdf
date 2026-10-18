@@ -373,7 +373,10 @@ class DomBuilder
                     $childBox->colspan = InputGuards::intAttr($child->getAttribute('colspan'), 1, 100, 1);
                 }
                 if ($child->hasAttribute('rowspan')) {
-                    $childBox->rowspan = InputGuards::intAttr($child->getAttribute('rowspan'), 1, 500, 1);
+                    // rowspan="0": the cell spans the remaining rows of its row group (resolved by the table layout);
+                    // a negative value is a parse error (1)
+                    $rs = InputGuards::intAttr($child->getAttribute('rowspan'), -1, 500, 1);
+                    $childBox->rowspan = $rs < 0 ? 1 : $rs;
                 }
             }
 

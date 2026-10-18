@@ -15,6 +15,7 @@ use IvoPdf\Font\TtfParser;
 use IvoPdf\Image\ImageLoader;
 use IvoPdf\Layout\LayoutBox;
 use IvoPdf\Layout\LayoutEngine;
+use IvoPdf\Layout\PageOverflow;
 use IvoPdf\Layout\Paginator;
 use IvoPdf\Pdf\ColorOps;
 use IvoPdf\Pdf\PdfDocument;
@@ -58,6 +59,11 @@ class IvoPdf
     private ?LayoutBox $layoutTree = null;
     private ?string $renderedPdf = null;
     private int $pageCount = 0;
+    /**
+     * @var array<string, array{0: float, 1: float}> Options::$pageOverflowWrap: page edges relative to boxes that an
+     * earlier layout pass of this render saw moved after their layout (box path => [left, right] pt)
+     */
+    private array $edgeAnchors = [];
     /** Bumped by every change other than appended HTML (mPDF PageNo() reuses its layout while only HTML was appended) */
     private int $stateVersion = 0;
     /**
@@ -78,11 +84,25 @@ class IvoPdf
         $this->mpdfInit(); // mPDF fontdata / fontDir
     }
 
+    /**
+     * Options that only IvoPDF has (no mPDF property of that name): `$pdf->maxMemory = '256M'` sets the option instead
+     * of being kept, unused, in Options::$compat.
+     */
+    private const OWN_OPTION_PROPERTIES = [
+        'maxMemory', 'maxRenderTime', 'maxPages', 'maxWordLength', 'maxHtmlBytes', 'maxNestingDepth', 'maxImagePixels',
+        'maxRemoteBytes', 'maxBarcodeLength', 'pageOverflowWrap',
+    ];
+
     /** mPDF compatibility: `$pdf->useActiveForms = true` maps to the `formFields` option; other mPDF properties are kept in Options::$compat. */
     public function __set(string $name, mixed $value): void
     {
         if ($name === 'useActiveForms') {
             $this->options->formFields = (bool) $value;
+            return;
+        }
+        if (in_array($name, self::OWN_OPTION_PROPERTIES, true)) {
+            $this->options->{$name} = (new Options([$name => $value]))->{$name}; // the option's own type coercion
+            $this->invalidate();
             return;
         }
         $this->mpdfSetProperty($name, $value);
@@ -92,6 +112,9 @@ class IvoPdf
     {
         if ($name === 'page') {
             return $this->PageNo(); // mPDF: the current page number
+        }
+        if (in_array($name, self::OWN_OPTION_PROPERTIES, true)) {
+            return $this->options->{$name};
         }
         return $name === 'useActiveForms' ? $this->options->formFields : ($this->options->compat[$name] ?? null);
     }
@@ -282,6 +305,19 @@ class IvoPdf
      */
     private function renderCore(): self
     {
+        // Options::$pageOverflowWrap: text laid out somewhere else first (inline-block, flex item, ...) that still runs
+        // past the page edge makes the document be laid out again with the move learned (at most three more times)
+        $this->edgeAnchors = [];
+        for ($edgePass = 0; $this->renderPass($edgePass); $edgePass++) {
+        }
+        return $this;
+    }
+
+    /**
+     * One rendering; returns true instead when the document must be laid out again (Options::$pageOverflowWrap).
+     */
+    private function renderPass(int $edgePass): bool
+    {
         CssUnit::setDpi($this->options->dpi);
         ColorOps::configure($this->options); // output color space / PDF/X (validates option combinations)
         ColorOps::startRender();
@@ -391,9 +427,51 @@ class IvoPdf
             $layoutEngine->setFixedContainingBlock($this->mpdfWritten ? null : [$layoutX, $effectiveTopMargin, $printableWidth, $printableHeight]);
 
             // Layout main document tree inside the effective printable area
-            $layoutEngine->layoutDocument($rootBox, $layoutX, $effectiveTopMargin, $printableWidth, true);
+            // Options::$pageOverflowWrap: words are broken where they would cross the page's content area (named pages
+            // with a wider area: the widest one)
+            $edgeRight = $layoutX + $printableWidth;
+            foreach ($plan->names() as $pageName) {
+                $edgeRight = max($edgeRight, $layoutX + $plan->namedWidth((string) $pageName) - $bodyMarginX);
+            }
+            if ($this->options->pageOverflowWrap) {
+                $layoutEngine->pageEdge = [$layoutX, $edgeRight];
+                $layoutEngine->edgeAnchors = PageOverflow::resolve($rootBox, $this->edgeAnchors);
+            }
+            try {
+                $layoutEngine->layoutDocument($rootBox, $layoutX, $effectiveTopMargin, $printableWidth, true);
+            } finally {
+                $layoutEngine->pageEdge = null;
+            }
+            $edge = PageOverflow::scan($rootBox, $layoutX, $edgeRight, $layoutEngine->edgeUsed);
+            if ($this->options->pageOverflowWrap && $edgePass < 3) {
+                $anchors = $this->edgeAnchors;
+                foreach ($edge['needed'] as $path => $rel) {
+                    $old = $anchors[$path] ?? null;
+                    if ($old === null || abs($old[0] - $rel[0]) > 0.5 || abs($old[1] - $rel[1]) > 0.5) {
+                        $anchors[$path] = $rel;
+                    }
+                }
+                if ($anchors !== $this->edgeAnchors) {
+                    // text laid out somewhere else first (inline-block, flex item, ...) still runs past the page edge
+                    $this->edgeAnchors = $anchors;
+                    return true;
+                }
+            }
+            if ($edge['broken'] > 0) {
+                $this->options->addWarning(sprintf(
+                    '%d word(s) or line(s) wider than the page were broken at the edge of the page so that none of their text is cut off (Options::$pageOverflowWrap).',
+                    $edge['broken']
+                ));
+            }
+            if ($edge['lost'] > 0) {
+                $this->options->addWarning(sprintf(
+                    '%d piece(s) of text run past the edge of the page and are not visible there%s.',
+                    $edge['lost'],
+                    $this->options->pageOverflowWrap ? '' : ' (Options::$pageOverflowWrap = true breaks such words at the page edge)'
+                ));
+            }
             if ($this->layoutProbe !== null && ($this->layoutProbe)('layout', $rootBox, null, 0, $plan) === false) {
-                return $this;
+                return false;
             }
 
             $this->footnotePrepare($rootBox); // footnote-policy: calls whose note must move start a page
@@ -418,7 +496,7 @@ class IvoPdf
             $this->footnoteAfterPaginate($rootBox, $paginator);
             $this->mpdfAfterPaginate($refResolver->getTargets(), $paginator, $totalPages); // mPDF header switching, page numbers, index
             if ($this->layoutProbe !== null && ($this->layoutProbe)('paginate', $rootBox, $paginator, $totalPages, $plan) === false) {
-                return $this;
+                return false;
             }
             $strings = $plan->hasMarginBoxes() ? StringSets::collect($rootBox, static fn(float $y): int => $paginator->pageOfY($y)) : null;
 
@@ -519,7 +597,7 @@ class IvoPdf
             $this->options->lang = $savedLang;
         }
 
-        return $this;
+        return false;
     }
 
     /**
@@ -624,8 +702,26 @@ class IvoPdf
         $builder = new DomBuilder($this->options, new CssParser());
         $box = $builder->build($html);
         $running?->inject($box);
-        $engine->layoutDocument($box, $x, $y, $width);
+        $engine->layoutDocument($box, $x, $y, $width); // margin boxes are laid out first and moved into place later
         return $box;
+    }
+
+    /**
+     * Lays out a running header / footer at its final place. Options::$pageOverflowWrap applies there too: a word
+     * wider than the area is broken at its edge instead of running off the page.
+     */
+    private function layoutWithinEdge(LayoutEngine $engine, LayoutBox $box, float $x, float $y, float $width): void
+    {
+        $saved = [$engine->pageEdge, $engine->edgeAnchors];
+        if ($this->options->pageOverflowWrap) {
+            $engine->pageEdge = [$x, $x + $width];
+            $engine->edgeAnchors = null;
+        }
+        try {
+            $engine->layoutDocument($box, $x, $y, $width);
+        } finally {
+            [$engine->pageEdge, $engine->edgeAnchors] = $saved;
+        }
     }
 
     private function buildRunningBox(string $html, int $pageNum, int $pageCount, LayoutEngine $engine, float $x, float $y, float $width): LayoutBox
@@ -644,7 +740,7 @@ class IvoPdf
         }
         $builder = new DomBuilder($this->options, new CssParser());
         $box = $builder->build($resolved);
-        $engine->layoutDocument($box, $x, $y, $width);
+        $this->layoutWithinEdge($engine, $box, $x, $y, $width);
         return $box;
     }
 

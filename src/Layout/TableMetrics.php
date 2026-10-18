@@ -173,6 +173,7 @@ final class TableMetrics
         $placements = [];
         $numRows = count($rows);
         $numCols = 0;
+        $groupOfRow = array_map(static fn(?LayoutBox $g): int => $g === null ? -1 : spl_object_id($g), $groups);
         foreach ($rows as $ri => $row) {
             $col = 0;
             foreach ($row->children as $cell) {
@@ -183,7 +184,7 @@ final class TableMetrics
                     $col++;
                 }
                 $cs = max(1, min(100, $cell->colspan));
-                $rs = max(1, min(500, $cell->rowspan));
+                $rs = CellPlacement::rowSpanOf($cell, $ri, $groupOfRow);
                 for ($r = $ri; $r < $ri + $rs; $r++) {
                     for ($c = $col; $c < $col + $cs; $c++) {
                         $occupied[$r][$c] = true;

@@ -28,6 +28,7 @@
 | `maxRenderTime` | 120 | seconds per `render()`/`output()` (all layout passes); `0` = unlimited |
 | `maxMemory` | `'auto'` | 90 % of `memory_limit`, or `'256M'` / bytes, `0` = off; both limits throw `IvoPdf\Exception\LimitExceededException` (`getLimit()` = `'time'` / `'memory'`) |
 | `maxHtmlBytes` / `maxNestingDepth` / `maxWordLength` / `maxPages` / `maxBarcodeLength` | 32 MB / 200 / 2000 / 5000 / 5000 | input guards |
+| `pageOverflowWrap` | `true` | a word / `pre` line that would cross the page edge is broken there (one warning counts them); `false` = browser behaviour, the rest is lost (with a warning) |
 | `inputEncoding` | `'auto'` | BOM → `<meta charset>` → UTF-8 → Windows-1251 (Cyrillic-looking) / Windows-1252; or an explicit charset |
 | `html5Parser` | `true` | WHATWG parser on PHP ≥ 8.4; on PHP < 8.4 libxml with HTML5 normalisation |
 | `shrinkTablesToFit` | 1.4 | max shrink factor for too-wide tables, `0` = off |
