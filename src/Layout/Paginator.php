@@ -830,6 +830,7 @@ class Paginator
         $copy->formBaseline = $source->formBaseline;
         $copy->href = $source->href;
         $copy->listMarker = $source->listMarker;
+        $copy->listMarkerString = $source->listMarkerString;
         $copy->colspan = $source->colspan;
         $copy->rowspan = $source->rowspan;
 

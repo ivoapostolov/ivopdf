@@ -300,7 +300,10 @@ final class FormFieldWriter
                 }
                 $parts[] = '/FT /Tx';
                 $parts[] = '/Ff ' . $flags;
-                $parts[] = '/V ' . $this->pdfText(str_replace("\n", "\r", $c->value));
+                if ($c->kind !== FormControl::PASSWORD) {
+                    // a password value is never written into the file (browsers do not print it either)
+                    $parts[] = '/V ' . $this->pdfText(str_replace("\n", "\r", $c->value));
+                }
                 if ($c->maxLength > 0) {
                     $parts[] = '/MaxLen ' . $c->maxLength;
                 }

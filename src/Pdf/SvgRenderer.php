@@ -15,7 +15,7 @@ use IvoPdf\Font\FontManager;
  * Renders inline <svg> DOMElements directly into native PDF vector graphics operations.
  *
  * Supports rect, circle, ellipse, line, polyline, polygon, full path commands (M, L, H, V, C, S, Q, T, A, Z),
- * text/tspan, g/a/switch, nested svg, use/symbol, the transform attribute, preserveAspectRatio, opacity
+ * text/tspan/textPath, g/a/switch, nested svg, use/symbol, the transform attribute, preserveAspectRatio, opacity
  * (through an optional ExtGState registrar), stroke styling (dash, cap, join, miter limit), fill-rule,
  * presentation attributes and inline style declarations. With a paint registry it also renders real
  * linear/radial gradients, tiling patterns, clip-path, mask, markers, <style> rules and <image>
@@ -1073,13 +1073,22 @@ class SvgRenderer
      */
     private function drawPath(DOMElement $el, array $s, string &$out): void
     {
-        $d = trim($el->getAttribute('d'));
-        if ($d === '') {
-            return;
+        [$path, $hasSubpath, $isClosed] = $this->buildPathData(trim($el->getAttribute('d')), $s);
+        if ($hasSubpath) {
+            $this->paint($path, $s, $isClosed, $out);
         }
+    }
 
-        if (!preg_match_all('/[MmLlHhVvCcSsQqTtAaZz]|' . self::NUMBER_RE . '/', $d, $matches)) {
-            return;
+    /**
+     * Converts SVG path data into PDF path operators through the current matrix.
+     *
+     * @param array<string, mixed> $s
+     * @return array{0: string, 1: bool, 2: bool} operators, has a subpath, last subpath closed
+     */
+    private function buildPathData(string $d, array $s): array
+    {
+        if ($d === '' || !preg_match_all('/[MmLlHhVvCcSsQqTtAaZz]|' . self::NUMBER_RE . '/', $d, $matches)) {
+            return ['', false, false];
         }
 
         $tokens = $matches[0];
@@ -1331,9 +1340,7 @@ class SvgRenderer
             }
         }
 
-        if ($hasSubpath) {
-            $this->paint($path, $s, $isClosed, $out);
-        }
+        return [$path, $hasSubpath, $isClosed];
     }
 
     /**
@@ -1491,10 +1498,243 @@ class SvgRenderer
      */
     private function drawText(DOMElement $el, array $s, string &$out): void
     {
+        foreach ($el->childNodes as $child) {
+            if ($child instanceof DOMElement && $this->tagOf($child) === 'textpath') {
+                $this->drawTextWithPaths($el, $s, $out);
+                return;
+            }
+        }
         $runs = [];
         $this->collectTextRuns($el, $s, $runs, ['x' => null, 'y' => null, 'dx' => 0.0, 'dy' => 0.0]);
+        $clean = $this->cleanTextRuns($runs);
+        $this->layoutTextRuns($clean, $out);
+    }
 
-        // Whitespace handling (xml:space="default"): collapse, trim the ends, avoid double spaces across runs.
+    /**
+     * <text> with <textPath> children: each textPath lays its glyphs along the referenced path; the text outside the
+     * textPath elements is drawn as ordinary text.
+     *
+     * @param array<string, mixed> $s
+     */
+    private function drawTextWithPaths(DOMElement $el, array $s, string &$out): void
+    {
+        $plain = $el->cloneNode(true);
+        $toRemove = [];
+        foreach ($plain->childNodes as $child) {
+            if ($child instanceof DOMElement && $this->tagOf($child) === 'textpath') {
+                $toRemove[] = $child;
+            }
+        }
+        foreach ($toRemove as $child) {
+            $plain->removeChild($child);
+        }
+        if (trim((string) $plain->textContent) !== '') {
+            $runs = [];
+            $this->collectTextRuns($plain, $s, $runs, ['x' => null, 'y' => null, 'dx' => 0.0, 'dy' => 0.0]);
+            $this->layoutTextRuns($this->cleanTextRuns($runs), $out);
+        }
+        $textX = $this->firstLength($el, 'x', $s, 'x') ?? 0.0;
+        foreach ($el->childNodes as $child) {
+            if ($child instanceof DOMElement && $this->tagOf($child) === 'textpath') {
+                $cs = $s;
+                if ($this->applyElementAttributes($child, $cs)) {
+                    $this->drawTextPath($child, $cs, $textX, $out);
+                }
+            }
+        }
+    }
+
+    /**
+     * Places the glyphs of a <textPath> along its path (SVG 1.1 / Chromium): each glyph's horizontal midpoint sits on
+     * the path at its distance along it and the glyph is rotated to the path's direction there; glyphs whose midpoint
+     * falls off the path are not drawn. Supports href / xlink:href, startOffset (length or %), the referenced path's
+     * pathLength and transform, text-anchor, side="right", dx / dy of the runs.
+     *
+     * @param array<string, mixed> $s
+     */
+    private function drawTextPath(DOMElement $tp, array $s, float $textX, string &$out): void
+    {
+        $ref = $this->hrefOf($tp);
+        $pathEl = $ref !== null && str_starts_with($ref, '#') ? $this->findById(substr($ref, 1)) : null;
+        if ($pathEl === null || $this->tagOf($pathEl) !== 'path') {
+            if ($this->warn !== null) {
+                ($this->warn)('SVG <textPath> without a valid href to a <path> was not drawn (' . ($ref ?? 'no href') . ').');
+            }
+            return;
+        }
+        $points = $this->pathPolyline($pathEl);
+        if (count($points) < 2) {
+            return;
+        }
+        // cumulative lengths (a moveto between subpaths adds no length); `side` is not supported, as in Chromium
+        $cum = [0.0];
+        $n = count($points);
+        for ($i = 1; $i < $n; $i++) {
+            $cum[$i] = $cum[$i - 1] + ($points[$i][2] ? 0.0 : hypot($points[$i][0] - $points[$i - 1][0], $points[$i][1] - $points[$i - 1][1]));
+        }
+        $length = $cum[$n - 1];
+        if ($length <= 1e-9) {
+            return;
+        }
+        $scale = 1.0;
+        $pathLengthAttr = $this->attr($pathEl, 'pathLength');
+        if ($pathLengthAttr !== null && is_numeric(trim($pathLengthAttr)) && (float) $pathLengthAttr > 0) {
+            $scale = $length / (float) $pathLengthAttr;
+        }
+        $offsetRaw = trim((string) $this->attr($tp, 'startOffset'));
+        $offset = 0.0;
+        if ($offsetRaw !== '') {
+            $offset = str_ends_with($offsetRaw, '%')
+                ? (float) substr($offsetRaw, 0, -1) / 100.0 * $length
+                : $this->parseLength($offsetRaw, $s, 'x') * $scale;
+        }
+
+        $runs = [];
+        $this->collectTextRuns($tp, $s, $runs, ['x' => null, 'y' => null, 'dx' => 0.0, 'dy' => 0.0]);
+        $runs = $this->cleanTextRuns($runs);
+        if ($runs === []) {
+            return;
+        }
+        // glyph clusters with their advances
+        $glyphs = [];
+        $total = 0.0;
+        foreach ($runs as $run) {
+            $rs = $run['s'];
+            $first = true;
+            $clusters = preg_split('/(\X)/u', $run['text'], -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [];
+            $measure = fn(string $t): float => $this->fontManager->measureText($t, (string) $rs['fontFamily'], (string) $rs['fontWeight'], (string) $rs['fontStyle'], (float) $rs['fontSize']);
+            // advances from growing prefixes keep the font's kerning (per-cluster measuring for very long runs)
+            $kerned = count($clusters) <= 400;
+            $prefix = '';
+            $prefixW = 0.0;
+            foreach ($clusters as $cl) {
+                if ($kerned) {
+                    $prefix .= $cl;
+                    $w = $measure($prefix);
+                    $adv = $w - $prefixW;
+                    $prefixW = $w;
+                } else {
+                    $adv = $measure($cl);
+                }
+                $dx = $first ? (float) $run['dx'] : 0.0;
+                $glyphs[] = ['text' => $cl, 's' => $rs, 'adv' => $adv, 'dx' => $dx, 'dy' => $first ? (float) $run['dy'] : 0.0];
+                $total += $adv + $dx;
+                $first = false;
+            }
+        }
+        $anchor = (string) $runs[0]['s']['textAnchor'];
+        $d = $textX + $offset - match ($anchor) {
+            'middle' => $total / 2.0,
+            'end' => $total,
+            default => 0.0,
+        };
+        $perp = 0.0;
+        $seg = 1;
+        foreach ($glyphs as $g) {
+            $d += $g['dx'];
+            $perp += $g['dy'];
+            $mid = $d + $g['adv'] / 2.0;
+            $d += $g['adv'];
+            if ($mid < 0.0 || $mid > $length || trim($g['text']) === '') {
+                continue;
+            }
+            while ($seg < $n - 1 && ($cum[$seg] < $mid || $points[$seg][2])) {
+                $seg++;
+            }
+            while ($seg > 1 && $cum[$seg - 1] > $mid) {
+                $seg--;
+            }
+            if ($points[$seg][2]) {
+                continue;
+            }
+            $p0 = $points[$seg - 1];
+            $p1 = $points[$seg];
+            $segLen = max(1e-12, $cum[$seg] - $cum[$seg - 1]);
+            $f = ($mid - $cum[$seg - 1]) / $segLen;
+            $cos = ($p1[0] - $p0[0]) / $segLen;
+            $sin = ($p1[1] - $p0[1]) / $segLen;
+            $mx = $p0[0] + ($p1[0] - $p0[0]) * $f;
+            $my = $p0[1] + ($p1[1] - $p0[1]) * $f;
+            // glyph frame: origin half an advance back along the tangent, y down perpendicular (user space)
+            $gs = $g['s'];
+            $gs['ctm'] = $this->multiply($s['ctm'], [$cos, $sin, -$sin, $cos, $mx - $cos * $g['adv'] / 2.0, $my - $sin * $g['adv'] / 2.0]);
+            $this->emitTextRun($g['text'], $gs, 0.0, $perp, $out);
+        }
+    }
+
+    /**
+     * The geometry of a <path> (with its own transform) as one polyline in the user space of the referencing
+     * element; curves are flattened. A point flagged true starts a subpath (the step to it is a jump, not a segment).
+     *
+     * @return list<array{0: float, 1: float, 2: bool}>
+     */
+    private function pathPolyline(DOMElement $pathEl): array
+    {
+        $k = 1000.0; // pt() keeps two decimals: scale up for precision
+        $linkBox = $this->linkBox;
+        $this->linkBox = null;
+        [$ops] = $this->buildPathData(trim($pathEl->getAttribute('d')), ['ctm' => [$k, 0.0, 0.0, $k, 0.0, 0.0], 'pageHeight' => 0.0]);
+        $this->linkBox = $linkBox;
+        $transform = $this->attr($pathEl, 'transform');
+        $m = $transform !== null && trim($transform) !== '' ? $this->parseTransform($transform) : [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        $map = static fn(float $x, float $y, bool $move = false): array => [$m[0] * $x + $m[2] * $y + $m[4], $m[1] * $x + $m[3] * $y + $m[5], $move];
+
+        $points = [];
+        $cur = [0.0, 0.0];
+        $start = [0.0, 0.0];
+        $nums = [];
+        foreach (preg_split('/\s+/', trim($ops), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $tok) {
+            if (is_numeric($tok)) {
+                $nums[] = (float) $tok;
+                continue;
+            }
+            // pt(): x * k, 0 - (y * k)
+            $xy = [];
+            for ($i = 0; $i + 1 < count($nums); $i += 2) {
+                $xy[] = [$nums[$i] / $k, -$nums[$i + 1] / $k];
+            }
+            $nums = [];
+            if ($tok === 'm' && $xy !== []) {
+                $cur = $start = $xy[0];
+                $points[] = $map($cur[0], $cur[1], true);
+            } elseif ($tok === 'l' && $xy !== []) {
+                $cur = $xy[0];
+                $points[] = $map($cur[0], $cur[1]);
+            } elseif ($tok === 'c' && count($xy) === 3) {
+                [$c1, $c2, $end] = $xy;
+                $steps = 24;
+                for ($t = 1; $t <= $steps; $t++) {
+                    $u = $t / $steps;
+                    $v = 1.0 - $u;
+                    $x = $v * $v * $v * $cur[0] + 3 * $v * $v * $u * $c1[0] + 3 * $v * $u * $u * $c2[0] + $u * $u * $u * $end[0];
+                    $y = $v * $v * $v * $cur[1] + 3 * $v * $v * $u * $c1[1] + 3 * $v * $u * $u * $c2[1] + $u * $u * $u * $end[1];
+                    $points[] = $map($x, $y);
+                }
+                $cur = $end;
+            } elseif ($tok === 'h') {
+                $cur = $start;
+                $points[] = $map($cur[0], $cur[1]);
+            }
+        }
+        // drop repeated points (zero-length segments have no direction)
+        $clean = [];
+        foreach ($points as $p) {
+            $last = $clean[count($clean) - 1] ?? null;
+            if ($last === null || abs($last[0] - $p[0]) > 1e-9 || abs($last[1] - $p[1]) > 1e-9) {
+                $clean[] = $p;
+            }
+        }
+        return $clean;
+    }
+
+    /**
+     * Whitespace handling (xml:space="default"): collapse, trim the ends, avoid double spaces across runs.
+     *
+     * @param list<array{text: string, s: array<string, mixed>, x: ?float, y: ?float, dx: float, dy: float}> $runs
+     * @return list<array{text: string, s: array<string, mixed>, x: ?float, y: ?float, dx: float, dy: float}>
+     */
+    private function cleanTextRuns(array $runs): array
+    {
         $clean = [];
         $carry = null;
         $prevEndsSpace = true;
@@ -1523,7 +1763,16 @@ class SvgRenderer
                 array_pop($clean);
             }
         }
+        return $clean;
+    }
 
+    /**
+     * Lays out cleaned text runs: text chunks start at absolutely positioned runs and honour text-anchor.
+     *
+     * @param list<array{text: string, s: array<string, mixed>, x: ?float, y: ?float, dx: float, dy: float}> $clean
+     */
+    private function layoutTextRuns(array $clean, string &$out): void
+    {
         $n = count($clean);
         $widths = [];
         foreach ($clean as $k => $run) {

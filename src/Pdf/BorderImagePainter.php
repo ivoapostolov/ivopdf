@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IvoPdf\Pdf;
 
+use IvoPdf\Css\CssColor;
 use IvoPdf\Css\CssUnit;
 use IvoPdf\Image\ImageLoader;
 use IvoPdf\Layout\LayoutBox;
@@ -13,6 +14,9 @@ use IvoPdf\Layout\LayoutBox;
  */
 final class BorderImagePainter
 {
+    /** @var array<int|string, mixed>|null colour of the box being painted (currentColor gradient stops) */
+    private ?array $currentColor = null;
+
     public function __construct(
         private PdfRenderer $renderer,
         private ImageLoader $imageLoader,
@@ -29,6 +33,7 @@ final class BorderImagePainter
         if ($source === '' || strtolower($source) === 'none') {
             return null;
         }
+        $this->currentColor = CssColor::parse($box->style->get('color', '#111827'));
         $bt = $box->borderTop;
         $br = $box->borderRight;
         $bb = $box->borderBottom;
@@ -188,7 +193,10 @@ final class BorderImagePainter
                 $ih = $natH * $scaleY;
                 $out .= "q\n" . sprintf("%.2F %.2F %.2F %.2F re W n\n", $tx, $this->pageHeight - ($ty + $tileH), $tileW, $tileH);
                 if ($isGradient) {
-                    $out .= $this->renderer->paintGradientCss($source, $ix, $iy, $iw, $ih);
+                    // the gradient image is drawn at its own size (the border box) and scaled like an image, so that
+                    // angles and conic sectors stretch with the slice as in browsers
+                    $out .= sprintf("%.5F 0 0 %.5F %.3F %.3F cm\n", $scaleX, $scaleY, $ix, $this->pageHeight - ($iy + $ih))
+                        . $this->renderer->paintGradientCss($source, 0.0, 0.0, $natW, $natH, $this->currentColor, 12.0, $natH);
                 } else {
                     $out .= sprintf("%.3F 0 0 %.3F %.3F %.3F cm /%s Do\n", $iw, $ih, $ix, $this->pageHeight - ($iy + $ih), $imgId);
                 }

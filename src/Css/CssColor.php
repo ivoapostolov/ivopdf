@@ -61,6 +61,29 @@ class CssColor
      */
     public static function parse(?string $value): ?array
     {
+        return self::parseInternal($value, false);
+    }
+
+    /**
+     * Like {@see parse()} but keeps fully transparent colours: `transparent` is [0, 0, 0, 0] (transparent black, as
+     * CSS defines it) and `rgba(255, 0, 0, 0)` keeps its RGB. Used for gradient stops, where a transparent stop takes
+     * part in the interpolation. Null only for invalid values.
+     *
+     * @return array<int|string, mixed>|null
+     */
+    public static function parseWithAlpha(?string $value): ?array
+    {
+        if ($value !== null && strtolower(trim($value)) === 'transparent') {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        return self::parseInternal($value, true);
+    }
+
+    /**
+     * @return array<int|string, mixed>|null
+     */
+    private static function parseInternal(?string $value, bool $keepTransparent): ?array
+    {
         if ($value === null) {
             return null;
         }
@@ -68,6 +91,7 @@ class CssColor
         if ($val === '' || $val === 'transparent' || $val === 'none' || $val === 'initial') {
             return null;
         }
+        $min = $keepTransparent ? -1.0 : 0.001;
 
         if (isset(self::NAMED_COLORS[$val])) {
             $val = self::NAMED_COLORS[$val];
@@ -77,6 +101,9 @@ class CssColor
         if (str_starts_with($val, '#')) {
             $hex = substr($val, 1);
             $len = strlen($hex);
+            if (!ctype_xdigit($hex)) {
+                return null;
+            }
             if ($len === 3) {
                 $r = hexdec($hex[0] . $hex[0]) / 255.0;
                 $g = hexdec($hex[1] . $hex[1]) / 255.0;
@@ -88,7 +115,7 @@ class CssColor
                 $g = hexdec($hex[1] . $hex[1]) / 255.0;
                 $b = hexdec($hex[2] . $hex[2]) / 255.0;
                 $a = hexdec($hex[3] . $hex[3]) / 255.0;
-                return $a <= 0.001 ? null : [$r, $g, $b, $a];
+                return $a <= $min ? null : [$r, $g, $b, $a];
             }
             if ($len === 6) {
                 $r = hexdec(substr($hex, 0, 2)) / 255.0;
@@ -101,7 +128,7 @@ class CssColor
                 $g = hexdec(substr($hex, 2, 2)) / 255.0;
                 $b = hexdec(substr($hex, 4, 2)) / 255.0;
                 $a = hexdec(substr($hex, 6, 2)) / 255.0;
-                return $a <= 0.001 ? null : [$r, $g, $b, $a];
+                return $a <= $min ? null : [$r, $g, $b, $a];
             }
         }
 
@@ -114,7 +141,7 @@ class CssColor
                 $g = self::parseChannel($parts[1], 255.0);
                 $b = self::parseChannel($parts[2], 255.0);
                 $a = isset($parts[3]) ? self::parseAlpha($parts[3]) : 1.0;
-                return $a <= 0.001 ? null : [$r, $g, $b, $a];
+                return $a <= $min ? null : [$r, $g, $b, $a];
             }
         }
 
@@ -137,7 +164,7 @@ class CssColor
                 $s = max(0.0, min(1.0, ((float) rtrim($parts[1], '%')) / 100.0));
                 $l = max(0.0, min(1.0, ((float) rtrim($parts[2], '%')) / 100.0));
                 $a = isset($parts[3]) ? self::parseAlpha($parts[3]) : 1.0;
-                if ($a <= 0.001) {
+                if ($a <= $min) {
                     return null;
                 }
                 [$r, $g, $b] = self::hslToRgb($h / 360.0, $s, $l);
@@ -157,216 +184,66 @@ class CssColor
     }
 
     /**
-     * Parses a CSS linear-gradient(...) value.
+     * Parses a CSS linear-gradient(...) value (legacy shape; the renderer uses {@see CssGradient}). Percentage stop
+     * positions only, clamped to 0..1; `to <corner>` gives the square-box angle.
      *
-     * @return array{angle: float, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>}|null
+     * @return array{angle: float, stops: list<array{color: array<int|string, mixed>, offset: float}>}|null
      */
     public static function parseLinearGradient(?string $value): ?array
     {
-        if ($value === null || !str_contains(strtolower($value), 'linear-gradient(')) {
+        $g = $value === null ? null : CssGradient::parse($value);
+        if ($g === null || $g['type'] !== 'linear') {
             return null;
         }
-
-        if (!preg_match('/linear-gradient\((.+)\)/is', $value, $m)) {
-            return null;
-        }
-
-        $args = self::splitGradientArgs($m[1]);
-        if (count($args) < 2) {
-            return null;
-        }
-
-        $angle = 180.0; // Default top-to-bottom
-        $first = strtolower(trim($args[0]));
-        $startIndex = 0;
-
-        if (str_ends_with($first, 'deg')) {
-            $angle = (float) substr($first, 0, -3);
-            $startIndex = 1;
-        } elseif (str_starts_with($first, 'to ')) {
-            $dir = trim(substr($first, 3));
-            $angle = match ($dir) {
-                'top' => 0.0,
-                'right' => 90.0,
-                'bottom' => 180.0,
-                'left' => 270.0,
-                'top right', 'right top' => 45.0,
-                'bottom right', 'right bottom' => 135.0,
-                'bottom left', 'left bottom' => 225.0,
-                'top left', 'left top' => 315.0,
-                default => 180.0,
+        $angle = (float) $g['angle'];
+        if ($g['corner'] !== null) {
+            $angle = match ($g['corner']) {
+                'top right' => 45.0,
+                'bottom right' => 135.0,
+                'bottom left' => 225.0,
+                default => 315.0,
             };
-            $startIndex = 1;
         }
-
-        $stops = self::parseColorStops(array_slice($args, $startIndex));
-        if ($stops === null) {
-            return null;
-        }
-
-        return [
-            'angle' => $angle,
-            'stops' => $stops,
-        ];
+        $stops = self::legacyStops($g['stops']);
+        return $stops === null ? null : ['angle' => $angle, 'stops' => $stops];
     }
 
     /**
-     * Parses a CSS radial-gradient(...) value.
+     * Parses a CSS radial-gradient(...) value (legacy shape; the renderer uses {@see CssGradient}).
      *
-     * @return array{shape: string, size: string, position: string, radii: array{0: ?string, 1: ?string}, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>}|null
+     * @return array{shape: string, size: string, position: string, radii: array{0: ?string, 1: ?string}, stops: list<array{color: array<int|string, mixed>, offset: float}>}|null
      */
     public static function parseRadialGradient(?string $value): ?array
     {
-        if ($value === null || !preg_match('/radial-gradient\((.+)\)/is', $value, $m)) {
+        $g = $value === null ? null : CssGradient::parse($value);
+        if ($g === null || $g['type'] !== 'radial') {
             return null;
         }
-        $args = self::splitGradientArgs($m[1]);
-        if (count($args) < 2) {
-            return null;
-        }
-
-        $shape = 'ellipse';
-        $size = 'farthest-corner';
-        $position = 'center';
-        $radii = [null, null];
-        $startIndex = 0;
-
-        $first = strtolower(trim($args[0]));
-        if (self::parse(preg_split('/\s+/', $first)[0] ?? '') === null) {
-            $startIndex = 1;
-            $parts = preg_split('/\s+at\s+/', ' ' . $first . ' ', 2) ?: [$first];
-            if (count($parts) === 2) {
-                $position = trim($parts[1]) !== '' ? trim($parts[1]) : 'center';
-            }
-            $lengths = [];
-            foreach (preg_split('/\s+/', trim($parts[0]), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $tok) {
-                if ($tok === 'circle' || $tok === 'ellipse') {
-                    $shape = $tok;
-                } elseif (in_array($tok, ['closest-side', 'closest-corner', 'farthest-side', 'farthest-corner'], true)) {
-                    $size = $tok;
-                } elseif (preg_match('/^[\d.]/', $tok)) {
-                    $lengths[] = $tok;
-                }
-            }
-            if (!empty($lengths)) {
-                $radii = [$lengths[0], $lengths[1] ?? null];
-                if (count($lengths) === 1) {
-                    $shape = 'circle';
-                }
-            }
-        }
-
-        $stops = self::parseColorStops(array_slice($args, $startIndex));
+        $stops = self::legacyStops($g['stops']);
         if ($stops === null) {
             return null;
         }
-        return ['shape' => $shape, 'size' => $size, 'position' => $position, 'radii' => $radii, 'stops' => $stops];
+        return ['shape' => $g['shape'], 'size' => $g['size'], 'position' => $g['position'], 'radii' => $g['radii'], 'stops' => $stops];
     }
 
     /**
-     * Parses gradient color stops with optional percentage positions; unpositioned stops are spread evenly
-     * between positioned neighbours and offsets are kept monotonic.
-     *
-     * @param list<string> $rawStops
-     * @return list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>|null
+     * @param list<array{color: array<int|string, mixed>|null, pos: ?string}> $stops
+     * @return list<array{color: array<int|string, mixed>, offset: float}>|null
      */
-    private static function parseColorStops(array $rawStops): ?array
+    private static function legacyStops(array $stops): ?array
     {
-        $parsed = [];
-        foreach ($rawStops as $stopStr) {
-            $stopStr = trim($stopStr);
-            $offsets = [];
-            $colorPart = $stopStr;
-            if (preg_match('/^(.*?)((?:\s+-?[\d.]+%)+)$/', $stopStr, $sm)) {
-                $colorPart = trim($sm[1]);
-                preg_match_all('/-?[\d.]+/', $sm[2], $om);
-                foreach ($om[0] as $o) {
-                    $offsets[] = max(0.0, min(1.0, ((float) $o) / 100.0));
-                }
-            }
-            $lc = strtolower($colorPart);
-            $color = $lc === 'transparent' ? [1.0, 1.0, 1.0, 0.0] : self::parse($colorPart);
-            if ($color === null) {
-                continue;
-            }
-            if (empty($offsets)) {
-                $parsed[] = ['color' => $color, 'offset' => null];
-            } else {
-                foreach ($offsets as $o) {
-                    $parsed[] = ['color' => $color, 'offset' => $o];
-                }
-            }
-        }
-
-        $count = count($parsed);
-        if ($count < 2) {
+        $resolved = CssGradient::resolveStops(
+            array_values(array_filter($stops, static fn(array $s): bool => $s['color'] !== null)),
+            static fn(string $p): ?float => str_ends_with($p, '%') ? ((float) substr($p, 0, -1)) / 100.0 : ((float) $p === 0.0 ? 0.0 : null)
+        );
+        if ($resolved === null) {
             return null;
         }
-        if ($parsed[0]['offset'] === null) {
-            $parsed[0]['offset'] = 0.0;
+        $out = [];
+        foreach ($resolved as $r) {
+            $out[] = ['color' => $r['color'], 'offset' => max(0.0, min(1.0, $r['t']))];
         }
-        if ($parsed[$count - 1]['offset'] === null) {
-            $parsed[$count - 1]['offset'] = 1.0;
-        }
-        // Fill unpositioned stops by linear interpolation between known neighbours
-        $i = 0;
-        while ($i < $count) {
-            if ($parsed[$i]['offset'] !== null) {
-                $i++;
-                continue;
-            }
-            $j = $i;
-            while ($parsed[$j]['offset'] === null) {
-                $j++;
-            }
-            $from = (float) $parsed[$i - 1]['offset'];
-            $to = (float) $parsed[$j]['offset'];
-            $n = $j - $i + 1;
-            for ($k = $i; $k < $j; $k++) {
-                $parsed[$k]['offset'] = $from + ($to - $from) * (($k - $i + 1) / $n);
-            }
-            $i = $j;
-        }
-        $prev = 0.0;
-        $stops = [];
-        foreach ($parsed as $st) {
-            $off = max($prev, (float) $st['offset']);
-            $prev = $off;
-            $stops[] = ['color' => $st['color'], 'offset' => $off];
-        }
-        return $stops;
-    }
-
-    /**
-     * @return list<string>
-     */
-    private static function splitGradientArgs(string $str): array
-    {
-        $result = [];
-        $current = '';
-        $depth = 0;
-        $len = strlen($str);
-
-        for ($i = 0; $i < $len; $i++) {
-            $ch = $str[$i];
-            if ($ch === '(') {
-                $depth++;
-                $current .= $ch;
-            } elseif ($ch === ')') {
-                $depth = max(0, $depth - 1);
-                $current .= $ch;
-            } elseif ($ch === ',' && $depth === 0) {
-                $result[] = trim($current);
-                $current = '';
-            } else {
-                $current .= $ch;
-            }
-        }
-        if (trim($current) !== '') {
-            $result[] = trim($current);
-        }
-
-        return $result;
+        return $out;
     }
 
     /**

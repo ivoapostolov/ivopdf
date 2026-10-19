@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IvoPdf\Pdf;
 
 use IvoPdf\Css\CssColor;
+use IvoPdf\Css\CssGradient;
 use IvoPdf\Css\CssUnit;
 use IvoPdf\Font\FontManager;
 use IvoPdf\Image\ImageLoader;
@@ -25,6 +26,7 @@ class PdfRenderer
     private BorderPainter $borderPainter;
     private EffectsPainter $effects;
     private BorderImagePainter $borderImagePainter;
+    private GradientPainter $gradients;
 
     private float $pageWidth;
     private float $pageHeight;
@@ -66,6 +68,7 @@ class PdfRenderer
         $this->borderPainter = new BorderPainter($pdf, $pageHeight);
         $this->effects = new EffectsPainter($pdf, $pageHeight);
         $this->borderImagePainter = new BorderImagePainter($this, $imageLoader, $pageHeight);
+        $this->gradients = new GradientPainter($pdf, $pdf->options(), fn(string $css, float $w, float $h): array => $this->resolvePosition($css, $w, $h));
         $this->topMargin = $topMargin;
         $this->printableHeight = max(50.0, $printableHeight);
     }
@@ -322,10 +325,12 @@ class PdfRenderer
                     $this->pdf->registerDestination($anchor, $this->currentPageIndex, $destY);
                 }
             }
-            if (preg_match('/^h([1-6])$/', $box->tagName, $hm) && !$box->domElement->hasAttribute('data-ivo-nobm')) {
-                $title = trim((string) preg_replace('/\s+/u', ' ', (string) $box->domElement->textContent));
+            // bookmarks: h1-h6 by default, any element with CSS `bookmark-level`, titled by `bookmark-label`
+            $bookmarkLevel = $box->bookmarkLevel;
+            if ($bookmarkLevel > 0 && !$box->domElement->hasAttribute('data-ivo-nobm')) {
+                $title = $box->bookmarkLabel ?? trim((string) preg_replace('/\s+/u', ' ', (string) $box->domElement->textContent));
                 if ($title !== '') {
-                    $this->pdf->addOutline((int) $hm[1], $title, $this->currentPageIndex, $destY);
+                    $this->pdf->addOutline($bookmarkLevel, $title, $this->currentPageIndex, $destY);
                 }
             }
             \IvoPdf\Compat\MpdfRenderHooks::apply($this->pdf, $box->domElement, $this->currentPageIndex, $localX, $destY); // mPDF <bookmark>, <annotation>
@@ -406,7 +411,7 @@ class PdfRenderer
                 $shadowCss = strtolower($shadowCss) === 'none' || $shadowCss === '' ? $ds : $shadowCss . ', ' . $ds;
             }
             if ($shadowCss !== '' && strtolower($shadowCss) !== 'none') {
-                $out .= $this->drawBoxShadow($shadowCss, $localX, $localY, $boxW, $boxH, $radii, $box->fontSizePt);
+                $out .= $this->drawBoxShadow($shadowCss, $localX, $localY, $boxW, $boxH, $radii, $box->fontSizePt, CssColor::parse($box->style->get('color', '#000')));
             }
 
             // 2. Background color
@@ -417,6 +422,11 @@ class PdfRenderer
 
             // 3. Background gradient or background-image
             $out .= $this->drawBackgroundImage($box, $localX, $localY, $boxW, $boxH, $radii);
+
+            // 3b. Inset box shadows (inside the padding box, above the background)
+            if ($shadowCss !== '' && stripos($shadowCss, 'inset') !== false) {
+                $out .= $this->drawInsetBoxShadows($shadowCss, $box, $localX, $localY, $boxW, $boxH, $radii);
+            }
 
             // 4. Clickable box link if <a> is styled as block/inline-block/flex
             if ($box->href !== null && $box->href !== '' && ($box->tagName === 'a' || !$box->isInlineLevel())
@@ -1213,8 +1223,8 @@ class PdfRenderer
     }
 
     /**
-     * Paints the first background-image layer: linear/radial gradient or url() image honoring
-     * background-size, background-position and background-repeat.
+     * Paints the background-image layers (the first layer on top): gradients and url() images, each honoring its
+     * background-size, background-position and background-repeat entry.
      *
      * @param array{0: float, 1: float, 2: float, 3: float} $radii
      */
@@ -1224,37 +1234,73 @@ class PdfRenderer
         if ($bgImage === '' || strtolower($bgImage) === 'none' || $w <= 0.05 || $h <= 0.05) {
             return '';
         }
-        $layer = $this->splitTopLevelCommas($bgImage)[0] ?? $bgImage;
-        $lower = strtolower($layer);
+        $layers = $this->splitTopLevelCommas($bgImage);
+        if (count($layers) === 1) {
+            return $this->drawBackgroundLayer($box, $layers[0], $box->style->get('background-size', 'auto'), $box->style->get('background-position', '0% 0%'), $box->style->get('background-repeat', 'repeat'), $x, $y, $w, $h, $radii);
+        }
+        $sizes = $this->splitTopLevelCommas($box->style->get('background-size', 'auto')) ?: ['auto'];
+        $positions = $this->splitTopLevelCommas($box->style->get('background-position', '0% 0%')) ?: ['0% 0%'];
+        $repeats = $this->splitTopLevelCommas($box->style->get('background-repeat', 'repeat')) ?: ['repeat'];
+        $out = '';
+        for ($i = count($layers) - 1; $i >= 0; $i--) {
+            $out .= $this->drawBackgroundLayer(
+                $box,
+                $layers[$i],
+                $sizes[$i % count($sizes)],
+                $positions[$i % count($positions)],
+                $repeats[$i % count($repeats)],
+                $x,
+                $y,
+                $w,
+                $h,
+                $radii
+            );
+        }
+        return $out;
+    }
 
-        if (str_contains($lower, 'radial-gradient(')) {
-            $radial = CssColor::parseRadialGradient($layer);
-            return $radial !== null ? $this->drawRadialGradient($x, $y, $w, $h, $radii, $radial) : '';
-        }
-        if (str_contains($lower, 'linear-gradient(')) {
-            $gradient = CssColor::parseLinearGradient($layer);
-            return $gradient !== null ? $this->drawLinearGradient($x, $y, $w, $h, $radii, $gradient) : '';
-        }
-        if (!preg_match('/url\((.+)\)/is', $layer, $um)) {
+    /**
+     * One background layer: a gradient (an image without intrinsic size: `auto` = the box) or a url() image.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     */
+    private function drawBackgroundLayer(LayoutBox $box, string $layer, string $sizeCss, string $positionCss, string $repeatCss, float $x, float $y, float $w, float $h, array $radii): string
+    {
+        $layer = trim($layer);
+        if ($layer === '' || strtolower($layer) === 'none') {
             return '';
         }
-
-        $src = trim($um[1], " \t\n\r\0\x0B'\"");
-        $svgBg = SvgBackground::load($this->imageLoader, $src);
-        $img = $svgBg !== null ? $svgBg['img'] : $this->imageLoader->load($src);
-        if ($img === null) {
-            return '';
+        $isGradient = CssGradient::functionName($layer) !== null;
+        $svgBg = null;
+        $img = null;
+        if ($isGradient) {
+            $natW = $w;
+            $natH = $h;
+        } else {
+            if (!preg_match('/url\((.+)\)/is', $layer, $um)) {
+                return '';
+            }
+            $src = trim($um[1], " \t\n\r\0\x0B'\"");
+            $svgBg = SvgBackground::load($this->imageLoader, $src);
+            $img = $svgBg !== null ? $svgBg['img'] : $this->imageLoader->load($src);
+            if ($img === null) {
+                return '';
+            }
+            $natW = max(0.01, $img['width'] * CssUnit::getPxToPt());
+            $natH = max(0.01, $img['height'] * CssUnit::getPxToPt());
         }
-
-        $natW = max(0.01, $img['width'] * CssUnit::getPxToPt());
-        $natH = max(0.01, $img['height'] * CssUnit::getPxToPt());
         $ratio = $natW / $natH;
 
-        $sizeCss = strtolower(trim($box->style->get('background-size', 'auto')));
+        $sizeCss = strtolower(trim($sizeCss));
         if ($sizeCss === 'cover' || $sizeCss === 'contain') {
-            $scale = $sizeCss === 'cover' ? max($w / $natW, $h / $natH) : min($w / $natW, $h / $natH);
-            $tileW = $natW * $scale;
-            $tileH = $natH * $scale;
+            if ($isGradient) {
+                $tileW = $w;
+                $tileH = $h;
+            } else {
+                $scale = $sizeCss === 'cover' ? max($w / $natW, $h / $natH) : min($w / $natW, $h / $natH);
+                $tileW = $natW * $scale;
+                $tileH = $natH * $scale;
+            }
         } else {
             $sizeTokens = preg_split('/\s+/', $sizeCss, -1, PREG_SPLIT_NO_EMPTY) ?: ['auto'];
             $sw = ($sizeTokens[0] ?? 'auto') === 'auto' ? null : CssUnit::toPt($sizeTokens[0], $w, $box->fontSizePt);
@@ -1264,10 +1310,11 @@ class PdfRenderer
                 $tileH = $natH;
             } elseif ($sh === null) {
                 $tileW = (float) $sw;
-                $tileH = $tileW / $ratio;
+                // a gradient has no ratio: the missing size is the box's
+                $tileH = $isGradient ? $h : $tileW / $ratio;
             } elseif ($sw === null) {
                 $tileH = $sh;
-                $tileW = $tileH * $ratio;
+                $tileW = $isGradient ? $w : $tileH * $ratio;
             } else {
                 $tileW = $sw;
                 $tileH = $sh;
@@ -1277,9 +1324,9 @@ class PdfRenderer
             return '';
         }
 
-        [$offX, $offY] = $this->resolvePosition($box->style->get('background-position', '0% 0%'), $w - $tileW, $h - $tileH);
+        [$offX, $offY] = $this->resolvePosition($positionCss, $w - $tileW, $h - $tileH);
 
-        $repeatTokens = preg_split('/\s+/', strtolower(trim($box->style->get('background-repeat', 'repeat'))), -1, PREG_SPLIT_NO_EMPTY) ?: ['repeat'];
+        $repeatTokens = preg_split('/\s+/', strtolower(trim($repeatCss)), -1, PREG_SPLIT_NO_EMPTY) ?: ['repeat'];
         if (count($repeatTokens) === 1) {
             [$repX, $repY] = match ($repeatTokens[0]) {
                 'no-repeat' => [false, false],
@@ -1290,6 +1337,11 @@ class PdfRenderer
         } else {
             $repX = $repeatTokens[0] !== 'no-repeat';
             $repY = $repeatTokens[1] !== 'no-repeat';
+        }
+
+        if ($isGradient && abs($tileW - $w) < 0.01 && abs($tileH - $h) < 0.01 && abs($offX) < 0.01 && abs($offY) < 0.01) {
+            // the usual case: one gradient filling the box
+            return $this->paintGradientLayer($box, $layer, $x, $y, $w, $h, $this->buildRoundedRectPath($x, $y, $w, $h, $radii));
         }
 
         $xs = [$x + $offX];
@@ -1311,10 +1363,22 @@ class PdfRenderer
 
         $out = "q\n" . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W n\n";
         $tiles = 0;
+        $gradientTile = null;
         foreach ($ys as $ty) {
             foreach ($xs as $tx) {
                 if (++$tiles > 4000) {
                     break 2;
+                }
+                if ($isGradient) {
+                    // painted once at the first tile, translated for the others (one shading for all tiles)
+                    if ($gradientTile === null) {
+                        $tileClip = sprintf("%.3F %.3F %.3F %.3F re\n", $tx, $this->pageHeight - ($ty + $tileH), $tileW, $tileH);
+                        $gradientTile = [$tx, $ty, $this->paintGradientLayer($box, $layer, $tx, $ty, $tileW, $tileH, $tileClip)];
+                        $out .= $gradientTile[2];
+                    } else {
+                        $out .= sprintf("q 1 0 0 1 %.3F %.3F cm\n", $tx - $gradientTile[0], $gradientTile[1] - $ty) . $gradientTile[2] . "Q\n";
+                    }
+                    continue;
                 }
                 if ($svgBg !== null) {
                     // SVG backgrounds stay vector: rendered into each tile
@@ -1328,62 +1392,41 @@ class PdfRenderer
     }
 
     /**
-     * Paints a CSS gradient string (linear / radial) into a rectangle; '' when the value is not a gradient.
+     * Paints a gradient background layer into ($x, $y, $w, $h) clipped by $clipPath; transparency is flattened onto
+     * the box's background colour where the output does not allow it.
      */
-    public function paintGradientCss(string $css, float $x, float $y, float $w, float $h): string
+    private function paintGradientLayer(LayoutBox $box, string $css, float $x, float $y, float $w, float $h, string $clipPath): string
     {
-        $none = [0.0, 0.0, 0.0, 0.0];
-        $lower = strtolower($css);
-        if (str_contains($lower, 'radial-gradient(')) {
-            $g = CssColor::parseRadialGradient($css);
-            return $g !== null ? $this->drawRadialGradient($x, $y, $w, $h, $none, $g) : '';
-        }
-        if (str_contains($lower, 'linear-gradient(')) {
-            $g = CssColor::parseLinearGradient($css);
-            return $g !== null ? $this->drawLinearGradient($x, $y, $w, $h, $none, $g) : '';
-        }
-        return '';
+        $bg = CssColor::parse($box->style->get('background-color', 'transparent'));
+        return $this->gradients->paintCss(
+            $css,
+            $x,
+            $y,
+            $w,
+            $h,
+            $this->pageHeight,
+            $clipPath,
+            $box->fontSizePt,
+            CssColor::parse($box->style->get('color', '#111827')),
+            $bg !== null && $bg[3] >= 0.999 ? $bg : null
+        );
     }
 
     /**
-     * @param array{0: float, 1: float, 2: float, 3: float} $radii
-     * @param array{shape: string, size: string, position: string, radii: array{0: ?string, 1: ?string}, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>} $gradient
+     * Paints a CSS gradient string (linear / radial / conic, repeating or not) into a rectangle; '' when the value
+     * is not a gradient.
+     *
+     * @param array<int|string, mixed>|null $currentColor
+     * @param float|null $pageHeight height of the coordinate system the box is given in (null: the page)
      */
-    private function drawRadialGradient(float $x, float $y, float $w, float $h, array $radii, array $gradient): string
+    public function paintGradientCss(string $css, float $x, float $y, float $w, float $h, ?array $currentColor = null, float $fontSizePt = 12.0, ?float $pageHeight = null): string
     {
-        [$cxOff, $cyOff] = $this->resolvePosition($gradient['position'], $w, $h);
-        $dxMin = min($cxOff, $w - $cxOff);
-        $dxMax = max($cxOff, $w - $cxOff);
-        $dyMin = min($cyOff, $h - $cyOff);
-        $dyMax = max($cyOff, $h - $cyOff);
-        $isCircle = $gradient['shape'] === 'circle';
-
-        if ($gradient['radii'][0] !== null) {
-            $rx = CssUnit::toPt($gradient['radii'][0], $w);
-            $ry = $gradient['radii'][1] !== null ? CssUnit::toPt($gradient['radii'][1], $h) : $rx;
-        } else {
-            [$rx, $ry] = match ($gradient['size']) {
-                'closest-side' => $isCircle ? [min($dxMin, $dyMin), min($dxMin, $dyMin)] : [$dxMin, $dyMin],
-                'farthest-side' => $isCircle ? [max($dxMax, $dyMax), max($dxMax, $dyMax)] : [$dxMax, $dyMax],
-                'closest-corner' => $isCircle
-                    ? [hypot($dxMin, $dyMin), hypot($dxMin, $dyMin)]
-                    : [$dxMin * M_SQRT2, $dyMin * M_SQRT2],
-                default => $isCircle
-                    ? [hypot($dxMax, $dyMax), hypot($dxMax, $dyMax)]
-                    : [$dxMax * M_SQRT2, $dyMax * M_SQRT2],
-            };
+        if (CssGradient::functionName($css) === null) {
+            return '';
         }
-        $rx = max(0.1, $rx);
-        $ry = max(0.1, $ry);
-
-        $shId = $this->pdf->registerRadialShading([0.0, 0.0, 0.0, 0.0, 0.0, $rx], $gradient['stops']);
-        $cxPdf = $x + $cxOff;
-        $cyPdf = $this->pageHeight - ($y + $cyOff);
-
-        $out = "q\n" . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W n\n";
-        $out .= sprintf("1 0 0 %.5F %.3F %.3F cm\n", $ry / $rx, $cxPdf, $cyPdf);
-        $out .= "/{$shId} sh\nQ\n";
-        return $out;
+        $ph = $pageHeight ?? $this->pageHeight;
+        $clip = sprintf("%.2F %.2F %.2F %.2F re\n", $x, $ph - ($y + $h), $w, $h);
+        return $this->gradients->paintCss($css, $x, $y, $w, $h, $ph, $clip, $fontSizePt, $currentColor, null);
     }
 
     /**
@@ -1433,7 +1476,9 @@ class PdfRenderer
         $color = CssColor::parse(($markerStyle ?? $liBox->style)->get('color', '#111827')) ?? [0.067, 0.094, 0.153, 1.0];
 
         $markerW = $this->fontManager->measureText($marker, $fontFamily, $fontWeight, 'normal', $fs);
-        if (in_array($marker, ['•', '◦', '▪'], true)) {
+        if ($liBox->listMarkerString) {
+            $markerX = $localX - $markerW; // ::marker { content: ... }: the text ends at the content edge
+        } elseif (in_array($marker, ['•', '◦', '▪'], true)) {
             // Chromium's outside symbol marker: its box starts (ascent * 2/3 + 8) px before the content edge and the
             // symbol, (ascent * 2/3 + 1) / 2 px wide, is drawn 1 px into it; the glyph is centred on that symbol
             $offsetPx = intdiv((int) round($ttf->ascent / 1000.0 * $fs / 0.75) * 2, 3);
@@ -1516,41 +1561,10 @@ class PdfRenderer
     }
 
     /**
-     * @param array{0: float, 1: float, 2: float, 3: float} $radii
-     * @param array{angle: float, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>} $gradient
-     */
-    private function drawLinearGradient(float $x, float $y, float $w, float $h, array $radii, array $gradient): string
-    {
-        $pdfBottom = $this->pageHeight - ($y + $h);
-        $pdfTop = $this->pageHeight - $y;
-        $cx = $x + $w / 2.0;
-        $cy = ($pdfBottom + $pdfTop) / 2.0;
-
-        // Convert CSS angle (0deg = to top, 90deg = to right, 180deg = to bottom) into math radians in PDF space
-        $rad = deg2rad(90.0 - $gradient['angle']);
-        $dx = cos($rad);
-        $dy = sin($rad);
-
-        $halfLen = (abs($w * $dx) + abs($h * $dy)) / 2.0;
-        $x0 = $cx - $dx * $halfLen;
-        $y0 = $cy - $dy * $halfLen;
-        $x1 = $cx + $dx * $halfLen;
-        $y1 = $cy + $dy * $halfLen;
-
-        $shId = $this->pdf->registerAxialShading([$x0, $y0, $x1, $y1], $gradient['stops']);
-
-        $out = "q\n";
-        $out .= $this->buildRoundedRectPath($x, $y, $w, $h, $radii);
-        $out .= "W n\n";
-        $out .= "/{$shId} sh\n";
-        $out .= "Q\n";
-        return $out;
-    }
-
-    /**
      * Renders a soft CSS box-shadow behind a box.
      *
      * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     * @param array{0: float, 1: float, 2: float, 3: float}|null $currentColor colour of shadows without one (currentColor)
      */
     private function drawBoxShadow(
         string $shadowCss,
@@ -1559,28 +1573,289 @@ class PdfRenderer
         float $w,
         float $h,
         array $radii,
-        float $fontSizePt
+        float $fontSizePt,
+        ?array $currentColor = null
     ): string {
         $layers = $this->splitTopLevelCommas($shadowCss);
         $out = '';
         // The first shadow is painted on top, so paint in reverse order
         foreach (array_reverse($layers) as $layer) {
-            $out .= $this->drawSingleBoxShadow($layer, $x, $y, $w, $h, $radii, $fontSizePt);
+            $out .= $this->drawSingleBoxShadow($layer, $x, $y, $w, $h, $radii, $fontSizePt, $currentColor ?? [0.0, 0.0, 0.0, 1.0]);
         }
         if ($out === '') {
             return '';
         }
         // Outer shadows are only visible outside the border box (even-odd clip: page minus box)
-        return "q
-" . sprintf("0 0 %.2F %.2F re
-", $this->pageWidth, $this->pageHeight)
-            . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W* n
-" . $out . "Q
-";
+        return "q\n" . sprintf("0 0 %.2F %.2F re\n", $this->pageWidth, $this->pageHeight)
+            . $this->buildRoundedRectPath($x, $y, $w, $h, $radii) . "W* n\n" . $out . "Q\n";
     }
 
     /**
+     * Parses one box-shadow layer: [offset-x, offset-y, blur, spread, colour] in pt (null when invalid or invisible).
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $currentColor
+     * @return array{0: float, 1: float, 2: float, 3: float, 4: array{0: float, 1: float, 2: float, 3: float}}|null
+     */
+    private static function parseShadowLayer(string $css, float $fontSizePt, array $currentColor): ?array
+    {
+        $css = (string) preg_replace('/(?:^|\s)inset(?=\s|$)/i', ' ', $css);
+        $color = $currentColor;
+        if (preg_match('/(rgba?\([^)]+\)|hsla?\([^)]+\)|#[0-9a-fA-F]{3,8}\b)/i', $css, $cm) === 1) {
+            $color = CssColor::parse($cm[1]) ?? [0.0, 0.0, 0.0, 0.0];
+            $css = str_replace($cm[1], ' ', $css);
+        }
+        $lengths = [];
+        foreach (preg_split('/\s+/', trim($css), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $tok) {
+            if (preg_match('/^[+-]?(?:\d|\.\d)|^calc\(/i', $tok) === 1) {
+                $lengths[] = $tok;
+            } elseif (($named = CssColor::parse($tok)) !== null) {
+                $color = $named;
+            } elseif (strtolower($tok) === 'transparent') {
+                $color = [0.0, 0.0, 0.0, 0.0];
+            }
+        }
+        if (count($lengths) < 2 || (float) $color[3] <= 0.004) {
+            return null;
+        }
+        return [
+            CssUnit::toPt($lengths[0], 0.0, $fontSizePt),
+            CssUnit::toPt($lengths[1], 0.0, $fontSizePt),
+            isset($lengths[2]) ? max(0.0, CssUnit::toPt($lengths[2], 0.0, $fontSizePt)) : 0.0,
+            isset($lengths[3]) ? CssUnit::toPt($lengths[3], 0.0, $fontSizePt) : 0.0,
+            [(float) $color[0], (float) $color[1], (float) $color[2], (float) $color[3]],
+        ];
+    }
+
+    /**
+     * Paints the `inset` layers of a box-shadow inside the padding box (above the background, below the border and
+     * content). The shadow is the padding box minus its copy moved by the offset and shrunk by the spread; the blur is
+     * approximated like the outer shadow: a few stacked translucent layers whose holes shrink step by step.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $radii border-box radii
+     */
+    private function drawInsetBoxShadows(string $shadowCss, LayoutBox $box, float $x, float $y, float $w, float $h, array $radii): string
+    {
+        $layers = array_values(array_filter(
+            $this->splitTopLevelCommas($shadowCss),
+            static fn(string $l): bool => preg_match('/(?:^|\s)inset(?:\s|$)/i', $l) === 1
+        ));
+        if ($layers === []) {
+            return '';
+        }
+        $bl = $box->borderLeft;
+        $br = $box->borderRight;
+        $bt = $box->borderTop;
+        $bb = $box->borderBottom;
+        $px = $x + $bl;
+        $py = $y + $bt;
+        $pw = $w - $bl - $br;
+        $ph = $h - $bt - $bb;
+        if ($pw <= 0.1 || $ph <= 0.1) {
+            return '';
+        }
+        $inner = [
+            max(0.0, $radii[0] - max($bl, $bt)),
+            max(0.0, $radii[1] - max($br, $bt)),
+            max(0.0, $radii[2] - max($br, $bb)),
+            max(0.0, $radii[3] - max($bl, $bb)),
+        ];
+        $currentColor = CssColor::parse($box->style->get('color', '#111827')) ?? [0.0, 0.0, 0.0, 1.0];
+        $body = '';
+        foreach (array_reverse($layers) as $layer) {
+            $parsed = self::parseShadowLayer($layer, $box->fontSizePt, $currentColor);
+            if ($parsed === null) {
+                continue;
+            }
+            [$ox, $oy, $blur, $spread, $color] = $parsed;
+            // Blur: Chromium blurs (Gaussian, sigma = blur / 2) the ring between the hole and the padding box grown
+            // by B = 0.45 * blur (measured against Edge), clipped to the padding box. Across a hole edge the opacity
+            // is then T(e) = alpha * (Phi(-e / sigma) - Phi((-B - h - e) / sigma)) at distance e inside the hole edge,
+            // h being that hole edge's depth below the padding edge (spread +/- the offset: each side has its own).
+            // Nested layers (each side's hole edge moved to where its T crosses k / steps of the strongest side's
+            // maximum) with opacities chosen so that the stacked layers give exactly Tmax * (layers covering the
+            // point) / steps: no seams, no darker overlap.
+            $depths = [$spread + $ox, $spread + $oy, $spread - $ox, $spread - $oy]; // left, top, right, bottom
+            [$edges, $tMax] = self::insetShadowLevels($color[3], $blur, $depths);
+            $steps = count($edges);
+            $fill = ColorOps::fillOp([$color[0], $color[1], $color[2], 1.0] + $color);
+            // Without transparency (PDF/A-1, PDF/X-1a / X-3) the layers are painted opaque, deepest first, each in the
+            // shadow colour composited onto the background at the opacity its band would have
+            $flatten = ColorOps::transparencyForbidden();
+            $bg = CssColor::parse($box->style->get('background-color', 'transparent'));
+            $backdrop = $bg !== null && $bg[3] >= 0.999 ? $bg : [1.0, 1.0, 1.0, 1.0];
+            $order = $flatten ? range($steps, 1) : range(1, $steps);
+            foreach ($order as $s) {
+                $e = $edges[$s - 1];
+                $after = 1.0 - $tMax * ($steps - $s) / $steps;
+                $before = 1.0 - $tMax * ($steps - $s + 1) / $steps;
+                $layerAlpha = $after > 1e-9 ? 1.0 - $before / $after : 1.0;
+                if ($layerAlpha <= 0.002) {
+                    continue;
+                }
+                $layerFill = $fill;
+                $gsOp = !$flatten && $layerAlpha < 0.999 ? '/' . $this->pdf->registerAlphaState($layerAlpha) . " gs\n" : '';
+                if ($flatten) {
+                    $o = $tMax * ($steps - $s + 1) / $steps;
+                    $layerFill = ColorOps::fillOp([
+                        $color[0] * $o + $backdrop[0] * (1.0 - $o),
+                        $color[1] * $o + $backdrop[1] * (1.0 - $o),
+                        $color[2] * $o + $backdrop[2] * (1.0 - $o),
+                        1.0,
+                    ]);
+                    $gsOp = '';
+                }
+                // each hole edge at its depth plus its level distance (beyond the padding box when that side never
+                // reaches this level)
+                $hx = $px + $depths[0] + $e[0];
+                $hy = $py + $depths[1] + $e[1];
+                $hw = $px + $pw - $depths[2] - $e[2] - $hx;
+                $hh = $py + $ph - $depths[3] - $e[3] - $hy;
+                $layerOps = sprintf("q\n%s%s\n%.2F %.2F %.2F %.2F re\n", $gsOp, $layerFill, $px - 1.0, $this->pageHeight - ($py + $ph + 1.0), $pw + 2.0, $ph + 2.0);
+                if ($hw > 0.05 && $hh > 0.05) {
+                    // corner radius: the inner radius minus the spread and the adjacent sides' level distances (a side
+                    // that never reaches the level counts at its padding edge)
+                    $ec = [];
+                    foreach ([0, 1, 2, 3] as $i) {
+                        $ec[$i] = max($e[$i], -$depths[$i]);
+                    }
+                    // (at least the radius where the blurred corner's contour crosses the diagonal)
+                    $holeRadii = [
+                        max($e[4] ?? 0.0, $inner[0] - $spread - ($ec[0] + $ec[1]) / 2.0),
+                        max($e[5] ?? 0.0, $inner[1] - $spread - ($ec[2] + $ec[1]) / 2.0),
+                        max($e[6] ?? 0.0, $inner[2] - $spread - ($ec[2] + $ec[3]) / 2.0),
+                        max($e[7] ?? 0.0, $inner[3] - $spread - ($ec[0] + $ec[3]) / 2.0),
+                    ];
+                    $layerOps .= $this->buildRoundedRectPath($hx, $hy, $hw, $hh, self::clampRadii($holeRadii, $hw, $hh));
+                }
+                $body .= $layerOps . "f*\nQ\n";
+            }
+        }
+        if ($body === '') {
+            return '';
+        }
+        return "q\n" . $this->buildRoundedRectPath($px, $py, $pw, $ph, $inner) . "W n\n" . $body . "Q\n";
+    }
+
+    /**
+     * Hole edge level distances and the peak opacity of an inset shadow layer stack; see drawInsetBoxShadows(). One
+     * entry per layer, the deepest hole (highest level) first: [left, top, right, bottom] distance of the hole edge
+     * inside the offset-and-spread hole edge.
+     *
+     * @param array{0: float, 1: float, 2: float, 3: float} $depths hole edge depth below the padding edge, per side
+     * @return array{0: list<array<int, float>>, 1: float}
+     */
+    private static function insetShadowLevels(float $alpha, float $blur, array $depths): array
+    {
+        if ($blur <= 1.0) {
+            return [[[0.0, 0.0, 0.0, 0.0]], $alpha];
+        }
+        $sigma = $blur / 2.0;
+        $outer = 0.45 * $blur;
+        $n = 400;
+        $hi = 4.0 * $sigma;
+        $sides = [];
+        $tMax = 0.0;
+        foreach ($depths as $i => $hRef) {
+            // sample from the padding edge (e = -h) inwards; monotone envelope from the inside out
+            $lo = -$hRef;
+            $es = [];
+            $env = [];
+            if ($hi - $lo > 1e-6) {
+                for ($j = 0; $j <= $n; $j++) {
+                    $es[$j] = $lo + ($hi - $lo) * $j / $n;
+                }
+                $run = 0.0;
+                for ($j = $n; $j >= 0; $j--) {
+                    $e = $es[$j];
+                    $run = max($run, $alpha * (self::normCdf(-$e / $sigma) - self::normCdf((-$outer - $hRef - $e) / $sigma)));
+                    $env[$j] = $run;
+                }
+                $tMax = max($tMax, $env[0]);
+            }
+            $sides[$i] = [$es, $env, $lo];
+        }
+        if ($tMax <= 0.002) {
+            return [[], 0.0];
+        }
+        $steps = min(12, max(3, (int) ceil($blur / 1.5)));
+        $levels = [];
+        for ($k = $steps; $k >= 1; $k--) {
+            // the largest e where the envelope still reaches the level: layers with a deeper hole cover more
+            $level = $tMax * ($k - 0.5) / $steps;
+            $row = [];
+            foreach ($sides as $i => [$es, $env, $lo]) {
+                $e = $lo - 2.0; // never reaches the level: the hole edge lies beyond the padding box
+                for ($j = count($es) - 1; $j >= 0; $j--) {
+                    if ($env[$j] >= $level) {
+                        $e = $es[$j];
+                        break;
+                    }
+                }
+                $row[$i] = $e;
+            }
+            // Hole corners: the field there is alpha * (1 - g_a * g_b), g = 1 - T / alpha per side, so the contour
+            // rounds the corner. Find where it crosses the diagonal (t in from the rectangle's corner) and use the
+            // radius of a rounded corner through that point (indexes 4..7: tl, tr, br, bl).
+            $target = 1.0 - $level / $alpha;
+            foreach ([[0, 1], [2, 1], [2, 3], [0, 3]] as $c => [$a, $b]) {
+                $r = 0.0;
+                if ($row[$a] > $sides[$a][2] - 1.0 && $row[$b] > $sides[$b][2] - 1.0 && $target > 0.0) {
+                    $g = static fn(int $i, float $d): float => 1.0 - (self::normCdf(-$d / $sigma) - self::normCdf((-$outer - $depths[$i] - $d) / $sigma));
+                    $tLo = 0.0;
+                    $tHi = 6.0 * $sigma;
+                    for ($it = 0; $it < 28; $it++) {
+                        $mid = ($tLo + $tHi) / 2.0;
+                        if ($g($a, $row[$a] + $mid) * $g($b, $row[$b] + $mid) >= $target) {
+                            $tHi = $mid;
+                        } else {
+                            $tLo = $mid;
+                        }
+                    }
+                    $r = $tHi / (1.0 - M_SQRT1_2);
+                }
+                $row[4 + $c] = $r;
+            }
+            $levels[] = $row;
+        }
+        return [$levels, $tMax];
+    }
+
+    /**
+     * Scales rounded-rect radii down so they fit the rectangle.
+     *
+     * @param array<int, float> $r [tl, tr, br, bl]
+     * @return array{0: float, 1: float, 2: float, 3: float}
+     */
+    private static function clampRadii(array $r, float $w, float $h): array
+    {
+        $f = 1.0;
+        foreach ([[$r[0] + $r[1], $w], [$r[3] + $r[2], $w], [$r[0] + $r[3], $h], [$r[1] + $r[2], $h]] as [$sum, $len]) {
+            if ($sum > $len && $sum > 0.0) {
+                $f = min($f, $len / $sum);
+            }
+        }
+        return [$r[0] * $f, $r[1] * $f, $r[2] * $f, $r[3] * $f];
+    }
+
+    /** Standard normal cumulative distribution (Abramowitz & Stegun 7.1.26, error < 1.5e-7). */
+    private static function normCdf(float $x): float
+    {
+        $z = abs($x) / M_SQRT2;
+        $t = 1.0 / (1.0 + 0.3275911 * $z);
+        $erf = 1.0 - ((((1.061405429 * $t - 1.453152027) * $t + 1.421413741) * $t - 0.284496736) * $t + 0.254829592) * $t * exp(-$z * $z);
+        return $x >= 0 ? 0.5 * (1.0 + $erf) : 0.5 * (1.0 - $erf);
+    }
+
+    /**
+     * Paints one outer box-shadow layer. Chromium blurs the shadow shape (the border box moved by the offset and grown
+     * by the spread) with a Gaussian of sigma = 0.47 * blur (measured against Edge's print output). For a rectangle
+     * the result is alpha * fx(x) * fy(y), fx(x) = Phi((x - x0) / sigma) - Phi((x - x1) / sigma); it is approximated by
+     * nested rounded rectangles on its iso-contours at Tmax * (k - 0.5) / steps (corner radius from where the contour
+     * crosses the corner diagonal), with opacities chosen so that the stacked layers give exactly
+     * Tmax * (layers covering the point) / steps: no seams, no darker overlap.
+     *
      * @param array{0: float, 1: float, 2: float, 3: float} $radii
+     * @param array{0: float, 1: float, 2: float, 3: float} $currentColor
      */
     private function drawSingleBoxShadow(
         string $shadowCss,
@@ -1589,56 +1864,115 @@ class PdfRenderer
         float $w,
         float $h,
         array $radii,
-        float $fontSizePt
+        float $fontSizePt,
+        array $currentColor
     ): string {
-        if (str_contains(strtolower($shadowCss), 'inset')) {
+        if (preg_match('/(?:^|\s)inset(?:\s|$)/i', $shadowCss) === 1) {
             return '';
         }
+        $parsed = self::parseShadowLayer($shadowCss, $fontSizePt, $currentColor);
+        if ($parsed === null) {
+            return '';
+        }
+        [$offsetX, $offsetY, $blur, $spread, $shadowColor] = $parsed;
 
-        // Extract color (rgba/rgb/hex) from shadow string
-        $shadowColor = [0.0, 0.0, 0.0, 0.10];
-        $cleaned = $shadowCss;
-        if (preg_match('/(rgba?\([^)]+\)|hsla?\([^)]+\)|#[0-9a-fA-F]{3,8})/i', $shadowCss, $cm)) {
-            $parsedColor = CssColor::parse($cm[1]);
-            if ($parsedColor !== null) {
-                $shadowColor = $parsedColor;
+        // the shadow shape; radii grown / shrunk by the spread as in CSS Backgrounds 3 (sharp corners stay sharp)
+        $cx = $x + $offsetX + $w / 2.0;
+        $cy = $y + $offsetY + $h / 2.0;
+        $hw = $w / 2.0 + $spread;
+        $hh = $h / 2.0 + $spread;
+        if ($hw <= 0.025 || $hh <= 0.025) {
+            return '';
+        }
+        $shapeRadii = [];
+        foreach ($radii as $i => $r) {
+            if ($r <= 0.0) {
+                $shapeRadii[$i] = 0.0;
+            } elseif ($spread < 0.0) {
+                $shapeRadii[$i] = max(0.0, $r + $spread);
+            } else {
+                $shapeRadii[$i] = $spread <= 0.0 || $r >= $spread ? $r + $spread : $r + $spread * (1.0 + ($r / $spread - 1.0) ** 3);
             }
-            $cleaned = str_replace($cm[1], '', $shadowCss);
         }
 
-        $lengths = preg_split('/\s+/', trim($cleaned), -1, PREG_SPLIT_NO_EMPTY) ?: [];
-        if (count($lengths) < 2) {
-            return '';
+        $alpha = $shadowColor[3];
+        $sigma = 0.47 * $blur;
+        $rects = []; // [half-width, half-height, radii, cumulative opacity], outermost first
+        if ($sigma < 0.3) {
+            $rects[] = [$hw, $hh, self::clampRadii($shapeRadii, 2.0 * $hw, 2.0 * $hh), $alpha];
+        } else {
+            $fx = static fn(float $a): float => self::normCdf(($hw - $a) / $sigma) - self::normCdf((-$hw - $a) / $sigma);
+            $fy = static fn(float $a): float => self::normCdf(($hh - $a) / $sigma) - self::normCdf((-$hh - $a) / $sigma);
+            $peakX = $fx(0.0);
+            $peakY = $fy(0.0);
+            $tMax = $alpha * $peakX * $peakY;
+            if ($tMax <= 0.004) {
+                return '';
+            }
+            $steps = min(16, max(2, (int) ceil(min(3.5 * $sigma, 40.0 * $tMax))));
+            // the largest a in [0, max] with f(a) >= level (f decreasing)
+            $solve = static function (callable $f, float $level, float $max): float {
+                $lo = 0.0;
+                $hi = $max;
+                for ($i = 0; $i < 32; $i++) {
+                    $mid = ($lo + $hi) / 2.0;
+                    if ($f($mid) >= $level) {
+                        $lo = $mid;
+                    } else {
+                        $hi = $mid;
+                    }
+                }
+                return ($lo + $hi) / 2.0;
+            };
+            $kDiag = 1.0 - M_SQRT1_2;
+            for ($k = 1; $k <= $steps; $k++) {
+                $level = $peakX * $peakY * ($k - 0.5) / $steps;
+                $ax = $solve(static fn(float $a): float => $fx($a) * $peakY, $level, $hw + 8.0 * $sigma);
+                $ay = $solve(static fn(float $a): float => $fy($a) * $peakX, $level, $hh + 8.0 * $sigma);
+                // where the contour crosses the corner diagonal (distance t in from the rectangle's corner): the
+                // radius of a rounded corner through that point
+                $m = min($ax, $ay);
+                $t = $m - $solve(static fn(float $u): float => $fx($ax - $m + $u) * $fy($ay - $m + $u), $level, $m);
+                $sharpR = max(0.0, $t / $kDiag);
+                $grow = min($ax - $hw, $ay - $hh);
+                $r = [];
+                foreach ($shapeRadii as $i => $sr) {
+                    $r[$i] = max($sharpR, $sr > 0.0 ? $sr + $grow : 0.0);
+                }
+                $rects[] = [$ax, $ay, self::clampRadii($r, 2.0 * $ax, 2.0 * $ay), $tMax * $k / $steps];
+            }
         }
 
-        $offsetX = CssUnit::toPt($lengths[0], 0.0, $fontSizePt);
-        $offsetY = CssUnit::toPt($lengths[1], 0.0, $fontSizePt);
-        $blur = isset($lengths[2]) ? max(0.0, CssUnit::toPt($lengths[2], 0.0, $fontSizePt)) : 0.0;
-        $spread = isset($lengths[3]) ? CssUnit::toPt($lengths[3], 0.0, $fontSizePt) : 0.0;
-
-        $steps = $blur > 1.0 ? min(5, max(2, (int) ceil($blur / 2.5))) : 1;
-        $baseAlpha = $shadowColor[3] / $steps;
-        if ($baseAlpha <= 0.004) {
-            return '';
-        }
-
+        $flatten = ColorOps::transparencyForbidden();
+        $hideR = max($radii);
         $out = '';
-        for ($s = $steps; $s >= 1; $s--) {
-            $expand = $spread + ($blur * ($s / $steps) * 0.65);
-            $sx = $x + $offsetX - $expand;
-            $sy = $y + $offsetY - $expand;
-            $sw = $w + 2.0 * $expand;
-            $sh = $h + 2.0 * $expand;
-            if ($sw <= 0.1 || $sh <= 0.1) {
+        $prev = 0.0;
+        foreach ($rects as [$ax, $ay, $r, $cum]) {
+            $layerAlpha = $prev < 1.0 - 1e-9 ? 1.0 - (1.0 - $cum) / (1.0 - $prev) : 1.0;
+            $prev = $cum;
+            $sx = $cx - $ax;
+            $sy = $cy - $ay;
+            $sw = 2.0 * $ax;
+            $sh = 2.0 * $ay;
+            if ($sw <= 0.05 || $sh <= 0.05 || $layerAlpha <= 0.002) {
                 continue;
             }
-            $sRadii = [
-                max(0.0, $radii[0] + $expand * 0.5),
-                max(0.0, $radii[1] + $expand * 0.5),
-                max(0.0, $radii[2] + $expand * 0.5),
-                max(0.0, $radii[3] + $expand * 0.5),
-            ];
-            $out .= $this->drawFilledRect($sx, $sy, $sw, $sh, $sRadii, [$shadowColor[0], $shadowColor[1], $shadowColor[2], $baseAlpha]);
+            // a layer entirely under the box is clipped away
+            if ($sx >= $x + $hideR && $sy >= $y + $hideR && $sx + $sw <= $x + $w - $hideR && $sy + $sh <= $y + $h - $hideR) {
+                continue;
+            }
+            if ($flatten) {
+                // PDF/A-1, PDF/X-1a / X-3: opaque layers (the widest first) in the colour the stacked translucent
+                // layers would give on a white page, instead of opaque black rings after the opacity reset
+                $out .= $this->drawFilledRect($sx, $sy, $sw, $sh, $r, [
+                    $shadowColor[0] * $cum + 1.0 - $cum,
+                    $shadowColor[1] * $cum + 1.0 - $cum,
+                    $shadowColor[2] * $cum + 1.0 - $cum,
+                    1.0,
+                ]);
+                continue;
+            }
+            $out .= $this->drawFilledRect($sx, $sy, $sw, $sh, $r, [$shadowColor[0], $shadowColor[1], $shadowColor[2], min(1.0, $layerAlpha)]);
         }
 
         return $out;

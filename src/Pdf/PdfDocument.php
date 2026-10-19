@@ -48,6 +48,11 @@ class PdfDocument
     /** @var array<string, array{coords: list<float>, stops: list<array{color: array{0: float, 1: float, 2: float, 3: float}, offset: float}>}> */
     private array $radialShadings = [];
 
+    /** @var array<string, array{dict: string, stream: ?string}> shadings written as given (CSS gradients with alpha / repetition, conic meshes) */
+    private array $rawShadings = [];
+    /** @var array<string, string> content hash => name of a registered raw shading */
+    private array $rawShadingKeys = [];
+
     /** @var array<string, array{page: int, y: float}> Named destinations (element ids) */
     private array $destinations = [];
     /** @var array<int, true> spl_object_id of every FormControl that already has a widget */
@@ -68,6 +73,12 @@ class PdfDocument
 
     /** @var list<string> Extra XMP rdf:Description snippets (e.g. Factur-X extension schema) for the PDF/A XMP builder */
     private array $xmpExtensions = [];
+
+    /** The options of the document being written (warnings, PDF/A / PDF/X level). */
+    public function options(): Options
+    {
+        return $this->options;
+    }
 
     /** Imported PDF pages (Form XObjects) registry: backgrounds, merged pages, <img src="x.pdf">. */
     public function imports(): Import\ImportRegistry
@@ -435,6 +446,21 @@ class PdfDocument
     }
 
     /**
+     * Registers a shading whose dictionary is already built (without the << >> delimiters); with $stream the shading is
+     * a stream (mesh shadings, types 4-7). Identical shadings share one object. Returns the resource name.
+     */
+    public function registerRawShading(string $dict, ?string $stream = null): string
+    {
+        $key = md5($dict . "\0" . ($stream ?? ''));
+        if (isset($this->rawShadingKeys[$key])) {
+            return $this->rawShadingKeys[$key];
+        }
+        $id = 'ShR' . (count($this->rawShadings) + 1);
+        $this->rawShadings[$id] = ['dict' => $dict, 'stream' => $stream];
+        return $this->rawShadingKeys[$key] = $id;
+    }
+
+    /**
      * Registers an axial linear-gradient shading and returns its PDF Shading resource name (e.g. 'Sh1').
      *
      * @param array{0: float, 1: float, 2: float, 3: float} $coords [x0, y0, x1, y1] in PDF page coordinates
@@ -523,6 +549,21 @@ class PdfDocument
         }
         foreach ($this->radialShadings as $shId => $shData) {
             $shadingRefs[$shId] = $this->buildShadingObject($shData['coords'], $shData['stops'], 3);
+        }
+        foreach ($this->rawShadings as $shId => $shData) {
+            $shObjId = $this->allocObj();
+            if ($shData['stream'] === null) {
+                $this->objects[$shObjId] = '<< ' . $shData['dict'] . ' >>';
+            } else {
+                $data = $shData['stream'];
+                $filter = '';
+                if ($this->options->compress) {
+                    $data = (string) gzcompress($data, 6);
+                    $filter = ' /Filter /FlateDecode';
+                }
+                $this->objects[$shObjId] = sprintf("<< %s /Length %d%s >>\nstream\n%s\nendstream", $shData['dict'], strlen($data), $filter, $data);
+            }
+            $shadingRefs[$shId] = $shObjId;
         }
 
         // 4b. SVG paint servers (gradient shadings/patterns, tiling patterns, soft masks, form XObjects)

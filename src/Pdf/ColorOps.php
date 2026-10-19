@@ -22,6 +22,8 @@ final class ColorOps
 {
     private static bool $cmykTarget = false;
     private static bool $flatten = false;
+    /** PDF/A-1 or PDF/X-1a / X-3: no transparency at all (see transparencyForbidden()) */
+    private static bool $noTransparency = false;
     /** PDF/A with the sRGB output intent: no device CMYK at all */
     private static bool $rgbOnly = false;
     /** a CMYK / spot color or image was written as RGB because of $rgbOnly */
@@ -39,6 +41,7 @@ final class ColorOps
         self::$rgbOnly = false;
         self::$notes = [];
         $pdfa = PdfFinisher::parsePdfa($options->pdfa);
+        self::$noTransparency = self::$flatten || ($pdfa !== null && $pdfa['part'] === 1);
         if ($pdfa !== null && PdfX::level($options) === '') {
             if (PdfAIntent::profile($options, $pdfa['part']) !== null) {
                 self::$cmykTarget = true; // CMYK output intent: everything is written in CMYK
@@ -98,6 +101,15 @@ final class ColorOps
     public static function isFlattening(): bool
     {
         return self::$flatten;
+    }
+
+    /**
+     * True when the output forbids transparency (PDF/A-1, PDF/X-1a / X-3): painters that would rely on soft masks
+     * or opacity states composite their colours onto the background instead.
+     */
+    public static function transparencyForbidden(): bool
+    {
+        return self::$noTransparency;
     }
 
     /**

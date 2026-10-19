@@ -24,8 +24,17 @@ class DomBuilder
     private string $documentLang = '';
     private string $documentDirection = 'ltr';
 
-    /** @var array<string, int> CSS counters (counter-reset / counter-increment / counter()) */
-    private array $counters = [];
+    /**
+     * CSS counter instances in scope, outermost first (CSS Lists 3): counter-reset on an element creates a new instance
+     * that is in scope for the element, its descendants and its following siblings; `level` identifies the sibling
+     * group of the element that created it (instances of a group leave the stack when its parent ends).
+     *
+     * @var list<array{name: string, value: int, level: int}>
+     */
+    private array $counterStack = [];
+    /** sibling group whose elements are being processed (see $counterStack) */
+    private int $counterLevel = 0;
+    private int $counterLevelSeq = 0;
 
     /** Elements whose box keeps its DOM element even without attributes (later passes read it); others only with attributes */
     private const DOM_READERS = ['table' => true, 'svg' => true, 'math' => true, 'h1' => true, 'h2' => true, 'h3' => true, 'h4' => true, 'h5' => true, 'h6' => true];
@@ -112,11 +121,20 @@ class DomBuilder
             $bodyEl = $bodyNodes->item(0);
             $bodyStyle = $this->cssParser->computeStyleForElement($bodyEl, $rootStyle);
             $rootBox = new LayoutBox('body', $bodyStyle, $bodyEl);
+            // counters of <html> and <body> (`body { counter-reset: chapter 5 }`) are in scope for the whole document
+            $this->counterStack = [];
+            if ($htmlNodes->length > 0) {
+                $this->applyCounterProperties($rootStyle);
+            }
+            $this->counterLevel = ++$this->counterLevelSeq;
+            $this->applyCounterProperties($bodyStyle);
+            $this->counterLevel = ++$this->counterLevelSeq;
             $this->buildChildren($bodyEl, $rootBox);
             return $rootBox;
         }
 
         // Fallback if no <body>
+        $this->counterStack = [];
         $rootBox = new LayoutBox('body', $rootStyle);
         if ($dom->documentElement instanceof DOMElement) {
             $this->buildChildren($dom->documentElement, $rootBox);
@@ -328,14 +346,40 @@ class DomBuilder
                 $childStyle = $childStyle->unshared();
                 $childStyle->set('list-style-type', 'disclosure-open');
             }
-            $this->applyCounterProperties($childStyle);
+            $listReset = null;
+            if ($tag === 'ol' || $tag === 'ul' || $tag === 'menu') {
+                // UA `counter-reset: list-item` (<ol start> / reversed: the value before the first item)
+                $listReset = 0;
+                if ($tag === 'ol') {
+                    $reversed = $child->hasAttribute('reversed');
+                    if ($child->hasAttribute('start') && is_numeric($child->getAttribute('start'))) {
+                        $listReset = self::clampCounter(self::clampCounter($child->getAttribute('start')) + ($reversed ? 1 : -1));
+                    } elseif ($reversed) {
+                        $items = 0;
+                        foreach ($child->childNodes as $cn) {
+                            $items += $cn instanceof DOMElement && strtolower($cn->tagName) === 'li' ? 1 : 0;
+                        }
+                        $listReset = $items + 1;
+                    }
+                }
+            }
+            $listIncrement = strtolower(trim($childStyle->get('display', 'inline'))) === 'list-item' ? ($listReversed ? -1 : 1) : 0;
+            $this->applyCounterProperties($childStyle, $listReset, $listIncrement);
 
             // An element without attributes has nothing a later pass could look up in the DOM (anchors, bookmarks,
             // attr() values, spans are read here): not keeping it saves the DOM wrapper of every plain cell, <br>, <span>,
             // <li>... (tables, SVG and headings read the DOM later: <col> widths, the drawing, bookmark titles)
-            $keepElement = isset(self::DOM_READERS[$tag]) || $child->hasAttributes()
+            $bookmarkLevel = $this->bookmarkLevel($tag, $childStyle);
+            $keepElement = isset(self::DOM_READERS[$tag]) || $child->hasAttributes() || $bookmarkLevel > 0
                 || strtolower(trim($childStyle->get('string-set', 'none'))) !== 'none';
             $childBox = new LayoutBox($tag, $childStyle, $keepElement ? $child : null);
+            if ($bookmarkLevel > 0) {
+                $childBox->bookmarkLevel = $bookmarkLevel;
+                $label = trim($childStyle->get('bookmark-label', ''));
+                if ($label !== '' && strtolower($label) !== 'content()' && strtolower($label) !== 'content(text)') {
+                    $childBox->bookmarkLabel = $this->evaluateBookmarkLabel($label, $child, $childStyle);
+                }
+            }
             $currentHref = $inheritedHref;
 
             if ($tag === 'a' && $child->hasAttribute('href')) {
@@ -380,7 +424,8 @@ class DomBuilder
                 }
             }
 
-            if ($tag === 'li' || $childBox->getDisplay() === 'list-item') {
+            // Only a list-item box has a marker and counts in its list (`li { display: block }` has neither, as in browsers)
+            if ($childBox->getDisplay() === 'list-item') {
                 if ($child->hasAttribute('value') && is_numeric($child->getAttribute('value'))) {
                     $listCounter = self::clampCounter($child->getAttribute('value'));
                 }
@@ -409,9 +454,11 @@ class DomBuilder
 
             // Do not recurse into <svg> children as LayoutBoxes; SvgRenderer renders the DOMElement directly
             if ($childBox->tagName !== 'svg' && $tag !== 'br' && $tag !== 'hr' && $tag !== 'img' && $childBox->formControl === null) {
+                $counterScope = $this->openCounterScope();
                 $this->addGeneratedContent($child, $childBox, 'before', $currentHref);
                 $this->buildChildren($child, $childBox, $currentHref);
                 $this->addGeneratedContent($child, $childBox, 'after', $currentHref);
+                $this->closeCounterScope($counterScope);
                 FirstPseudo::apply($this->cssParser, $child, $childBox);
             }
 
@@ -462,6 +509,18 @@ class DomBuilder
         $li->markerStyle = $this->cssParser->computePseudoStyle($el, $style, 'marker', false);
         if ($markerImg !== null && $markerImg !== '') {
             $li->listMarkerImage = $markerImg;
+        }
+        // ::marker { content: ... } replaces the marker (counters(list-item, ".") for legal numbering; none hides it)
+        $markerContent = $li->markerStyle !== null ? trim($li->markerStyle->get('content', 'normal')) : 'normal';
+        if ($markerContent !== '' && strtolower($markerContent) !== 'normal') {
+            $li->listMarkerImage = null;
+            if (strtolower($markerContent) === 'none') {
+                $li->listMarker = null;
+                return;
+            }
+            $text = $this->evaluateContent($markerContent, $el);
+            $li->listMarker = $text !== '' ? $text : null;
+            $li->listMarkerString = true;
         }
         if (strtolower(trim($style->get('list-style-position', 'outside'))) !== 'inside') {
             return;
@@ -598,16 +657,21 @@ class DomBuilder
             return;
         }
         $pseudoStyle = self::blockify($pseudoStyle, $box->style);
+        // Counters a pseudo-element creates are its own (Chromium: a counter-reset in ::before does not number the
+        // element's children); increments of counters already in scope stay
+        $scope = $this->openCounterScope();
         $this->applyCounterProperties($pseudoStyle);
         $rawContent = $pseudoStyle->get('content', '');
         if (\IvoPdf\Paged\PagedContent::isPaged($rawContent)) {
             // leader() / target-counter(): placeholders resolved after pagination (PageRefResolver)
             $pseudoBox = \IvoPdf\Paged\PagedContent::buildBox($rawContent, $el, $pseudoStyle, $href, fn(string $c): string => $this->evaluateContent($c, $el));
+            $this->closeCounterScope($scope);
             if ($pseudoBox === null) {
                 return;
             }
         } else {
             $text = $this->evaluateContent($rawContent, $el);
+            $this->closeCounterScope($scope);
             if ($text === '') {
                 return;
             }
@@ -627,24 +691,217 @@ class DomBuilder
         }
     }
 
-    private function applyCounterProperties(\IvoPdf\Css\ComputedStyle $style): void
+    /**
+     * counter-reset, counter-increment and counter-set of an element (in this order, CSS Lists 3): a reset creates
+     * a new counter instance (nested counters), an increment / set without a counter in scope first creates one with 0.
+     * The implicit `list-item` counter: <ol> / <ul> / <menu> reset it ($listReset, also when the author's
+     * counter-reset does not name it, as Chromium does), list items increment it ($listIncrement) unless
+     * counter-increment / counter-set name it.
+     */
+    private function applyCounterProperties(\IvoPdf\Css\ComputedStyle $style, ?int $listReset = null, int $listIncrement = 0): void
     {
-        foreach (['counter-reset' => 0, 'counter-set' => 0, 'counter-increment' => 1] as $prop => $default) {
+        $ops = [];
+        foreach (['counter-reset' => 0, 'counter-increment' => 1, 'counter-set' => 0] as $prop => $default) {
+            $ops[$prop] = [];
             $val = trim($style->get($prop, 'none'));
             if ($val === '' || strtolower($val) === 'none') {
                 continue;
             }
-            preg_match_all('/([a-zA-Z_][\w-]*)(?:\s+(-?\d+))?/', $val, $mm, PREG_SET_ORDER);
+            preg_match_all('/([a-zA-Z_][\w-]*)(?:\s+([+-]?\d+))?/', $val, $mm, PREG_SET_ORDER);
             foreach ($mm as $m) {
                 $name = $m[1];
-                $num = isset($m[2]) && $m[2] !== '' ? self::clampCounter($m[2]) : $default;
-                if ($prop === 'counter-increment') {
-                    $this->counters[$name] = self::clampCounter(($this->counters[$name] ?? 0) + $num);
-                } else {
-                    $this->counters[$name] = $num;
+                if (in_array(strtolower($name), ['none', 'inherit', 'initial', 'unset', 'revert'], true)) {
+                    continue;
                 }
+                $ops[$prop][] = [$name, isset($m[2]) && $m[2] !== '' ? self::clampCounter($m[2]) : $default];
             }
         }
+        $names = static fn(array $list): array => array_map(static fn(array $o): string => $o[0], $list);
+        if ($listReset !== null && !in_array('list-item', $names($ops['counter-reset']), true)) {
+            array_unshift($ops['counter-reset'], ['list-item', $listReset]);
+        }
+        if ($listIncrement !== 0 && !in_array('list-item', $names($ops['counter-increment']), true) && !in_array('list-item', $names($ops['counter-set']), true)) {
+            $ops['counter-increment'][] = ['list-item', $listIncrement];
+        }
+        foreach ($ops as $prop => $list) {
+            foreach ($list as [$name, $num]) {
+                if ($prop === 'counter-reset') {
+                    $this->instantiateCounter($name, $num);
+                    continue;
+                }
+                $i = $this->innermostCounter($name) ?? $this->instantiateCounter($name, 0);
+                $this->counterStack[$i]['value'] = $prop === 'counter-increment'
+                    ? self::clampCounter($this->counterStack[$i]['value'] + $num)
+                    : $num;
+            }
+        }
+    }
+
+    /**
+     * Outline level of an element (CSS GCPM `bookmark-level: none | <integer>`; h1-h6 default to their level as in
+     * the GCPM user-agent stylesheet); 0 = no bookmark.
+     */
+    private function bookmarkLevel(string $tag, \IvoPdf\Css\ComputedStyle $style): int
+    {
+        $raw = strtolower(trim($style->get('bookmark-level', '')));
+        if ($raw === 'none') {
+            return 0;
+        }
+        if (preg_match('/^\+?\d+$/', $raw) === 1 && (int) $raw >= 1) {
+            return min(64, (int) $raw);
+        }
+        return preg_match('/^h([1-6])$/', $tag, $m) === 1 ? (int) $m[1] : 0;
+    }
+
+    /**
+     * Evaluates `bookmark-label`: strings, content() / content(text | before | after | first-letter), attr() and
+     * counter() / counters() (at the element's counter values).
+     */
+    private function evaluateBookmarkLabel(string $label, DOMElement $el, \IvoPdf\Css\ComputedStyle $style): string
+    {
+        $text = static fn(string $s): string => trim((string) preg_replace('/\s+/u', ' ', $s));
+        $pseudoText = function (string $pseudo) use ($el, $style): string {
+            $ps = $this->cssParser->computePseudoStyle($el, $style, $pseudo);
+            return $ps === null ? '' : $this->evaluateContent($ps->get('content', ''), $el);
+        };
+        $resolved = (string) preg_replace_callback(
+            '/content\(\s*(text|before|after|first-letter|marker)?\s*\)/i',
+            static function (array $m) use ($el, $text, $pseudoText): string {
+                $value = match (strtolower($m[1] ?? '')) {
+                    'before' => $pseudoText('before'),
+                    'after' => $pseudoText('after'),
+                    'first-letter' => mb_substr($text((string) $el->textContent), 0, 1),
+                    default => $text((string) $el->textContent),
+                };
+                return '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $value) . '"';
+            },
+            $label
+        );
+        return $text($this->evaluateContent($resolved, $el));
+    }
+
+    /** Index of the innermost counter instance named $name in scope, or null. */
+    private function innermostCounter(string $name): ?int
+    {
+        for ($i = count($this->counterStack) - 1; $i >= 0; $i--) {
+            if ($this->counterStack[$i]['name'] === $name) {
+                return $i;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Creates a counter instance on the current element; one created by the element itself or a previous sibling
+     * is replaced (a reset on the next <h2> restarts the counter instead of nesting a new one).
+     */
+    private function instantiateCounter(string $name, int $value): int
+    {
+        $i = $this->innermostCounter($name);
+        if ($i !== null && $this->counterStack[$i]['level'] === $this->counterLevel) {
+            array_splice($this->counterStack, $i, 1);
+        }
+        $this->counterStack[] = ['name' => $name, 'value' => $value, 'level' => $this->counterLevel];
+        return count($this->counterStack) - 1;
+    }
+
+    /**
+     * Opens the counter scope of an element's children (its ::before / ::after included); returns the state to give
+     * back to {@see closeCounterScope()} once the element ends.
+     *
+     * @return array{0: int, 1: int}
+     */
+    private function openCounterScope(): array
+    {
+        $state = [$this->counterLevel, count($this->counterStack)];
+        $this->counterLevel = ++$this->counterLevelSeq;
+        return $state;
+    }
+
+    /**
+     * Ends an element: the counters its children created go out of scope (values of outer counters they changed stay).
+     *
+     * @param array{0: int, 1: int} $state
+     */
+    private function closeCounterScope(array $state): void
+    {
+        $this->counterLevel = $state[0];
+        if (count($this->counterStack) > $state[1]) {
+            array_splice($this->counterStack, $state[1]);
+        }
+    }
+
+    /**
+     * Formats counter() / counters() for the innermost (or every, outermost first) instance named $name; a counter
+     * that is not in scope counts as 0.
+     */
+    private function formatCounters(string $name, bool $all, string $separator, string $styleArg): string
+    {
+        $values = [];
+        foreach ($this->counterStack as $c) {
+            if ($c['name'] === $name) {
+                $values[] = $c['value'];
+            }
+        }
+        if ($values === []) {
+            $values = [0];
+        } elseif (!$all) {
+            $values = [$values[count($values) - 1]];
+        }
+        $styleArg = strtolower($styleArg);
+        if ($styleArg === 'none') {
+            return '';
+        }
+        $parts = [];
+        foreach ($values as $value) {
+            $parts[] = $styleArg === 'decimal' ? (string) $value : (\IvoPdf\Text\CounterStyles::supports($styleArg)
+                ? \IvoPdf\Text\CounterStyles::body(self::clampCounter($value), $styleArg)
+                : rtrim($this->formatListNumber($value, $styleArg), '.)'));
+        }
+        return implode($separator, $parts);
+    }
+
+    /**
+     * Splits function arguments on commas outside quotes; quotes are removed from string arguments.
+     *
+     * @return list<string>
+     */
+    private static function splitContentArgs(string $args): array
+    {
+        $out = [];
+        $cur = '';
+        $quote = '';
+        $len = strlen($args);
+        for ($i = 0; $i < $len; $i++) {
+            $ch = $args[$i];
+            if ($quote !== '') {
+                if ($ch === '\\' && $i + 1 < $len) {
+                    $cur .= $args[++$i];
+                    continue;
+                }
+                if ($ch === $quote) {
+                    $quote = '';
+                    continue;
+                }
+                $cur .= $ch;
+                continue;
+            }
+            if ($ch === '"' || $ch === "'") {
+                $quote = $ch;
+                continue;
+            }
+            if ($ch === ',') {
+                $out[] = $cur;
+                $cur = '';
+                continue;
+            }
+            if ($ch === ' ' || $ch === "\t" || $ch === "\n" || $ch === "\r") {
+                continue; // whitespace outside quotes only separates tokens (a quoted ", " keeps its space)
+            }
+            $cur .= $ch;
+        }
+        $out[] = $cur;
+        return $out;
     }
 
     /**
@@ -679,9 +936,9 @@ class DomBuilder
                 $i = $j + 1;
                 continue;
             }
-            if (preg_match('/^(attr|counters?)\(([^)]*)\)/i', substr($content, $i), $fm)) {
+            if (preg_match('/^(attr|counters?)\(((?:[^()"\']|"[^"]*"|\'[^\']*\')*)\)/i', substr($content, $i), $fm)) {
                 $fn = strtolower($fm[1]);
-                $args = array_map(static fn(string $a): string => trim($a, " \t'\""), explode(',', $fm[2]));
+                $args = self::splitContentArgs($fm[2]);
                 if ($fn === 'attr') {
                     $out .= $el->getAttribute($args[0]);
                 } else {
@@ -690,12 +947,10 @@ class DomBuilder
                         $out .= '{PAGE_NUM}';
                     } elseif ($name === 'pages') {
                         $out .= '{PAGE_COUNT}';
+                    } elseif ($fn === 'counters') {
+                        $out .= $this->formatCounters($name, true, $args[1] ?? '', ($args[2] ?? '') !== '' ? $args[2] : 'decimal');
                     } else {
-                        $styleArg = $fn === 'counters' ? ($args[2] ?? 'decimal') : ($args[1] ?? 'decimal');
-                        $value = $this->counters[$name] ?? 0;
-                        $out .= $styleArg === 'decimal' ? (string) $value : (\IvoPdf\Text\CounterStyles::supports($styleArg)
-                            ? \IvoPdf\Text\CounterStyles::body(self::clampCounter($value), $styleArg)
-                            : rtrim($this->formatListNumber($value, $styleArg), '.)'));
+                        $out .= $this->formatCounters($name, false, '', ($args[1] ?? '') !== '' ? $args[1] : 'decimal');
                     }
                 }
                 $i += strlen($fm[0]);

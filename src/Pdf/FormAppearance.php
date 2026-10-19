@@ -76,6 +76,21 @@ final class FormAppearance
         }
 
         if ($this->activeForms && $register) {
+            if ($c->kind === FormControl::PASSWORD) {
+                // A password is never written into the PDF (no /V, no clear text in any appearance): its bullets
+                // (one per character, as browsers print them) are page content and the widget is empty and
+                // transparent, so every viewer shows the bullets, including viewers that rebuild the appearance
+                // from the (empty) value because of /NeedAppearances
+                if ($c->value !== '') {
+                    $page .= sprintf("q 1 0 0 1 %.3F %.3F cm\n%sQ\n", $x, $pdfBottom, $widget->normalAp);
+                    $empty = clone $c;
+                    $empty->value = '';
+                    $empty->placeholder = '';
+                    $widget->normalAp = $this->textAppearance($box, $empty, $widget, $color);
+                }
+                $this->pdf->addFormWidget($pageIndex, $widget->rect, $widget);
+                return $page;
+            }
             if ($c->placeholder !== '' && $c->value === '' && !$c->isButton() && $c->kind !== FormControl::SELECT) {
                 // The placeholder is page content, as browsers print it; it is not the field's value, so the
                 // widget appearance stays empty and the field gets an opaque background (/MK /BG) that hides the
@@ -125,7 +140,7 @@ final class FormAppearance
         $fontId = $this->fontManager->markFontUsed($ttf);
         $widget->apFontId = $fontId;
 
-        $texts = [$c->value, $c->caption, $c->placeholder];
+        $texts = [$c->kind === FormControl::PASSWORD ? '' : $c->value, $c->caption, $c->placeholder];
         foreach ($c->options as $o) {
             $texts[] = $o['label'];
             $texts[] = $o['value'];

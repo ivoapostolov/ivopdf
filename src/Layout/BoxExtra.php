@@ -19,6 +19,8 @@ final class BoxExtra
     public ?string $href = null;
     public ?string $imageSrc = null;
     public ?string $listMarker = null;
+    /** The marker text comes from `::marker { content }`: drawn as is, ending at the content edge (no symbol box) */
+    public bool $listMarkerString = false;
     /** list-style-image source (outside markers are drawn by the renderer) */
     public ?string $listMarkerImage = null;
     /** Computed ::marker style (color / font-size) when the stylesheet defines one */
@@ -51,4 +53,8 @@ final class BoxExtra
     public ?ColumnFlow $columnFlow = null;
     /** @var list<array{x: float, y: float, w: float, h: float, chunk: int, col: int}> Used column rects of a multicol container */
     public array $columnRects = [];
+    /** Outline (bookmark) level of the box: h1-h6 by default, CSS `bookmark-level`; 0 = no bookmark */
+    public int $bookmarkLevel = 0;
+    /** Outline title from CSS `bookmark-label` (null: the element's text) */
+    public ?string $bookmarkLabel = null;
 }

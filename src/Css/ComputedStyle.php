@@ -1316,69 +1316,78 @@ class ComputedStyle
             return;
         }
 
-        // Multiple layers: the image comes from the first layer, the color from the last layer
+        // Multiple layers (painted first = top): each layer has its own image / position / size / repeat, the colour
+        // can only be given in the last layer. The longhands become comma-separated lists, one entry per layer.
         $layers = $this->splitTopLevel($val, ',');
-        $firstLayer = $layers[0];
-        $lastLayer = $layers[count($layers) - 1];
-
-        $remaining = [];
-        foreach ($this->splitSpaceTokens($firstLayer) as $tok) {
-            $tl = strtolower($tok);
-            if (str_starts_with($tl, 'url(') || str_contains($tl, 'gradient(')) {
-                if ($this->props['background-image'] === 'none') {
-                    $this->props['background-image'] = str_starts_with($tl, 'url(')
-                        ? 'url(' . trim(substr($tok, 4, -1), " \t\n\r\0\x0B'\"") . ')'
-                        : $tok;
+        $images = [];
+        $positions = [];
+        $sizes = [];
+        $repeats = [];
+        foreach ($layers as $li => $layer) {
+            $image = 'none';
+            $remaining = [];
+            foreach ($this->splitSpaceTokens($layer) as $tok) {
+                $tl = strtolower($tok);
+                if (str_starts_with($tl, 'url(') || str_contains($tl, 'gradient(')) {
+                    if ($image === 'none') {
+                        $image = str_starts_with($tl, 'url(')
+                            ? 'url(' . trim(substr($tok, 4, -1), " \t\n\r\0\x0B'\"") . ')'
+                            : $tok;
+                    }
+                    continue;
                 }
-                continue;
+                $remaining[] = $tok;
             }
-            $remaining[] = $tok;
-        }
 
-        // Split "position / size"
-        $slashParts = $this->splitTopLevel(implode(' ', $remaining), '/');
-        $positionTokens = [];
-        $sizeTokens = [];
-        $repeatTokens = [];
-        $otherTokens = $this->splitSpaceTokens($slashParts[0]);
-        if (count($slashParts) > 1) {
-            $afterSlash = $this->splitSpaceTokens($slashParts[1]);
-            while (!empty($afterSlash) && count($sizeTokens) < 2 && $this->isBackgroundSizeToken($afterSlash[0])) {
-                $sizeTokens[] = array_shift($afterSlash);
+            // Split "position / size"
+            $slashParts = $this->splitTopLevel(implode(' ', $remaining), '/');
+            $positionTokens = [];
+            $sizeTokens = [];
+            $repeatTokens = [];
+            $otherTokens = $this->splitSpaceTokens($slashParts[0]);
+            if (count($slashParts) > 1) {
+                $afterSlash = $this->splitSpaceTokens($slashParts[1]);
+                while (!empty($afterSlash) && count($sizeTokens) < 2 && $this->isBackgroundSizeToken($afterSlash[0])) {
+                    $sizeTokens[] = array_shift($afterSlash);
+                }
+                $otherTokens = array_merge($otherTokens, $afterSlash);
             }
-            $otherTokens = array_merge($otherTokens, $afterSlash);
-        }
 
-        foreach ($otherTokens as $tok) {
-            $tl = strtolower($tok);
-            if (in_array($tl, ['repeat', 'no-repeat', 'repeat-x', 'repeat-y', 'space', 'round'], true)) {
-                $repeatTokens[] = $tl;
-            } elseif (in_array($tl, ['scroll', 'fixed', 'local', 'border-box', 'padding-box', 'content-box', 'text'], true)) {
-                continue;
-            } elseif (in_array($tl, ['left', 'right', 'top', 'bottom', 'center'], true) || preg_match('/^-?[\d.]/', $tl) || str_starts_with($tl, 'calc(')) {
-                $positionTokens[] = $tok;
-            } elseif (CssColor::parse($tok) !== null || $tl === 'currentcolor') {
-                $this->props['background-color'] = $tok;
-            }
-        }
-
-        if ($lastLayer !== $firstLayer) {
-            foreach ($this->splitSpaceTokens($lastLayer) as $tok) {
-                if (CssColor::parse($tok) !== null) {
-                    $this->props['background-color'] = $tok;
+            foreach ($otherTokens as $tok) {
+                $tl = strtolower($tok);
+                if (in_array($tl, ['repeat', 'no-repeat', 'repeat-x', 'repeat-y', 'space', 'round'], true)) {
+                    $repeatTokens[] = $tl;
+                } elseif (in_array($tl, ['scroll', 'fixed', 'local', 'border-box', 'padding-box', 'content-box', 'text'], true)) {
+                    continue;
+                } elseif (in_array($tl, ['left', 'right', 'top', 'bottom', 'center'], true) || preg_match('/^-?[\d.]/', $tl) || str_starts_with($tl, 'calc(')) {
+                    $positionTokens[] = $tok;
+                } elseif (CssColor::parse($tok) !== null || $tl === 'currentcolor') {
+                    if ($li === count($layers) - 1 || $li === 0) {
+                        $this->props['background-color'] = $tok;
+                    }
                 }
             }
+            $images[] = $image;
+            $positions[] = empty($positionTokens) ? '0% 0%' : implode(' ', $positionTokens);
+            $sizes[] = empty($sizeTokens) ? 'auto' : implode(' ', $sizeTokens);
+            $repeats[] = empty($repeatTokens) ? 'repeat' : implode(' ', $repeatTokens);
         }
 
-        if (!empty($positionTokens)) {
-            $this->props['background-position'] = implode(' ', $positionTokens);
+        // A single layer keeps the plain values; several layers keep one entry per layer (layers without an image are
+        // dropped: they paint nothing)
+        $keep = array_keys(array_filter($images, static fn(string $i): bool => $i !== 'none'));
+        if (count($layers) > 1 && count($keep) > 1) {
+            $this->props['background-image'] = implode(', ', array_map(static fn(int $k): string => $images[$k], $keep));
+            $this->props['background-position'] = implode(', ', array_map(static fn(int $k): string => $positions[$k], $keep));
+            $this->props['background-size'] = implode(', ', array_map(static fn(int $k): string => $sizes[$k], $keep));
+            $this->props['background-repeat'] = implode(', ', array_map(static fn(int $k): string => $repeats[$k], $keep));
+            return;
         }
-        if (!empty($sizeTokens)) {
-            $this->props['background-size'] = implode(' ', $sizeTokens);
-        }
-        if (!empty($repeatTokens)) {
-            $this->props['background-repeat'] = implode(' ', $repeatTokens);
-        }
+        $k = $keep[0] ?? 0;
+        $this->props['background-image'] = $images[$k];
+        $this->props['background-position'] = $positions[$k];
+        $this->props['background-size'] = $sizes[$k];
+        $this->props['background-repeat'] = $repeats[$k];
     }
 
     private function isBackgroundSizeToken(string $tok): bool
@@ -1451,7 +1460,7 @@ class ComputedStyle
         if (strtolower($val) === 'none') {
             return;
         }
-        if (preg_match('/(?:repeating-)?(?:linear|radial)-gradient\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|url\([^)]*\)/i', $val, $m, PREG_OFFSET_CAPTURE)) {
+        if (preg_match('/(?:-webkit-)?(?:repeating-)?(?:linear|radial|conic)-gradient\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|url\([^)]*\)/i', $val, $m, PREG_OFFSET_CAPTURE)) {
             $this->props['border-image-source'] = $m[0][0];
             $val = trim(substr($val, 0, $m[0][1]) . ' ' . substr($val, $m[0][1] + strlen($m[0][0])));
         }
