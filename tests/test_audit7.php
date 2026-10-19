@@ -232,7 +232,7 @@ if (($px = pixels($bytes, [[15, 15], [205, 55], [80, 22], [140, 48]])) !== null)
     // to top right: the 50 % line runs through the top-left and bottom-right corners (Chromium "magic corners")
     check('`to top right` follows the box diagonal', near($px[0], [255, 0, 0]) && near($px[1], [0, 0, 255]) && near($px[2], [0, 0, 255]) && near($px[3], [255, 0, 0]), implode(' ', array_map('fmt', $px)));
 }
-$pdf = make('<div style="width:200pt;height:100pt;background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.7)), url(data:image/gif;base64,R0lGODlhAQABAIAAAP8AAP///ywAAAAAAQABAAACAkQBADs=) center/cover"></div>');
+$pdf = make('<div style="width:200pt;height:100pt;background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.7)), url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC) center/cover"></div>');
 $bytes = $pdf->output();
 if (($px = pixels($bytes, [[100, 2], [100, 98]])) !== null) {
     check('gradient overlay above a photo layer: the photo stays (top)', near($px[0], [255, 0, 0], 15), fmt($px[0]));
