@@ -39,15 +39,20 @@ final class ReplacedSize
             if ($css === '' || $css === $none || $css === 'auto' || $css === 'none' || str_contains($css, 'content')) {
                 return null;
             }
-            if ($containingWidth === null && str_contains($css, '%')) {
+            $vBase = null;
+            if (!$horizontal && str_contains($css, '%')) {
+                // height / min-height / max-height: % of the containing block's height when it is definite
+                // (a parent with a fixed height, an absolutely positioned box...), otherwise auto / none
+                $vBase = BoxSizing::percentBase($engine, $box);
+                if ($vBase === null) {
+                    return null;
+                }
+            } elseif ($containingWidth === null && str_contains($css, '%')) {
                 return null;
-            }
-            if (!$horizontal && str_contains($css, '%') && str_starts_with($prop, 'm')) {
-                return null; // min-height / max-height: % against an indefinite height
             }
             $v = $horizontal
                 ? $engine->resolveBoxHorizontalDimension($box, $css, $ref) - $hSpace
-                : $engine->resolveBoxVerticalDimension($box, $css, $ref) - $vSpace;
+                : $engine->resolveBoxVerticalDimension($box, $css, $vBase ?? $ref) - $vSpace;
             return is_nan($v) ? null : max(0.0, $v);
         };
 

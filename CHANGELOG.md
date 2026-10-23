@@ -2,6 +2,11 @@
 
 All notable changes to IvoPDF are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] – 2026-10-23
+
+### Fixed
+- `height: 100%` (and percentage `min-height` / `max-height`) on an `<img>` was resolved against the containing block's width instead of its height, so `width: 100%; height: 100%; object-fit: contain | cover` inside a box with a definite height (a fixed `height`, an absolutely positioned frame, with or without `display: flex`) got a height derived from the width and the image's aspect ratio, overflowed the frame and was cut by `overflow: hidden`. Percentage heights of images now use the definite height of the containing block (auto when it is indefinite), as in browsers; checked against Edge.
+
 ## [1.0.2] – 2026-10-19
 
 Fixes from the seventh audit. Every change was compared with Microsoft Edge's print-to-PDF output.
